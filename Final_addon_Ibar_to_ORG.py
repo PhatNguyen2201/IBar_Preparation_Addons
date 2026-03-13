@@ -16,6 +16,7 @@ import os
 import hashlib
 import math
 import re
+import json
 import shutil
 import urllib.error
 import urllib.request
@@ -32,20 +33,50 @@ GITHUB_OWNER = "PhatNguyen2201"
 GITHUB_REPO = "IBar_Preparation_Addons"
 GITHUB_BRANCH = "main"
 GITHUB_FILE_PATH = "Final_addon_Ibar_to_ORG.py"
+GITHUB_BRANCH_FALLBACKS = ("main", "master")
 
 
 def _version_to_str(version_tuple):
     return ".".join(str(v) for v in version_tuple)
 
 
-def _fetch_remote_addon_source():
-    raw_url = (
-        f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/"
-        f"{GITHUB_BRANCH}/{GITHUB_FILE_PATH}"
-    )
-    request = urllib.request.Request(raw_url, headers={"User-Agent": "Blender-Ibar-Updater"})
+def _http_get_text(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "Blender-Ibar-Updater"})
     with urllib.request.urlopen(request, timeout=20) as response:
         return response.read().decode("utf-8")
+
+
+def _discover_remote_download_url():
+    branches = [GITHUB_BRANCH] + [b for b in GITHUB_BRANCH_FALLBACKS if b != GITHUB_BRANCH]
+    file_candidates = [GITHUB_FILE_PATH, Path(__file__).name]
+    last_error = None
+
+    for branch in branches:
+        api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/?ref={branch}"
+        try:
+            root_items = json.loads(_http_get_text(api_url))
+        except Exception as err:
+            last_error = err
+            continue
+
+        if not isinstance(root_items, list):
+            continue
+
+        for candidate in file_candidates:
+            for item in root_items:
+                if item.get("type") == "file" and item.get("name") == candidate:
+                    download_url = item.get("download_url")
+                    if download_url:
+                        return download_url
+
+    raise FileNotFoundError(
+        f"Khong tim thay file add-on tren GitHub ({GITHUB_OWNER}/{GITHUB_REPO}). Loi cuoi: {last_error}"
+    )
+
+
+def _fetch_remote_addon_source():
+    raw_url = _discover_remote_download_url()
+    return _http_get_text(raw_url)
 
 
 def _extract_version_from_source(source_text):
@@ -57,8 +88,6 @@ def _extract_version_from_source(source_text):
 
 def _get_remote_version_and_source():
     source_text = _fetch_remote_addon_source()
-    if "404: Not Found" in source_text:
-        raise FileNotFoundError("Khong tim thay file add-on tren GitHub")
     return _extract_version_from_source(source_text), source_text
 
 
