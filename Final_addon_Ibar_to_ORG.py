@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 1),
+    "version": (2, 3, 2),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
