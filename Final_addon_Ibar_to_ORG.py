@@ -1521,25 +1521,70 @@ def create_hash(data, algorithm="sha512"):
     hash_func.update(data.encode('utf-8'))
     return hash_func.hexdigest()
 
+def _read_windows_machine_guid():
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
+        value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        return str(value).strip()
+    except Exception:
+        return ""
+
+def _build_machine_fingerprint():
+    machine_guid = _read_windows_machine_guid()
+    mac_address = str(uuid.getnode())
+    host_name = os.environ.get("COMPUTERNAME", "") or os.environ.get("HOSTNAME", "")
+    processor = os.environ.get("PROCESSOR_IDENTIFIER", "")
+    cpu_count = os.environ.get("NUMBER_OF_PROCESSORS", "")
+
+    parts = [machine_guid, mac_address, host_name, processor, cpu_count]
+    raw_fingerprint = "|".join(part for part in parts if part)
+    if not raw_fingerprint:
+        raw_fingerprint = mac_address
+
+    # Keep the displayed hardware ID compact while still being deterministic.
+    return create_hash(raw_fingerprint, "sha256")[:32].upper()
+
+def get_stable_hardware_id():
+    user_folder = os.path.expanduser("~")
+    machine_id_path = os.path.join(user_folder, ".ibar_machine_id")
+
+    if os.path.exists(machine_id_path):
+        try:
+            with open(machine_id_path, "r", encoding="utf-8") as file_read:
+                cached_id = file_read.read().strip()
+                if cached_id:
+                    return cached_id
+        except Exception:
+            pass
+
+    hardware_id = _build_machine_fingerprint()
+    try:
+        with open(machine_id_path, "w", encoding="utf-8") as file_write:
+            file_write.write(hardware_id)
+    except Exception:
+        pass
+    return hardware_id
+
 def hw_read_key():
-    hardware_id = str(uuid.getnode())
+    hardware_id = get_stable_hardware_id()
     hashed_text = create_hash(hardware_id*2)
+    legacy_hardware_id = str(uuid.getnode())
+    legacy_hashed_text = create_hash(legacy_hardware_id*2)
     user_folder = os.path.expanduser("~")
 
-    licenseFolder = f"{user_folder}\\"
-    license_path = licenseFolder + "addon_ibar.key"
+    license_path = os.path.join(user_folder, "addon_ibar.key")
     if not os.path.exists(license_path):
-        hardware_id_filepart = f"{user_folder}\\Desktop\\IbarPrep.hwid"
+        hardware_id_filepart = os.path.join(user_folder, "Desktop", "IbarPrep.hwid")
         if not os.path.exists(hardware_id_filepart):
-            fileWrite = open(hardware_id_filepart, "w")
-            fileWrite.write(hardware_id)
-            fileWrite.close()
+            with open(hardware_id_filepart, "w", encoding="utf-8") as file_write:
+                file_write.write(hardware_id)
         print('No License Found')
         return False
 
-    hardware_id_input = open(license_path, "r")
-    lines = hardware_id_input.readlines()
-    if lines[0] == hashed_text:
+    with open(license_path, "r", encoding="utf-8") as hardware_id_input:
+        lines = hardware_id_input.readlines()
+    if lines and lines[0].strip() in {hashed_text, legacy_hashed_text}:
         return True
     print('Wrong license key')
     return False
@@ -1622,7 +1667,7 @@ class IbarMeshControlPanel(bpy.types.Panel):
         row1.operator(buttonOperator_HideGingiva.bl_idname, text = "Hide")
         row2 = layout.row()
         row2.operator(buttonOperator_SetAntagonist.bl_idname, text = "Set", icon = 'STRIP_COLOR_02')
-        row2.label(text="Anta")
+        row2.label(text="Antagonist")
         row2.operator(buttonOperator_ShowAntagonist.bl_idname, text = "Show")
         row2.operator(buttonOperator_HideAntagonist.bl_idname, text = "Hide")
         row3 = layout.row()
@@ -1670,8 +1715,8 @@ class IbarRetentionPanel(bpy.types.Panel):
         row1 = layout.row()
         row1.operator(buttonOperator_Retention.bl_idname, text = "Add Retention", icon = 'MESH_CUBE')
         row2 = layout.row()
-        row2.operator(buttonOperator_ApplyRetention.bl_idname, text = "Cut on Cutter", icon = 'CHECKBOX_HLT')
-        row2.operator(buttonOperator_ApplyRetentionCutter.bl_idname, text = "Cut on Bar", icon = 'CHECKBOX_HLT')
+        row2.operator(buttonOperator_ApplyRetentionCutter.bl_idname, text = "Cut on Cutter", icon = 'CHECKBOX_HLT')
+        row2.operator(buttonOperator_ApplyRetention.bl_idname, text = "Cut on Bar", icon = 'CHECKBOX_HLT')
         
 class SaveSTLIPSPanel(bpy.types.Panel):
     bl_label = "IBar Save STL"
