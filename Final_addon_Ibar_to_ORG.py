@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 3),
+    "version": (2, 3, 4),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -1723,21 +1723,24 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         # === Phần 2: Lấy tham chiếu object rồi đổi tên thêm PartName và PatientName ===
         patient_name, patient_first_name = _read_patient_info(path)
         patient_suffix = ""
-        if patient_name:
-            patient_suffix += "_" + patient_name
         if patient_first_name:
             patient_suffix += "_" + patient_first_name
         part_suffix = "_" + self.part_name + patient_suffix
+
+        def _make_name(prefix, suffix, max_len=63):
+            full = prefix + suffix
+            return full[:max_len] if len(full) > max_len else full
+
         hybrid_obj = bpy.data.objects.get("Hybrid_Shell")
         ibar_obj = bpy.data.objects.get("iBar")
         closedbar_obj = bpy.data.objects.get("Closed_Bar")
-        ibar_new_name = "iBar" + part_suffix
+        ibar_new_name = _make_name("iBar", part_suffix)
         if hybrid_obj:
-            hybrid_obj.name = "Hybrid_Shell" + part_suffix
+            hybrid_obj.name = _make_name("Hybrid_Shell", part_suffix)
         if ibar_obj:
             ibar_obj.name = ibar_new_name
         if closedbar_obj:
-            closedbar_obj.name = "Closed_Bar" + part_suffix
+            closedbar_obj.name = _make_name("Closed_Bar", part_suffix)
 
         # === Phần 3: Đổi tên tất cả file khớp Filename trong thư mục làm việc ===
         old_filename = self.filename
