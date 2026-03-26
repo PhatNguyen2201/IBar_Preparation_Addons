@@ -213,7 +213,7 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
         path = bpy.path.abspath("//")
         for ob in obs:
             viewlayer.objects.active = ob
-            if ob.name.startswith("Hybrid") or ob.name == "iBar" or ob.name == "Closed_Bar":
+            if ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar":
                 ob.select_set(True)
                 stl_path = path + f"{ob.name}.stl"
                 bpy.ops.export_mesh.stl(
@@ -260,7 +260,7 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
         for ob in obs:
             if ob.name == "Closed_Bar":
                 ob.select_set(True)
-            if ob.name.startswith("Hybrid"):
+            if ob.name == "Hybrid_Shell":
                 ob.select_set(True)
             if ob.name == "iBar":
                 ob.select_set(True)
@@ -285,7 +285,7 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
         
         for ob in obs:
             viewlayer.objects.active = ob
-            if ob.name.startswith("Hybrid") or ob.name == "iBar" or ob.name == "Closed_Bar":
+            if ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar":
                 ob.select_set(True)
                 stl_path = path + f"{ob.name}.stl"
                 bpy.ops.export_mesh.stl(
@@ -296,7 +296,7 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
         objectArrows = bpy.data.objects['fileORG']
         objectArrows.select_set(True)
         for ob in obs:
-            if ob.name.startswith("Hybrid") or ob.name == "iBar" or ob.name == "Closed_Bar":
+            if ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar":
                 ob.select_set(True)
         bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
         bpy.data.objects.remove(objectArrows)
