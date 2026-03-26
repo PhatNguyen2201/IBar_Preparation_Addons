@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 2),
+    "version": (2, 3, 3),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -1589,6 +1589,211 @@ def hw_read_key():
     print('Wrong license key')
     return False
 
+class ConstructionFileItem(bpy.types.PropertyGroup):
+    part_name: bpy.props.StringProperty(name="PartName", default="")
+    filename: bpy.props.StringProperty(name="Filename", default="")
+
+class buttonOperator_LoadConstructionInfo(bpy.types.Operator):
+    """Load ConstructionInfo and list parts"""
+    bl_idname = "object.pnfunction_load_ci"
+    bl_label = "Load ConstructionInfo"
+
+    def execute(self, context):
+        if not hw_read_key():
+            self.report({'ERROR'}, "Vui lòng đăng ký key để kích hoạt sử dụng")
+            return {'FINISHED'}
+        path = bpy.path.abspath("//")
+        if path == '':
+            self.report({'ERROR'}, "Vui lòng lưu project trước khi bắt đầu")
+            return {'FINISHED'}
+        ci_file = None
+        for fn in os.listdir(path):
+            if fn.endswith('.constructionInfo'):
+                ci_file = os.path.join(path, fn)
+                break
+        if ci_file is None:
+            self.report({'ERROR'}, "Không tìm thấy file .constructionInfo trong thư mục làm việc")
+            return {'FINISHED'}
+        try:
+            tree = ET.parse(ci_file)
+            root = tree.getroot()
+        except Exception as e:
+            self.report({'ERROR'}, f"Không thể đọc file constructionInfo: {e}")
+            return {'FINISHED'}
+        context.scene.construction_files.clear()
+        for cf in root.findall(".//ConstructionFileList/ConstructionFile"):
+            filename = cf.findtext("Filename", default="")
+            part_name = cf.findtext("PartName", default="")
+            item = context.scene.construction_files.add()
+            item.part_name = part_name
+            item.filename = filename
+        count = len(context.scene.construction_files)
+        if count == 0:
+            self.report({'WARNING'}, "Không tìm thấy ConstructionFile trong file")
+        else:
+            self.report({'INFO'}, f"Đã tải {count} phần từ constructionInfo")
+        return {'FINISHED'}
+
+def _read_patient_info(path):
+    """Đọc PatientName và PatientFirstName từ file .dentalProject trong thư mục path."""
+    for fn in os.listdir(path):
+        if fn.endswith('.dentalProject'):
+            try:
+                tree = ET.parse(os.path.join(path, fn))
+                root = tree.getroot()
+                patient_name = root.findtext(".//Patient/PatientName") or ""
+                patient_first_name = root.findtext(".//Patient/PatientFirstName") or ""
+                return patient_name.strip(), patient_first_name.strip()
+            except Exception:
+                pass
+    return "", ""
+
+class buttonOperator_SaveSTLByPart(bpy.types.Operator):
+    """Save STL for a specific construction part with ORG transform and rename"""
+    bl_idname = "object.pnfunction_save_stl_part"
+    bl_label = "Save STL by Part"
+
+    part_name: bpy.props.StringProperty(name="PartName", default="")
+    filename: bpy.props.StringProperty(name="Filename", default="")
+
+    def execute(self, context):
+        if not hw_read_key():
+            self.report({'ERROR'}, "Vui lòng đăng ký key để kích hoạt sử dụng")
+            return {'FINISHED'}
+        scene = context.scene
+        viewlayer = context.view_layer
+        obs = [o for o in scene.objects if o.type == 'MESH']
+        path = bpy.path.abspath("//")
+        if path == '':
+            self.report({'ERROR'}, "Vui lòng lưu project trước khi bắt đầu")
+            return {'FINISHED'}
+
+        # === Phần 1: Transform về ORG (giống SaveSTLORG đến trước dòng xuất STL) ===
+        file_path = path + "transform.txt"
+        try:
+            with open(file_path, "r") as tf:
+                lines = tf.readlines()
+        except Exception as e:
+            self.report({'ERROR'}, f"Không thể đọc transform.txt: {e}")
+            return {'FINISHED'}
+        matrixObjectTransform = bpy.context.scene.cursor.matrix
+        matrixValues1 = lines[0].split(",")
+        matrixValues2 = lines[1].split(",")
+        matrixValues3 = lines[2].split(",")
+        matrixValues4 = lines[3].split(",")
+        matrixObjectTransform[0] = [float(val) for val in matrixValues1]
+        matrixObjectTransform[1] = [float(val) for val in matrixValues2]
+        matrixObjectTransform[2] = [float(val) for val in matrixValues3]
+        matrixObjectTransform[3] = [float(val) for val in matrixValues4]
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.ops.object.empty_add(type='ARROWS', radius=10, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
+        object = bpy.context.active_object
+        object.matrix_world = matrixObjectTransform
+        for obj in bpy.context.selected_objects:
+            obj.name = "fileORG"
+        for ob in obs:
+            if ob.name == "Closed_Bar":
+                ob.select_set(True)
+            if ob.name == "Hybrid_Shell":
+                ob.select_set(True)
+            if ob.name == "iBar":
+                ob.select_set(True)
+        bpy.ops.object.parent_set(type='OBJECT')
+        file_pathORG = path + "before.txt"
+        try:
+            with open(file_pathORG, "r") as of:
+                linesORG = of.readlines()
+        except Exception as e:
+            self.report({'ERROR'}, f"Không thể đọc before.txt: {e}")
+            return {'FINISHED'}
+        matrixObjectORG = bpy.context.scene.cursor.matrix
+        matrixValuesORG1 = linesORG[0].split(",")
+        matrixValuesORG2 = linesORG[1].split(",")
+        matrixValuesORG3 = linesORG[2].split(",")
+        matrixValuesORG4 = linesORG[3].split(",")
+        matrixObjectORG[0] = [float(val) for val in matrixValuesORG1]
+        matrixObjectORG[1] = [float(val) for val in matrixValuesORG2]
+        matrixObjectORG[2] = [float(val) for val in matrixValuesORG3]
+        matrixObjectORG[3] = [float(val) for val in matrixValuesORG4]
+        object2 = bpy.context.active_object
+        object2.matrix_world = matrixObjectORG
+        bpy.ops.object.select_all(action='DESELECT')
+        # === Kết thúc phần 1 ===
+
+        # === Phần 2: Lấy tham chiếu object rồi đổi tên thêm PartName và PatientName ===
+        patient_name, patient_first_name = _read_patient_info(path)
+        patient_suffix = ""
+        if patient_name:
+            patient_suffix += "_" + patient_name
+        if patient_first_name:
+            patient_suffix += "_" + patient_first_name
+        part_suffix = "_" + self.part_name + patient_suffix
+        hybrid_obj = bpy.data.objects.get("Hybrid_Shell")
+        ibar_obj = bpy.data.objects.get("iBar")
+        closedbar_obj = bpy.data.objects.get("Closed_Bar")
+        ibar_new_name = "iBar" + part_suffix
+        if hybrid_obj:
+            hybrid_obj.name = "Hybrid_Shell" + part_suffix
+        if ibar_obj:
+            ibar_obj.name = ibar_new_name
+        if closedbar_obj:
+            closedbar_obj.name = "Closed_Bar" + part_suffix
+
+        # === Phần 3: Đổi tên tất cả file khớp Filename trong thư mục làm việc ===
+        old_filename = self.filename
+        if old_filename:
+            old_ext = os.path.splitext(old_filename)[1]
+            new_file_name = ibar_new_name + old_ext
+            for fn in os.listdir(path):
+                if fn == old_filename:
+                    try:
+                        os.rename(os.path.join(path, fn), os.path.join(path, new_file_name))
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Không thể đổi tên file {fn}: {e}")
+
+        # === Phần 4: Tạo constructionInfo mới với Filename đã được cập nhật ===
+        ci_source = None
+        for fn in os.listdir(path):
+            if fn.endswith('.constructionInfo'):
+                ci_source = os.path.join(path, fn)
+                break
+        if ci_source and old_filename:
+            try:
+                with open(ci_source, 'r', encoding='utf-8') as f:
+                    ci_content = f.read()
+                old_fn_tag = re.escape(f"<Filename>{old_filename}</Filename>")
+                new_fn_tag = f"<Filename>{ibar_new_name}.stl</Filename>"
+                new_ci_content = re.sub(old_fn_tag, new_fn_tag, ci_content, count=1)
+                new_ci_path = os.path.join(path, ibar_new_name + ".constructionInfo")
+                with open(new_ci_path, 'w', encoding='utf-8') as f:
+                    f.write(new_ci_content)
+            except Exception as e:
+                self.report({'WARNING'}, f"Không thể tạo constructionInfo mới: {e}")
+
+        # === Phần 5: Xuất STL cho các object đã đổi tên (giống dòng 284-302 SaveSTLORG) ===
+        objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj] if o is not None]
+        for ob in objects_to_save:
+            viewlayer.objects.active = ob
+            ob.select_set(True)
+            stl_path = path + f"{ob.name}.stl"
+            bpy.ops.export_mesh.stl(
+                filepath=str(stl_path),
+                use_selection=True)
+            ob.select_set(False)
+
+        # === Phần 6: Clear parent và xóa fileORG ===
+        bpy.ops.object.select_all(action='DESELECT')
+        objectArrows = bpy.data.objects.get('fileORG')
+        if objectArrows:
+            objectArrows.select_set(True)
+            for ob in objects_to_save:
+                ob.select_set(True)
+            bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
+            bpy.data.objects.remove(objectArrows)
+
+        self.report({'INFO'}, f"Đã lưu STL cho phần: {self.part_name}")
+        return {'FINISHED'}
+
 class IbarPrepPanel(bpy.types.Panel):
     bl_label = "IBar Function Prepare"
     bl_idname = "OBJECT_PT_Ibar_Transform"
@@ -1598,6 +1803,9 @@ class IbarPrepPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        row0 = layout.row(align=True)
+        row0.operator(IBAR_OT_CheckAddonUpdate.bl_idname, text = "Check Update", icon = 'URL')
+        row0.operator(IBAR_OT_UpdateAddonFromGitHub.bl_idname, text = "Update", icon = 'FILE_REFRESH')
         row1 = layout.row()
         row1.operator(ImportFileSTLOperator.bl_idname, text = "Select STLs", icon = 'FILE_FOLDER')
         row2 = layout.row()
@@ -1607,9 +1815,6 @@ class IbarPrepPanel(bpy.types.Panel):
         row3.operator(buttonOperator_SeparateObject.bl_idname, text = "Separate", icon = 'UNLINKED')
         row4 = layout.row()
         row4.operator(buttonOperator_SetORG.bl_idname, text = "Set Object ORG", icon = 'PIVOT_CURSOR')
-        row5 = layout.row(align=True)
-        row5.operator(IBAR_OT_CheckAddonUpdate.bl_idname, text = "Check Update", icon = 'URL')
-        row5.operator(IBAR_OT_UpdateAddonFromGitHub.bl_idname, text = "Update", icon = 'FILE_REFRESH')
 
 class OcclusalAlignment(bpy.types.Panel):
     bl_label = "Occlusal Alignment"
@@ -1732,10 +1937,22 @@ class SaveSTLIPSPanel(bpy.types.Panel):
         row1.operator(buttonOperator_SaveSTLORG.bl_idname, text = "STL to ORG", icon = 'TRANSFORM_ORIGINS')
         row2 = layout.row()
         row2.operator(buttonOperator_SaveAllSTL.bl_idname, text = "Save All STL", icon = 'DISK_DRIVE')
+        layout.separator()
+        row3 = layout.row()
+        row3.operator(buttonOperator_LoadConstructionInfo.bl_idname, text = "Load ConstructionInfo", icon = 'FILE_FOLDER')
+        if hasattr(context.scene, 'construction_files'):
+            for item in context.scene.construction_files:
+                row = layout.row()
+                op = row.operator(buttonOperator_SaveSTLByPart.bl_idname, text = item.part_name if item.part_name else "(no name)")
+                op.part_name = item.part_name
+                op.filename = item.filename
 
 from bpy.utils import register_class, unregister_class
 
 _classes = [
+ConstructionFileItem,
+buttonOperator_LoadConstructionInfo,
+buttonOperator_SaveSTLByPart,
 IBAR_OT_CheckAddonUpdate,
 IBAR_OT_UpdateAddonFromGitHub,
 buttonOperator_SetORG,
@@ -1792,8 +2009,10 @@ SaveSTLIPSPanel]
 def register():
     for cls in _classes:
         register_class(cls)
+    bpy.types.Scene.construction_files = bpy.props.CollectionProperty(type=ConstructionFileItem)
 
 def unregister():
+    del bpy.types.Scene.construction_files
     for cls in _classes:
         unregister_class(cls)
 
