@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 4),
+    "version": (2, 3, 5),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -1219,7 +1219,7 @@ class buttonOperator_Retention(bpy.types.Operator):
                 if g.group == vertex_groupBottom.index:
                     v.select = True
         bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.bevel(offset=1, offset_pct=0, segments=8, affect='EDGES')
+        bpy.ops.mesh.bevel(offset=1, offset_pct=0, segments=128, affect='EDGES')
         bpy.ops.object.mode_set(mode='OBJECT')
         return {'FINISHED'}
 class buttonOperator_ApplyRetention(bpy.types.Operator):
