@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 5),
+    "version": (2, 3, 6),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -18,6 +18,7 @@ import math
 import re
 import json
 import shutil
+import threading
 import urllib.error
 import urllib.request
 import mathutils
@@ -89,6 +90,34 @@ def _extract_version_from_source(source_text):
 def _get_remote_version_and_source():
     source_text = _fetch_remote_addon_source()
     return _extract_version_from_source(source_text), source_text
+
+
+def _auto_update_worker():
+    local_version = tuple(bl_info.get("version", (0, 0, 0)))
+    try:
+        remote_version, remote_source = _get_remote_version_and_source()
+    except Exception as e:
+        print(f"[IBar Auto-Update] Không thể kiểm tra update: {e}")
+        return
+    if remote_version <= local_version:
+        print(f"[IBar Auto-Update] Đang dùng phiên bản mới nhất {_version_to_str(local_version)}")
+        return
+    addon_file = Path(__file__)
+    backup_file = addon_file.with_suffix(addon_file.suffix + ".bak")
+    try:
+        shutil.copy2(addon_file, backup_file)
+        addon_file.write_text(remote_source, encoding="utf-8")
+        print(
+            f"[IBar Auto-Update] Đã cập nhật lên {_version_to_str(remote_version)}. "
+            "Vui lòng disable/enable lại add-on hoặc khởi động lại Blender."
+        )
+    except Exception as e:
+        print(f"[IBar Auto-Update] Cập nhật thất bại: {e}")
+
+
+def _schedule_auto_update():
+    threading.Thread(target=_auto_update_worker, daemon=True).start()
+    return None
 
 
 class IBAR_OT_CheckAddonUpdate(bpy.types.Operator):
@@ -920,10 +949,17 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
         dir_list = os.listdir(path)
         fullFileName = ''
         for item in dir_list:
-            if item.endswith('.constructionInfo'):      
+            if item.endswith('.constructionInfo'):
                 fullFileName = path + "//" + item
                 parser = ConstructionInfoParser(fullFileName)
                 valid_implants = parser.extract_valid_implants()
+                context.scene.construction_files.clear()
+                for cf in parser.root.findall(".//ConstructionFileList/ConstructionFile"):
+                    cf_filename = cf.findtext("Filename", default="")
+                    cf_part_name = cf.findtext("PartName", default="")
+                    cf_item = context.scene.construction_files.add()
+                    cf_item.part_name = cf_part_name
+                    cf_item.filename = cf_filename
             elif item.startswith('ImplantDirectionPosition') and item.endswith('.xml'):             
                 fullFileName = path + "//" + item
                 parser = ImplantDirectionPositionParser(fullFileName)
@@ -1593,47 +1629,6 @@ class ConstructionFileItem(bpy.types.PropertyGroup):
     part_name: bpy.props.StringProperty(name="PartName", default="")
     filename: bpy.props.StringProperty(name="Filename", default="")
 
-class buttonOperator_LoadConstructionInfo(bpy.types.Operator):
-    """Load ConstructionInfo and list parts"""
-    bl_idname = "object.pnfunction_load_ci"
-    bl_label = "Load ConstructionInfo"
-
-    def execute(self, context):
-        if not hw_read_key():
-            self.report({'ERROR'}, "Vui lòng đăng ký key để kích hoạt sử dụng")
-            return {'FINISHED'}
-        path = bpy.path.abspath("//")
-        if path == '':
-            self.report({'ERROR'}, "Vui lòng lưu project trước khi bắt đầu")
-            return {'FINISHED'}
-        ci_file = None
-        for fn in os.listdir(path):
-            if fn.endswith('.constructionInfo'):
-                ci_file = os.path.join(path, fn)
-                break
-        if ci_file is None:
-            self.report({'ERROR'}, "Không tìm thấy file .constructionInfo trong thư mục làm việc")
-            return {'FINISHED'}
-        try:
-            tree = ET.parse(ci_file)
-            root = tree.getroot()
-        except Exception as e:
-            self.report({'ERROR'}, f"Không thể đọc file constructionInfo: {e}")
-            return {'FINISHED'}
-        context.scene.construction_files.clear()
-        for cf in root.findall(".//ConstructionFileList/ConstructionFile"):
-            filename = cf.findtext("Filename", default="")
-            part_name = cf.findtext("PartName", default="")
-            item = context.scene.construction_files.add()
-            item.part_name = part_name
-            item.filename = filename
-        count = len(context.scene.construction_files)
-        if count == 0:
-            self.report({'WARNING'}, "Không tìm thấy ConstructionFile trong file")
-        else:
-            self.report({'INFO'}, f"Đã tải {count} phần từ constructionInfo")
-        return {'FINISHED'}
-
 def _read_patient_info(path):
     """Đọc PatientName và PatientFirstName từ file .dentalProject trong thư mục path."""
     for fn in os.listdir(path):
@@ -1754,7 +1749,7 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
                     except Exception as e:
                         self.report({'WARNING'}, f"Không thể đổi tên file {fn}: {e}")
 
-        # === Phần 4: Tạo constructionInfo mới với Filename đã được cập nhật ===
+        # === Phần 4: Tạo constructionInfo mới cho từng object (iBar và Hybrid) ===
         ci_source = None
         for fn in os.listdir(path):
             if fn.endswith('.constructionInfo'):
@@ -1765,11 +1760,22 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
                 with open(ci_source, 'r', encoding='utf-8') as f:
                     ci_content = f.read()
                 old_fn_tag = re.escape(f"<Filename>{old_filename}</Filename>")
-                new_fn_tag = f"<Filename>{ibar_new_name}.stl</Filename>"
-                new_ci_content = re.sub(old_fn_tag, new_fn_tag, ci_content, count=1)
-                new_ci_path = os.path.join(path, ibar_new_name + ".constructionInfo")
-                with open(new_ci_path, 'w', encoding='utf-8') as f:
-                    f.write(new_ci_content)
+
+                # constructionInfo cho iBar
+                new_fn_tag_ibar = f"<Filename>{ibar_new_name}.stl</Filename>"
+                new_ci_content_ibar = re.sub(old_fn_tag, new_fn_tag_ibar, ci_content, count=1)
+                new_ci_path_ibar = os.path.join(path, ibar_new_name + ".constructionInfo")
+                with open(new_ci_path_ibar, 'w', encoding='utf-8') as f:
+                    f.write(new_ci_content_ibar)
+
+                # constructionInfo cho Hybrid_Shell (nếu tồn tại)
+                if hybrid_obj:
+                    hybrid_new_name = hybrid_obj.name
+                    new_fn_tag_hybrid = f"<Filename>{hybrid_new_name}.stl</Filename>"
+                    new_ci_content_hybrid = re.sub(old_fn_tag, new_fn_tag_hybrid, ci_content, count=1)
+                    new_ci_path_hybrid = os.path.join(path, hybrid_new_name + ".constructionInfo")
+                    with open(new_ci_path_hybrid, 'w', encoding='utf-8') as f:
+                        f.write(new_ci_content_hybrid)
             except Exception as e:
                 self.report({'WARNING'}, f"Không thể tạo constructionInfo mới: {e}")
 
@@ -1937,12 +1943,11 @@ class SaveSTLIPSPanel(bpy.types.Panel):
         layout = self.layout
         row1 = layout.row()
         row1.operator(buttonOperator_SaveSTL.bl_idname, text = "STL only", icon = 'DISK_DRIVE')
-        row1.operator(buttonOperator_SaveSTLORG.bl_idname, text = "STL to ORG", icon = 'TRANSFORM_ORIGINS')
         row2 = layout.row()
         row2.operator(buttonOperator_SaveAllSTL.bl_idname, text = "Save All STL", icon = 'DISK_DRIVE')
         layout.separator()
         row3 = layout.row()
-        row3.operator(buttonOperator_LoadConstructionInfo.bl_idname, text = "Load ConstructionInfo", icon = 'FILE_FOLDER')
+        row3.label(text="Chạy 'Create Tubes' để tải danh sách", icon='INFO')
         if hasattr(context.scene, 'construction_files'):
             for item in context.scene.construction_files:
                 row = layout.row()
@@ -1954,7 +1959,6 @@ from bpy.utils import register_class, unregister_class
 
 _classes = [
 ConstructionFileItem,
-buttonOperator_LoadConstructionInfo,
 buttonOperator_SaveSTLByPart,
 IBAR_OT_CheckAddonUpdate,
 IBAR_OT_UpdateAddonFromGitHub,
@@ -1971,7 +1975,6 @@ buttonAddRedPoint3,
 buttonOperator_TransformToPlane,
 buttonOperator_TransformToCurrentDesign,
 buttonOperator_SaveSTL,
-buttonOperator_SaveSTLORG,
 buttonOperator_ImportAllSTL,
 buttonOperator_CreateTubes,
 buttonOperator_SaveAllSTL,
@@ -2013,8 +2016,11 @@ def register():
     for cls in _classes:
         register_class(cls)
     bpy.types.Scene.construction_files = bpy.props.CollectionProperty(type=ConstructionFileItem)
+    bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
 
 def unregister():
+    if bpy.app.timers.is_registered(_schedule_auto_update):
+        bpy.app.timers.unregister(_schedule_auto_update)
     del bpy.types.Scene.construction_files
     for cls in _classes:
         unregister_class(cls)
