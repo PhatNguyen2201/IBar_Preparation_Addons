@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 6),
+    "version": (2, 3, 7),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -1010,6 +1010,9 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
                 for group_name, idx in zip(vertex_groups, vertex_indices):
                     vertex_group = curve_object.vertex_groups.new(name=group_name)
                     vertex_group.add([idx], 1.0, 'ADD')
+
+                # Create an empty vertex group for 4 implants
+                curve_object.vertex_groups.new(name="4Implants")
 
                 # Optionally, select the vertices in each vertex group (for demonstration purposes)
                 bpy.ops.object.mode_set(mode='EDIT')
