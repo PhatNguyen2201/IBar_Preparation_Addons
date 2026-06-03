@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 7),
+    "version": (2, 3, 8),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -118,6 +118,29 @@ def _auto_update_worker():
 def _schedule_auto_update():
     threading.Thread(target=_auto_update_worker, daemon=True).start()
     return None
+
+
+def _is_in_view_layer(obj, viewlayer=None):
+    """Return True when an object can be safely selected/activated in the ViewLayer."""
+    viewlayer = viewlayer or bpy.context.view_layer
+    return obj is not None and obj.name in viewlayer.objects
+
+
+def _set_active_object(obj, viewlayer=None):
+    """Safely set active object only if it belongs to the current ViewLayer."""
+    viewlayer = viewlayer or bpy.context.view_layer
+    if not _is_in_view_layer(obj, viewlayer):
+        return False
+    viewlayer.objects.active = obj
+    return True
+
+
+def _select_object(obj, state=True, viewlayer=None):
+    """Safely select/deselect object only if it belongs to the current ViewLayer."""
+    if not _is_in_view_layer(obj, viewlayer):
+        return False
+    obj.select_set(state)
+    return True
 
 
 class IBAR_OT_CheckAddonUpdate(bpy.types.Operator):
@@ -241,14 +264,13 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
 
         path = bpy.path.abspath("//")
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar":
-                ob.select_set(True)
+            if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
                 bpy.ops.export_mesh.stl(
                     filepath=str(stl_path),
                     use_selection=True)
-                ob.select_set(False)
+                _select_object(ob, False, viewlayer)
         return {'FINISHED'}
 
 class buttonOperator_SaveSTLORG(bpy.types.Operator):
@@ -288,11 +310,11 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
             obj.name = "fileORG"
         for ob in obs:
             if ob.name == "Closed_Bar":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
             if ob.name == "Hybrid_Shell":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
             if ob.name == "iBar":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
         file_pathORG = path + "before.txt"
         fileORG = open(file_pathORG, "r")
@@ -313,20 +335,19 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')
         
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar":
-                ob.select_set(True)
+            if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
                 bpy.ops.export_mesh.stl(
                     filepath=str(stl_path),
                     use_selection=True)
-                ob.select_set(False)
+                _select_object(ob, False, viewlayer)
         bpy.ops.object.select_all(action='DESELECT')
         objectArrows = bpy.data.objects['fileORG']
-        objectArrows.select_set(True)
+        _select_object(objectArrows, True, viewlayer)
         for ob in obs:
             if ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
         bpy.data.objects.remove(objectArrows)
         return {'FINISHED'}
@@ -339,7 +360,9 @@ class buttonOperator_GetTransformORG(bpy.types.Operator):
         if not hw_read_key():
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
-        bpy.context.view_layer.objects.active = bpy.data.objects['Models']
+        if not _set_active_object(bpy.data.objects.get('Models'), context.view_layer):
+            self.report({'ERROR'}, "Object 'Models' không nằm trong ViewLayer hiện tại")
+            return {'FINISHED'}
         obj = bpy.context.active_object
         matrixObjectORG = bpy.context.object.matrix_world
         path = bpy.path.abspath("//")
@@ -466,14 +489,13 @@ class buttonOperator_TransformToPlane(bpy.types.Operator):
         point3 = mathutils.Vector((0, 0, 0))
 
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name == "pointLeft":
+            if ob.name == "pointLeft" and _is_in_view_layer(ob, viewlayer):
                 point1 = ob.location
                 continue
-            if ob.name == "pointIncisor":
+            if ob.name == "pointIncisor" and _is_in_view_layer(ob, viewlayer):
                 point2 = ob.location
                 continue
-            if ob.name == "pointRight":
+            if ob.name == "pointRight" and _is_in_view_layer(ob, viewlayer):
                 point3 = ob.location
                 continue
 
@@ -495,10 +517,10 @@ class buttonOperator_TransformToPlane(bpy.types.Operator):
         objectArrows = bpy.data.objects['ArrowAxisTransform']
         objectwaxup = bpy.data.objects['Models']
 
-        objectArrows.select_set(True)
-        objectwaxup.select_set(True)
+        _select_object(objectArrows, True, viewlayer)
+        _select_object(objectwaxup, True, viewlayer)
 
-        bpy.context.view_layer.objects.active = objectArrows
+        _set_active_object(objectArrows, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
 
         objectArrows.location.x = 0
@@ -633,8 +655,7 @@ class buttonFramework_Thickness(bpy.types.Operator):
         matg = bpy.data.materials.new("Red")
         matg.diffuse_color = (0.8, 0, 0, 0.3)
         for obj in obs:
-            if obj.name.find(new_obj.name) > -1:
-                viewlayer.objects.active = obj
+            if obj.name.find(new_obj.name) > -1 and _set_active_object(obj, viewlayer):
                 bpy.ops.object.modifier_add(type='REMESH')
                 bpy.context.object.modifiers["Remesh"].mode = 'SMOOTH'
                 bpy.context.object.modifiers["Remesh"].octree_depth = 7
@@ -680,10 +701,9 @@ class buttonOperator_TransformToCurrentDesign(bpy.types.Operator):
         object.name = "currentAxis"
         objectArrows = bpy.data.objects['currentAxis']
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name.find('MeshTransform')>-1:
-                ob.select_set(True)
-        bpy.context.view_layer.objects.active = objectArrows
+            if ob.name.find('MeshTransform')>-1 and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
+        _set_active_object(objectArrows, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
 
         file_path = path + "transform.txt"
@@ -702,11 +722,10 @@ class buttonOperator_TransformToCurrentDesign(bpy.types.Operator):
         object2 = bpy.context.active_object
         object2.matrix_world = matrixObjectTransform
 
-        objectArrows.select_set(True)
+        _select_object(objectArrows, True, viewlayer)
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name.find('MeshTransform')>-1:
-                ob.select_set(True)
+            if ob.name.find('MeshTransform')>-1 and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
         bpy.data.objects.remove(objectArrows)
         return {'FINISHED'}
@@ -727,13 +746,13 @@ class buttonOperator_SaveAllSTL(bpy.types.Operator):
 
         path = bpy.path.abspath("//")
         for ob in obs:
-            viewlayer.objects.active = ob
-            ob.select_set(True)
-            stl_path = path + f"{ob.name}.stl"
-            bpy.ops.export_mesh.stl(
-                filepath=str(stl_path),
-                use_selection=True)
-            ob.select_set(False)
+            if _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
+                stl_path = path + f"{ob.name}.stl"
+                bpy.ops.export_mesh.stl(
+                    filepath=str(stl_path),
+                    use_selection=True)
+                _select_object(ob, False, viewlayer)
         return {'FINISHED'}
         
 class buttonOperator_CreateTubes(bpy.types.Operator):
@@ -1058,10 +1077,9 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
         object.name = "currentAxis"
         objectArrows = bpy.data.objects['currentAxis']
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name.find('Tubes')>-1:
-                ob.select_set(True)
-        bpy.context.view_layer.objects.active = objectArrows
+            if ob.name.find('Tubes')>-1 and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
+        _set_active_object(objectArrows, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
 
         file_path = path + "transform.txt"
@@ -1080,19 +1098,17 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
         object2 = bpy.context.active_object
         object2.matrix_world = matrixObjectTransform
 
-        objectArrows.select_set(True)
+        _select_object(objectArrows, True, viewlayer)
         for ob in obs:
-            viewlayer.objects.active = ob
-            if ob.name.find('Tubes')>-1:
-                ob.select_set(True)
+            if ob.name.find('Tubes')>-1 and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
         bpy.data.objects.remove(objectArrows)
         
         bpy.ops.object.select_all(action='DESELECT')
         for ob in obs:
-            if ob.name.find('Tubes') > -1:
-                viewlayer.objects.active = ob
-                ob.select_set(True)
+            if ob.name.find('Tubes') > -1 and _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
                 bpy.ops.object.modifier_add(type='SKIN')
                 bpy.ops.object.modifier_add(type='SUBSURF')
                 bpy.context.object.modifiers["Subdivision"].levels = 3
@@ -1114,10 +1130,10 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
                 bpy.ops.object.mode_set(mode='EDIT')
                 bpy.ops.transform.skin_resize(value=(2.5, 2.5, 2.5), orient_type='LOCAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='LOCAL', mirror=True, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'FACE'}, use_snap_project=False, snap_target='CENTER', use_snap_self=False, use_snap_edit=False, use_snap_nonedit=False, use_snap_selectable=False)
                 bpy.ops.object.mode_set(mode='OBJECT')
-                ob.select_set(False)
+                _select_object(ob, False, viewlayer)
         for ob in obs:
             if ob.name.find('Tubes') > -1:
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
         return {'FINISHED'}
 class buttonOperator_SetAntagonist(bpy.types.Operator):
     """Set selected as Antagonist"""
@@ -1270,17 +1286,20 @@ class buttonOperator_ApplyRetention(bpy.types.Operator):
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
         bpy.ops.object.select_all(action='DESELECT')
-        objectIbar = bpy.data.objects['iBar']
-        objectIbar.select_set(True)
+        objectIbar = bpy.data.objects.get('iBar')
         scene = context.scene
         viewlayer = context.view_layer
+        if not _set_active_object(objectIbar, viewlayer):
+            self.report({'ERROR'}, "Object 'iBar' không nằm trong ViewLayer hiện tại")
+            return {'FINISHED'}
+        _select_object(objectIbar, True, viewlayer)
         obs = [o for o in scene.objects if o.type == 'MESH']
         for ob in obs:
-            if ob.name.find('retentionCube') > -1:
+            if ob.name.find('retentionCube') > -1 and _is_in_view_layer(ob, viewlayer):
                 boolean_modifier = objectIbar.modifiers.new(name="Boolean", type='BOOLEAN')
                 boolean_modifier.object = ob
                 boolean_modifier.operation = 'DIFFERENCE'
-                viewlayer.objects.active = objectIbar
+                _set_active_object(objectIbar, viewlayer)
                 bpy.ops.object.modifier_apply(modifier="Boolean")
         for ob in obs:
             if ob.name.find('retentionCube') > -1:
@@ -1513,17 +1532,20 @@ class buttonOperator_ApplyRetentionCutter(bpy.types.Operator):
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
         bpy.ops.object.select_all(action='DESELECT')
-        objectCutter = bpy.data.objects['CUTTER']
-        objectCutter.select_set(True)
+        objectCutter = bpy.data.objects.get('CUTTER')
         scene = context.scene
         viewlayer = context.view_layer
+        if not _set_active_object(objectCutter, viewlayer):
+            self.report({'ERROR'}, "Object 'CUTTER' không nằm trong ViewLayer hiện tại")
+            return {'FINISHED'}
+        _select_object(objectCutter, True, viewlayer)
         obs = [o for o in scene.objects if o.type == 'MESH']
         for ob in obs:
-            if ob.name.find('retentionCube') > -1:
+            if ob.name.find('retentionCube') > -1 and _is_in_view_layer(ob, viewlayer):
                 boolean_modifier = objectCutter.modifiers.new(name="Boolean", type='BOOLEAN')
                 boolean_modifier.object = ob
                 boolean_modifier.operation = 'DIFFERENCE'
-                viewlayer.objects.active = objectCutter
+                _set_active_object(objectCutter, viewlayer)
                 bpy.ops.object.modifier_apply(modifier="Boolean")
         for ob in obs:
             if ob.name.find('retentionCube') > -1:
@@ -1691,11 +1713,11 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
             obj.name = "fileORG"
         for ob in obs:
             if ob.name == "Closed_Bar":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
             if ob.name == "Hybrid_Shell":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
             if ob.name == "iBar":
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
         file_pathORG = path + "before.txt"
         try:
@@ -1785,21 +1807,21 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         # === Phần 5: Xuất STL cho các object đã đổi tên (giống dòng 284-302 SaveSTLORG) ===
         objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj] if o is not None]
         for ob in objects_to_save:
-            viewlayer.objects.active = ob
-            ob.select_set(True)
-            stl_path = path + f"{ob.name}.stl"
-            bpy.ops.export_mesh.stl(
-                filepath=str(stl_path),
-                use_selection=True)
-            ob.select_set(False)
+            if _set_active_object(ob, viewlayer):
+                _select_object(ob, True, viewlayer)
+                stl_path = path + f"{ob.name}.stl"
+                bpy.ops.export_mesh.stl(
+                    filepath=str(stl_path),
+                    use_selection=True)
+                _select_object(ob, False, viewlayer)
 
         # === Phần 6: Clear parent và xóa fileORG ===
         bpy.ops.object.select_all(action='DESELECT')
         objectArrows = bpy.data.objects.get('fileORG')
         if objectArrows:
-            objectArrows.select_set(True)
+            _select_object(objectArrows, True, viewlayer)
             for ob in objects_to_save:
-                ob.select_set(True)
+                _select_object(ob, True, viewlayer)
             bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
             bpy.data.objects.remove(objectArrows)
 
