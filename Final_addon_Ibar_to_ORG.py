@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 8),
+    "version": (2, 3, 9),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -663,7 +663,55 @@ class buttonFramework_Thickness(bpy.types.Operator):
                 bpy.ops.object.modifier_apply(modifier="Remesh")
                 obj.active_material = matg
         return {'FINISHED'}
-        
+
+class buttonOperator_RemoveHybrid(bpy.types.Operator):
+    """Remove Hybrid collections and meshes from the current file"""
+    bl_idname = "object.pnfunction44"
+    bl_label = "Remove Hybrid"
+    def execute(self, context):
+        collection_names = ["Hybrid", "Hybrid_Dublicate_Original", "Hybrid_Design"]
+        mesh_names = ["Hybrid_Design", "Hybrid_Dublicate_Original"]
+
+        for mesh_name in mesh_names:
+            mesh = bpy.data.meshes.get(mesh_name)
+            if mesh:
+                bpy.data.meshes.remove(mesh)
+
+        for collection_name in collection_names:
+            collection = bpy.data.collections.get(collection_name)
+            if collection:
+                bpy.data.collections.remove(collection)
+
+        self.report({'INFO'}, "Removed Hybrid components")
+        return {'FINISHED'}
+
+class buttonOperator_FixJumpToCutter(bpy.types.Operator):
+    """Move Hybrid mesh into Hybrid_Design collection and rename it"""
+    bl_idname = "object.pnfunction45"
+    bl_label = "Fix-Jump to Cutter"
+    def execute(self, context):
+        design_collection = bpy.data.collections.get("Hybrid_Design")
+        if design_collection is None:
+            design_collection = bpy.data.collections.new("Hybrid_Design")
+            bpy.context.scene.collection.children.link(design_collection)
+
+        hybrid_obj = bpy.data.objects.get("Hybrid")
+        if hybrid_obj is None:
+            self.report({'WARNING'}, "Không tìm thấy mesh 'Hybrid'")
+            return {'FINISHED'}
+
+        for col in hybrid_obj.users_collection:
+            col.objects.unlink(hybrid_obj)
+        if hybrid_obj.name not in design_collection.objects:
+            design_collection.objects.link(hybrid_obj)
+
+        hybrid_obj.name = "Hybrid_Design"
+        if hybrid_obj.data:
+            hybrid_obj.data.name = "Hybrid_Design"
+
+        self.report({'INFO'}, "Moved Hybrid to Hybrid_Design")
+        return {'FINISHED'}
+
 class buttonOperator_TransformToCurrentDesign(bpy.types.Operator):
     """Offset selected from ORG to current"""
     bl_idname = "object.pnfunction15"
@@ -1889,6 +1937,10 @@ class IbarAddCustomPanel(bpy.types.Panel):
         row3.operator(buttonOperator_CreateTubes.bl_idname, text = "Create Tubes Automatically", icon = 'ORIENTATION_LOCAL')
         row4 = layout.row()
         row4.operator(buttonFramework_Thickness.bl_idname, text = "Create Framework thickness", icon = 'MOD_THICKNESS')
+        row5 = layout.row()
+        row5.operator(buttonOperator_RemoveHybrid.bl_idname, text = "Remove Hybrid", icon = 'TRASH')
+        row6 = layout.row()
+        row6.operator(buttonOperator_FixJumpToCutter.bl_idname, text = "Fix-Jump to Cutter", icon = 'TRACKING_FORWARDS')
 
 class IbarMeshControlPanel(bpy.types.Panel):
     bl_label = "Object Control"
@@ -1989,6 +2041,8 @@ IBAR_OT_CheckAddonUpdate,
 IBAR_OT_UpdateAddonFromGitHub,
 buttonOperator_SetORG,
 buttonFramework_Thickness,
+buttonOperator_RemoveHybrid,
+buttonOperator_FixJumpToCutter,
 buttonDeleteOther,
 buttonSnapToScrews,
 buttonSetAsGingiva,
