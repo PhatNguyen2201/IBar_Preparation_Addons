@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 3, 9),
+    "version": (2, 4, 0),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -1918,7 +1918,7 @@ class OcclusalAlignment(bpy.types.Panel):
         row5 = layout.row()
         row5.operator(buttonOperator_GetTransformORG.bl_idname, text = "Save Transform Info", icon = 'PINNED')
         row6 = layout.row()
-        row6.operator(buttonOperator_TransformToCurrentDesign.bl_idname, text = "Offset Transform Object", icon = 'GIZMO')
+        row6.operator(buttonOperator_TransformToCurrentDesign.bl_idname, text = "Apply Saved Transform", icon = 'GIZMO')
 
 class IbarAddCustomPanel(bpy.types.Panel):
     bl_label = "IBar Custom Function"
