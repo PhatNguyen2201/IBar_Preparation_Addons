@@ -1,34 +1,23 @@
 bl_info = {
     "name": "Gingiva/Teeth Surface Splitter",
     "author": "Phat Nguyen",
-    "version": (1, 0, 0),
+    "version": (2, 0, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > IBAR Split",
-    "description": "Ve mot vong line kin tren be mat va tach object thanh Gingiva va Teeth",
+    "description": "Ve mot vong line dang object bam tren be mat Target va tach thanh Gingiva / Teeth",
     "category": "Object",
 }
 
 import bpy
 import bmesh
-import math
 import os
 import uuid
 import hashlib
 from mathutils import Vector
-from bpy_extras import view3d_utils
-import gpu
-from gpu_extras.batch import batch_for_shader
 
 
 # ---------------------------------------------------------------------------
-# Module-level cache: lưu vòng line (điểm + normal world) đã vẽ theo tên object.
-# ---------------------------------------------------------------------------
-# { object_name: {"points": [Vector, ...], "normals": [Vector, ...]} }
-_stroke_cache = {}
-
-
-# ---------------------------------------------------------------------------
-# ViewLayer safety helpers (sao chép để add-on độc lập với add-on iBar).
+# ViewLayer safety helpers (sao chép de add-on doc lap voi add-on iBar).
 # ---------------------------------------------------------------------------
 def _is_in_view_layer(obj, viewlayer=None):
     if obj is None:
@@ -57,7 +46,7 @@ def _select_object(obj, state=True, viewlayer=None):
 
 
 # ---------------------------------------------------------------------------
-# License check (sao chép nguyen khoi tu Final_addon_Ibar_to_ORG.py, dong 1628-1699).
+# License check (sao chép nguyen khoi tu Final_addon_Ibar_to_ORG.py).
 # Dung chung file key ~/addon_ibar.key voi add-on iBar hien tai.
 # ---------------------------------------------------------------------------
 def create_hash(data, algorithm="sha512"):
@@ -154,6 +143,44 @@ def _bbox_center_world(obj):
     for c in corners:
         center += c
     return center / len(corners)
+
+
+def _ordered_world_loop(obj):
+    """Doc vong line tu object line theo thu tu noi canh (da ap dung Shrinkwrap).
+
+    Tra ve (points_world, closed) - danh sach dinh world theo thu tu di vong, va
+    co la vong kin hay khong.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    me = eval_obj.to_mesh()
+    mw = obj.matrix_world
+
+    nverts = len(me.vertices)
+    adj = {i: [] for i in range(nverts)}
+    for e in me.edges:
+        a, b = e.vertices
+        adj[a].append(b)
+        adj[b].append(a)
+
+    endpoints = [i for i, nb in adj.items() if len(nb) == 1]
+    closed = (nverts >= 3 and not endpoints and all(len(nb) == 2 for nb in adj.values()))
+
+    start = endpoints[0] if endpoints else 0
+    order = []
+    visited = set()
+    cur = start
+    prev = None
+    while cur is not None and cur not in visited:
+        visited.add(cur)
+        order.append(cur)
+        nxts = [v for v in adj[cur] if v != prev and v not in visited]
+        prev = cur
+        cur = nxts[0] if nxts else None
+
+    pts = [mw @ me.vertices[i].co for i in order]
+    eval_obj.to_mesh_clear()
+    return pts, closed
 
 
 def _resample_loop_on_surface(obj, points, samples_per_edge=8):
@@ -289,7 +316,22 @@ def _mesh_volume(obj):
 # ---------------------------------------------------------------------------
 # Properties
 # ---------------------------------------------------------------------------
+def _poll_mesh(self, obj):
+    return obj.type == 'MESH'
+
+
 class GTSplitProps(bpy.types.PropertyGroup):
+    target_object: bpy.props.PointerProperty(
+        name="Target Object",
+        description="Object MESH se duoc ve len va tach (line se tu snap vao be mat object nay)",
+        type=bpy.types.Object,
+        poll=_poll_mesh,
+    )
+    line_object: bpy.props.PointerProperty(
+        name="Line Object",
+        description="Object line dang ve",
+        type=bpy.types.Object,
+    )
     offset: bpy.props.FloatProperty(
         name="Offset",
         description="Khoang cach mat cat so voi be mat object",
@@ -308,152 +350,148 @@ class GTSplitProps(bpy.types.PropertyGroup):
 
 
 # ---------------------------------------------------------------------------
-# Operator: ve vong line kin tren be mat (modal)
+# Operator: dat Target Object
 # ---------------------------------------------------------------------------
-class GTSPLIT_OT_draw_line(bpy.types.Operator):
-    """Ve mot vong line kin tren be mat object (click tung diem, Enter de dong vong)"""
-    bl_idname = "object.gtsplit_draw_line"
-    bl_label = "Ve duong cat (vong kin)"
-    bl_options = {'REGISTER'}
+class GTSPLIT_OT_set_target(bpy.types.Operator):
+    """Dat object MESH dang active lam Target (line se snap vao be mat object nay)"""
+    bl_idname = "object.gtsplit_set_target"
+    bl_label = "Chon Target Object"
+    bl_options = {'REGISTER', 'UNDO'}
 
-    _handle = None
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Hay chon mot object MESH lam active truoc")
+            return {'CANCELLED'}
+        context.scene.gt_split.target_object = obj
+        self.report({'INFO'}, "Da dat Target: %s" % obj.name)
+        return {'FINISHED'}
 
-    def invoke(self, context, event):
+
+# ---------------------------------------------------------------------------
+# Operator: tao line object + vao edit mode de ve
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_create_line(bpy.types.Operator):
+    """Tao object line bam tren be mat Target va vao Edit Mode de ve (E de extrude diem)"""
+    bl_idname = "object.gtsplit_create_line"
+    bl_label = "Ve duong cat (tao line)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
         if not hw_read_key():
             self.report({'ERROR'}, "Vui long dang ky key de kich hoat su dung")
             return {'CANCELLED'}
 
-        target = context.active_object
+        props = context.scene.gt_split
+        target = props.target_object
         if target is None or target.type != 'MESH':
-            self.report({'ERROR'}, "Hay chon mot object MESH lam active")
-            return {'CANCELLED'}
-        if context.area is None or context.area.type != 'VIEW_3D':
-            self.report({'ERROR'}, "Hay chay trong View3D")
+            self.report({'ERROR'}, "Hay dat Target Object truoc (nut Chon Target Object)")
             return {'CANCELLED'}
 
-        self.target = target
-        self.points = []          # diem click tren be mat (world)
-        self.normals = []         # normal be mat tai diem click (world)
-        self.preview = None       # diem preview duoi con tro
+        # Bao dam dang o Object Mode truoc khi tao.
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-        args = (self, context)
-        self._handle = bpy.types.SpaceView3D.draw_handler_add(
-            _draw_callback, args, 'WINDOW', 'POST_VIEW')
-        context.window_manager.modal_handler_add(self)
-        context.workspace.status_text_set(
-            "Click: them diem  |  Enter/Space: dong vong & ket thuc  |  Esc/Phai: huy")
-        context.area.tag_redraw()
-        return {'RUNNING_MODAL'}
+        # Xoa line cu neu con.
+        if props.line_object is not None and props.line_object.name in bpy.data.objects:
+            bpy.data.objects.remove(props.line_object, do_unlink=True)
 
-    def _raycast(self, context, event):
-        region = context.region
-        rv3d = context.region_data
-        coord = (event.mouse_region_x, event.mouse_region_y)
-        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
-        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
-        mwi = self.target.matrix_world.inverted()
-        ray_origin = mwi @ origin
-        ray_dir = (mwi.to_3x3() @ direction).normalized()
-        hit, loc, nrm, _idx = self.target.ray_cast(ray_origin, ray_dir)
-        if not hit:
-            return None, None
-        world_co = self.target.matrix_world @ loc
-        world_nrm = _world_normal(self.target, nrm)
-        return world_co, world_nrm
+        # Diem bat dau: snap tam bounding-box ve be mat target.
+        center_world = _bbox_center_world(target)
+        local_center = target.matrix_world.inverted() @ center_world
+        hit, location, _nrm, _idx = target.closest_point_on_mesh(local_center)
+        start_world = target.matrix_world @ location if hit else center_world
 
-    def modal(self, context, event):
-        if context.area:
-            context.area.tag_redraw()
+        me = bpy.data.meshes.new("GT_Line")
+        me.from_pydata([start_world], [], [])
+        me.update()
 
-        if event.type == 'MOUSEMOVE':
-            co, _nrm = self._raycast(context, event)
-            self.preview = co
-            return {'RUNNING_MODAL'}
+        line = bpy.data.objects.new("GT_Line", me)
+        context.collection.objects.link(line)
 
-        elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            co, nrm = self._raycast(context, event)
-            if co is None:
-                self.report({'WARNING'}, "Diem phai nam tren be mat object")
-                return {'RUNNING_MODAL'}
-            self.points.append(co)
-            self.normals.append(nrm)
-            return {'RUNNING_MODAL'}
+        # Shrinkwrap giu moi dinh line dung tren be mat Target.
+        sw = line.modifiers.new(name="GT_Shrinkwrap", type='SHRINKWRAP')
+        sw.target = target
+        sw.wrap_method = 'NEAREST_SURFACEPOINT'
+        sw.wrap_mode = 'ON_SURFACE'
+        sw.show_in_editmode = True
+        sw.show_on_cage = True
 
-        elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
-            if len(self.points) < 3:
-                self.report({'WARNING'}, "Can it nhat 3 diem de tao vong kin")
-                return {'RUNNING_MODAL'}
-            self._finish(context)
-            self.report({'INFO'},
-                        "Da luu vong kin %d diem. Nhan 'Tach object' de cat." % len(self.points))
-            return {'FINISHED'}
+        props.line_object = line
 
-        elif event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
-            self._cleanup(context)
-            self.report({'INFO'}, "Da huy ve duong cat")
+        viewlayer = context.view_layer
+        bpy.ops.object.select_all(action='DESELECT')
+        _set_active_object(line, viewlayer)
+        _select_object(line, True, viewlayer)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+
+        self.report(
+            {'INFO'},
+            "Nhan E de extrude diem tiep theo, xoay view tu do. Xong nhan 'Noi diem dau-cuoi'.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Operator: noi 2 diem dau-cuoi (tuong tu chon 2 diem roi nhan F)
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_close_loop(bpy.types.Operator):
+    """Noi diem dau va diem cuoi cua line thanh vong kin (tuong tu chon 2 diem + F)"""
+    bl_idname = "object.gtsplit_close_loop"
+    bl_label = "Noi diem dau-cuoi"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.gt_split
+        line = props.line_object
+        if line is None or line.name not in bpy.data.objects:
+            self.report({'ERROR'}, "Chua co line. Hay 'Ve duong cat' truoc.")
             return {'CANCELLED'}
 
-        # Cho phep xoay/zoom view trong khi ve.
-        elif event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
-            return {'PASS_THROUGH'}
+        in_edit = (context.mode == 'EDIT_MESH' and context.edit_object == line)
 
-        return {'RUNNING_MODAL'}
+        if in_edit:
+            bm = bmesh.from_edit_mesh(line.data)
+            ends = [v for v in bm.verts if len(v.link_edges) == 1]
+            if len(ends) != 2:
+                self.report({'WARNING'},
+                            "Can dung 2 diem dau cuoi (line dang co %d diem ho)" % len(ends))
+                return {'CANCELLED'}
+            try:
+                bm.edges.new((ends[0], ends[1]))
+            except ValueError:
+                self.report({'INFO'}, "Hai diem da duoc noi san")
+                return {'CANCELLED'}
+            bmesh.update_edit_mesh(line.data)
+        else:
+            bm = bmesh.new()
+            bm.from_mesh(line.data)
+            bm.verts.ensure_lookup_table()
+            ends = [v for v in bm.verts if len(v.link_edges) == 1]
+            if len(ends) != 2:
+                bm.free()
+                self.report({'WARNING'},
+                            "Can dung 2 diem dau cuoi (line dang co %d diem ho)" % len(ends))
+                return {'CANCELLED'}
+            try:
+                bm.edges.new((ends[0], ends[1]))
+            except ValueError:
+                bm.free()
+                self.report({'INFO'}, "Hai diem da duoc noi san")
+                return {'CANCELLED'}
+            bm.to_mesh(line.data)
+            bm.free()
+            line.data.update()
 
-    def _finish(self, context):
-        _stroke_cache[self.target.name] = {
-            "points": [p.copy() for p in self.points],
-            "normals": [n.copy() for n in self.normals],
-        }
-        self._cleanup(context)
-
-    def _cleanup(self, context):
-        if self._handle is not None:
-            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
-            self._handle = None
-        context.workspace.status_text_set(None)
-        if context.area:
-            context.area.tag_redraw()
-
-
-def _draw_callback(operator, context):
-    pts = list(operator.points)
-
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    gpu.state.line_width_set(2.0)
-    gpu.state.point_size_set(8.0)
-
-    # Vong kin (noi diem cuoi ve diem dau) neu du diem.
-    if len(pts) >= 2:
-        loop = pts + [pts[0]]
-        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": loop})
-        shader.bind()
-        shader.uniform_float("color", (0.1, 0.9, 0.2, 1.0))
-        batch.draw(shader)
-
-    # Doan tu diem cuoi toi con tro (preview).
-    if operator.preview is not None and len(pts) >= 1:
-        seg = [pts[-1], operator.preview]
-        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": seg})
-        shader.bind()
-        shader.uniform_float("color", (0.9, 0.9, 0.2, 1.0))
-        batch.draw(shader)
-
-    # Cac diem.
-    if pts:
-        batch = batch_for_shader(shader, 'POINTS', {"pos": pts})
-        shader.bind()
-        shader.uniform_float("color", (1.0, 0.3, 0.1, 1.0))
-        batch.draw(shader)
-
-    gpu.state.line_width_set(1.0)
-    gpu.state.point_size_set(1.0)
+        self.report({'INFO'}, "Da noi diem dau-cuoi (vong kin)")
+        return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
 # Operator: thuc hien cat -> Gingiva / Teeth
 # ---------------------------------------------------------------------------
 class GTSPLIT_OT_execute_cut(bpy.types.Operator):
-    """Dung cutter tu vong line da ve va tach object thanh Gingiva / Teeth"""
+    """Dung cutter tu vong line da ve va tach Target thanh Gingiva / Teeth"""
     bl_idname = "object.gtsplit_execute_cut"
     bl_label = "Tach object"
     bl_options = {'REGISTER', 'UNDO'}
@@ -463,32 +501,45 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
             self.report({'ERROR'}, "Vui long dang ky key de kich hoat su dung")
             return {'CANCELLED'}
 
-        target = context.active_object
-        if target is None or target.type != 'MESH':
-            self.report({'ERROR'}, "Hay chon object MESH can cat lam active")
-            return {'CANCELLED'}
-
-        data = _stroke_cache.get(target.name)
-        if not data or len(data["points"]) < 3:
-            self.report({'ERROR'}, "Chua co vong line. Hay 'Ve duong cat' truoc.")
-            return {'CANCELLED'}
-
         props = context.scene.gt_split
-        offset = props.offset
+        target = props.target_object
+        if target is None or target.type != 'MESH':
+            self.report({'ERROR'}, "Chua co Target Object")
+            return {'CANCELLED'}
+
+        line = props.line_object
+        if line is None or line.name not in bpy.data.objects:
+            self.report({'ERROR'}, "Chua co line. Hay 'Ve duong cat' truoc.")
+            return {'CANCELLED'}
+
         gap = props.gap
         if gap <= 0:
             self.report({'ERROR'}, "Gap phai > 0")
             return {'CANCELLED'}
 
+        # Ve Object Mode de doc/xu ly an toan.
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Doc vong line (da snap tren be mat nho Shrinkwrap) theo thu tu.
+        raw_pts, closed = _ordered_world_loop(line)
+        if not closed:
+            self.report({'ERROR'},
+                        "Vong chua kin. Hay nhan 'Noi diem dau-cuoi' truoc khi tach.")
+            return {'CANCELLED'}
+        if len(raw_pts) < 3:
+            self.report({'ERROR'}, "Can it nhat 3 diem de tao vong kin")
+            return {'CANCELLED'}
+
         # Resample + snap toan vong ve be mat -> vong kin day diem.
         loop_pts, loop_nrms = _resample_loop_on_surface(
-            target, data["points"], samples_per_edge=props.samples_per_edge)
+            target, raw_pts, samples_per_edge=props.samples_per_edge)
         if len(loop_pts) < 3:
             self.report({'ERROR'}, "Khong dung duoc vong tren be mat")
             return {'CANCELLED'}
 
         # Dung cutter.
-        cutter = _build_cutter(context, target, loop_pts, loop_nrms, offset, gap)
+        cutter = _build_cutter(context, target, loop_pts, loop_nrms, props.offset, gap)
         if cutter is None:
             self.report({'ERROR'}, "Khong dung duoc cutter")
             return {'CANCELLED'}
@@ -528,8 +579,6 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
         if len(pieces) < 2:
             self.report({'ERROR'},
                         "Vong line chua xuyen het be day object. Hay tang Gap hoac ve lai vong.")
-            # Don dep stroke da dung.
-            _stroke_cache.pop(target.name, None)
             return {'CANCELLED'}
 
         # Tinh the tich, sap xep, giu 2 manh lon nhat.
@@ -539,15 +588,11 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
 
         kept = vols[:2]
         scrap = vols[2:]
-        # Xoa cac manh vun nho (< 1% tong).
         removed = 0
         for o, v in scrap:
             if v < 0.01 * total:
                 bpy.data.objects.remove(o, do_unlink=True)
                 removed += 1
-            else:
-                # Manh dang ke ngoai 2 manh chinh -> giu lai, canh bao.
-                pass
 
         # kept[0] = lon nhat -> Teeth ; kept[1] = nho hon -> Gingiva
         teeth_obj, _tv = kept[0]
@@ -555,8 +600,10 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
         teeth_obj.name = "Teeth"
         gingiva_obj.name = "Gingiva"
 
-        # Don dep stroke.
-        _stroke_cache.pop(target.name, None)
+        # Don dep line.
+        if props.line_object is not None and props.line_object.name in bpy.data.objects:
+            bpy.data.objects.remove(props.line_object, do_unlink=True)
+        props.line_object = None
 
         msg = "Da tach: Teeth + Gingiva (%d manh)." % len(pieces)
         if removed:
@@ -570,21 +617,25 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
-# Operator: xoa stroke hien tai
+# Operator: xoa line hien tai
 # ---------------------------------------------------------------------------
 class GTSPLIT_OT_clear(bpy.types.Operator):
-    """Xoa vong line da ve cua object hien tai"""
+    """Xoa object line dang ve"""
     bl_idname = "object.gtsplit_clear"
     bl_label = "Xoa duong cat"
-    bl_options = {'REGISTER'}
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        target = context.active_object
-        if target is not None and target.name in _stroke_cache:
-            _stroke_cache.pop(target.name, None)
-            self.report({'INFO'}, "Da xoa vong line")
+        props = context.scene.gt_split
+        line = props.line_object
+        if line is not None and line.name in bpy.data.objects:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.data.objects.remove(line, do_unlink=True)
+            props.line_object = None
+            self.report({'INFO'}, "Da xoa line")
         else:
-            self.report({'INFO'}, "Khong co vong line de xoa")
+            self.report({'INFO'}, "Khong co line de xoa")
         return {'FINISHED'}
 
 
@@ -601,25 +652,45 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.gt_split
-        col = layout.column(align=True)
-        col.operator(GTSPLIT_OT_draw_line.bl_idname, text="Ve duong cat", icon='GREASEPENCIL')
 
-        target = context.active_object
-        if target is not None and target.name in _stroke_cache:
-            n = len(_stroke_cache[target.name]["points"])
-            col.label(text="Vong line: %d diem" % n, icon='CHECKMARK')
-            col.operator(GTSPLIT_OT_clear.bl_idname, text="Xoa duong cat", icon='X')
-        else:
-            col.label(text="Chua co vong line", icon='INFO')
-
-        layout.separator()
+        # 1) Target Object - nut doi ten thanh ten Target khi da chon.
         box = layout.box()
+        box.label(text="1. Target Object", icon='OBJECT_DATA')
+        target = props.target_object
+        if target is not None and target.name in bpy.data.objects:
+            box.operator(GTSPLIT_OT_set_target.bl_idname,
+                         text=target.name, icon='RESTRICT_SELECT_OFF')
+        else:
+            box.operator(GTSPLIT_OT_set_target.bl_idname,
+                         text="Chon Target Object", icon='EYEDROPPER')
+
+        # 2) Ve line.
+        box = layout.box()
+        box.label(text="2. Ve duong cat", icon='GREASEPENCIL')
+        col = box.column(align=True)
+        row = col.row()
+        row.enabled = target is not None
+        row.operator(GTSPLIT_OT_create_line.bl_idname, text="Ve duong cat (tao line)",
+                     icon='GREASEPENCIL')
+
+        line = props.line_object
+        has_line = line is not None and line.name in bpy.data.objects
+        col.label(text="Trong Edit Mode: nhan E de them diem", icon='INFO')
+        sub = col.column(align=True)
+        sub.enabled = has_line
+        sub.operator(GTSPLIT_OT_close_loop.bl_idname, text="Noi diem dau-cuoi (F)",
+                     icon='MESH_CIRCLE')
+        sub.operator(GTSPLIT_OT_clear.bl_idname, text="Xoa line", icon='X')
+
+        # 3) Tham so + tach.
+        box = layout.box()
+        box.label(text="3. Tach object", icon='MOD_BOOLEAN')
         box.prop(props, "offset")
         box.prop(props, "gap")
         box.prop(props, "samples_per_edge")
-
-        layout.separator()
-        layout.operator(GTSPLIT_OT_execute_cut.bl_idname, text="Tach object", icon='MOD_BOOLEAN')
+        row = box.row()
+        row.enabled = has_line and target is not None
+        row.operator(GTSPLIT_OT_execute_cut.bl_idname, text="Tach object", icon='MOD_BOOLEAN')
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +698,9 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
 # ---------------------------------------------------------------------------
 _classes = [
     GTSplitProps,
-    GTSPLIT_OT_draw_line,
+    GTSPLIT_OT_set_target,
+    GTSPLIT_OT_create_line,
+    GTSPLIT_OT_close_loop,
     GTSPLIT_OT_execute_cut,
     GTSPLIT_OT_clear,
     GTSPLIT_PT_panel,
