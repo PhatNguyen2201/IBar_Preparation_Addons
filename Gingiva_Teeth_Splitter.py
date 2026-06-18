@@ -46,6 +46,97 @@ def _select_object(obj, state=True, viewlayer=None):
 
 
 # ---------------------------------------------------------------------------
+# Surface snapping helpers
+# ---------------------------------------------------------------------------
+# Bat "Face Project" snapping kieu retopo: khi extrude/di chuyen, chinh DINH THAT
+# (tam/gizmo) duoc chieu thang xuong be mat Target, chu khong chi rieng cage hien
+# thi cua Shrinkwrap. Nho do ca tam va diem extrude deu nam tren be mat.
+_SNAP_BACKUP = None
+
+
+def _enable_surface_snap(context):
+    global _SNAP_BACKUP
+    ts = context.scene.tool_settings
+
+    if _SNAP_BACKUP is None:
+        backup = {"use_snap": ts.use_snap}
+        for attr in ("use_snap_translate", "use_snap_nonedit", "use_snap_self",
+                     "use_snap_project"):
+            if hasattr(ts, attr):
+                backup[attr] = getattr(ts, attr)
+        for attr in ("snap_elements", "snap_elements_individual"):
+            if hasattr(ts, attr):
+                backup[attr] = set(getattr(ts, attr))
+        _SNAP_BACKUP = backup
+
+    ts.use_snap = True
+    if hasattr(ts, "use_snap_translate"):
+        try:
+            ts.use_snap_translate = True
+        except Exception:
+            pass
+    # Blender 4.x: chieu tung phan tu len be mat object khac.
+    if hasattr(ts, "snap_elements_individual"):
+        try:
+            ts.snap_elements_individual = {'FACE_PROJECT'}
+        except Exception:
+            pass
+    elif hasattr(ts, "snap_elements"):
+        try:
+            ts.snap_elements = {'FACE'}
+        except Exception:
+            pass
+        if hasattr(ts, "use_snap_project"):
+            try:
+                ts.use_snap_project = True
+            except Exception:
+                pass
+    # Cho phep snap len object khong o edit mode (Target), khong snap len chinh line.
+    if hasattr(ts, "use_snap_nonedit"):
+        try:
+            ts.use_snap_nonedit = True
+        except Exception:
+            pass
+    if hasattr(ts, "use_snap_self"):
+        try:
+            ts.use_snap_self = False
+        except Exception:
+            pass
+
+
+def _restore_snap(context):
+    global _SNAP_BACKUP
+    if _SNAP_BACKUP is None:
+        return
+    ts = context.scene.tool_settings
+    for attr, value in _SNAP_BACKUP.items():
+        if hasattr(ts, attr):
+            try:
+                setattr(ts, attr, value)
+            except Exception:
+                pass
+    _SNAP_BACKUP = None
+
+
+def _snap_bmesh_verts_to_surface(bm, line, target):
+    """Ghi de toa do DINH THAT cua line ve dung be mat Target (world).
+
+    Dam bao moi diem (ke ca tam) nam tren be mat du truoc do co bi troi.
+    """
+    if target is None or target.type != 'MESH':
+        return
+    mw_t = target.matrix_world
+    mwi_t = mw_t.inverted()
+    mwl = line.matrix_world
+    mwi_l = mwl.inverted()
+    for v in bm.verts:
+        world_co = mwl @ v.co
+        hit, location, _nrm, _idx = target.closest_point_on_mesh(mwi_t @ world_co)
+        if hit:
+            v.co = mwi_l @ (mw_t @ location)
+
+
+# ---------------------------------------------------------------------------
 # License check (sao chép nguyen khoi tu Final_addon_Ibar_to_ORG.py).
 # Dung chung file key ~/addon_ibar.key voi add-on iBar hien tai.
 # ---------------------------------------------------------------------------
@@ -426,6 +517,9 @@ class GTSPLIT_OT_create_line(bpy.types.Operator):
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
 
+        # Bat snapping Face Project: dinh that duoc chieu len be mat khi extrude.
+        _enable_surface_snap(context)
+
         self.report(
             {'INFO'},
             "Nhan E de extrude diem tiep theo, xoay view tu do. Xong nhan 'Noi diem dau-cuoi'.")
@@ -448,6 +542,7 @@ class GTSPLIT_OT_close_loop(bpy.types.Operator):
             self.report({'ERROR'}, "Chua co line. Hay 'Ve duong cat' truoc.")
             return {'CANCELLED'}
 
+        target = props.target_object
         in_edit = (context.mode == 'EDIT_MESH' and context.edit_object == line)
 
         if in_edit:
@@ -462,6 +557,7 @@ class GTSPLIT_OT_close_loop(bpy.types.Operator):
             except ValueError:
                 self.report({'INFO'}, "Hai diem da duoc noi san")
                 return {'CANCELLED'}
+            _snap_bmesh_verts_to_surface(bm, line, target)
             bmesh.update_edit_mesh(line.data)
         else:
             bm = bmesh.new()
@@ -479,11 +575,12 @@ class GTSPLIT_OT_close_loop(bpy.types.Operator):
                 bm.free()
                 self.report({'INFO'}, "Hai diem da duoc noi san")
                 return {'CANCELLED'}
+            _snap_bmesh_verts_to_surface(bm, line, target)
             bm.to_mesh(line.data)
             bm.free()
             line.data.update()
 
-        self.report({'INFO'}, "Da noi diem dau-cuoi (vong kin)")
+        self.report({'INFO'}, "Da noi diem dau-cuoi (vong kin), moi diem da bam be mat")
         return {'FINISHED'}
 
 
@@ -600,10 +697,11 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
         teeth_obj.name = "Teeth"
         gingiva_obj.name = "Gingiva"
 
-        # Don dep line.
+        # Don dep line + khoi phuc cai dat snap cua nguoi dung.
         if props.line_object is not None and props.line_object.name in bpy.data.objects:
             bpy.data.objects.remove(props.line_object, do_unlink=True)
         props.line_object = None
+        _restore_snap(context)
 
         msg = "Da tach: Teeth + Gingiva (%d manh)." % len(pieces)
         if removed:
@@ -633,8 +731,10 @@ class GTSPLIT_OT_clear(bpy.types.Operator):
                 bpy.ops.object.mode_set(mode='OBJECT')
             bpy.data.objects.remove(line, do_unlink=True)
             props.line_object = None
+            _restore_snap(context)
             self.report({'INFO'}, "Da xoa line")
         else:
+            _restore_snap(context)
             self.report({'INFO'}, "Khong co line de xoa")
         return {'FINISHED'}
 
@@ -675,7 +775,7 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
 
         line = props.line_object
         has_line = line is not None and line.name in bpy.data.objects
-        col.label(text="Trong Edit Mode: nhan E de them diem", icon='INFO')
+        col.label(text="Edit Mode: E them diem (da bat snap be mat)", icon='INFO')
         sub = col.column(align=True)
         sub.enabled = has_line
         sub.operator(GTSPLIT_OT_close_loop.bl_idname, text="Noi diem dau-cuoi (F)",
