@@ -327,10 +327,14 @@ def _smooth_normals(normals, iterations=2):
     return result
 
 
-def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap):
+def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
+                  apply_solidify=True, name="GT_Cutter"):
     """Dung cutter ong kin treo tu vong line, solidify len do day gap.
 
-    Tra ve object cutter (da apply solidify), hoac None neu loi.
+    apply_solidify=True  -> apply luon Solidify (dung khi cat ngay).
+    apply_solidify=False -> giu Solidify dang modifier de xem truoc / chinh sua.
+
+    Tra ve object cutter, hoac None neu loi.
     """
     n = len(loop_pts)
     if n < 3:
@@ -373,11 +377,11 @@ def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap):
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
-    me = bpy.data.meshes.new("GT_cut_wall")
+    me = bpy.data.meshes.new(name)
     bm.to_mesh(me)
     bm.free()
 
-    cutter = bpy.data.objects.new("GT_cut_wall", me)
+    cutter = bpy.data.objects.new(name, me)
     context.collection.objects.link(cutter)
 
     # Solidify len do day Gap (giong pattern add-on iBar).
@@ -387,12 +391,32 @@ def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap):
     mod.thickness = gap
     mod.use_flip_normals = True
 
+    if apply_solidify:
+        bpy.ops.object.select_all(action='DESELECT')
+        _set_active_object(cutter, context.view_layer)
+        _select_object(cutter, True, context.view_layer)
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    return cutter
+
+
+def _apply_cutter_solidify(context, cutter, gap):
+    """Cap nhat do day gap roi apply Solidify cho cutter da co (truoc khi boolean)."""
+    sol = None
+    for m in cutter.modifiers:
+        if m.type == 'SOLIDIFY':
+            sol = m
+            break
+    if sol is None:
+        sol = cutter.modifiers.new(name="Solidify", type='SOLIDIFY')
+        sol.solidify_mode = 'NON_MANIFOLD'
+        sol.nonmanifold_thickness_mode = 'FIXED'
+        sol.use_flip_normals = True
+    sol.thickness = gap
     bpy.ops.object.select_all(action='DESELECT')
     _set_active_object(cutter, context.view_layer)
     _select_object(cutter, True, context.view_layer)
-    bpy.ops.object.modifier_apply(modifier="Solidify")
-
-    return cutter
+    bpy.ops.object.modifier_apply(modifier=sol.name)
 
 
 def _mesh_volume(obj):
@@ -411,6 +435,16 @@ def _poll_mesh(self, obj):
     return obj.type == 'MESH'
 
 
+def _gap_update(self, context):
+    """Cap nhat live do day Solidify cua cutter xem truoc khi keo Gap."""
+    cutter = self.cutter_object
+    if cutter is not None and cutter.name in bpy.data.objects:
+        for m in cutter.modifiers:
+            if m.type == 'SOLIDIFY':
+                m.thickness = self.gap
+                break
+
+
 class GTSplitProps(bpy.types.PropertyGroup):
     target_object: bpy.props.PointerProperty(
         name="Target Object",
@@ -423,6 +457,11 @@ class GTSplitProps(bpy.types.PropertyGroup):
         description="Object line dang ve",
         type=bpy.types.Object,
     )
+    cutter_object: bpy.props.PointerProperty(
+        name="Cutter Object",
+        description="Cutter xem truoc (co the chinh sua truoc khi Split)",
+        type=bpy.types.Object,
+    )
     offset: bpy.props.FloatProperty(
         name="Offset",
         description="Khoang cach mat cat so voi be mat object",
@@ -432,6 +471,7 @@ class GTSplitProps(bpy.types.PropertyGroup):
         name="Gap",
         description="Do day khe ho giua 2 thanh phan (phai > 0)",
         default=0.1, min=0.0001, unit='LENGTH',
+        update=_gap_update,
     )
     samples_per_edge: bpy.props.IntProperty(
         name="Smoothness",
@@ -487,11 +527,11 @@ class GTSPLIT_OT_create_line(bpy.types.Operator):
         if props.line_object is not None and props.line_object.name in bpy.data.objects:
             bpy.data.objects.remove(props.line_object, do_unlink=True)
 
-        # Diem bat dau: snap tam bounding-box ve be mat target.
-        center_world = _bbox_center_world(target)
-        local_center = target.matrix_world.inverted() @ center_world
-        hit, location, _nrm, _idx = target.closest_point_on_mesh(local_center)
-        start_world = target.matrix_world @ location if hit else center_world
+        # Diem bat dau: vi tri 3D Cursor hien tai, snap ve be mat target.
+        cursor_world = context.scene.cursor.location.copy()
+        local_cursor = target.matrix_world.inverted() @ cursor_world
+        hit, location, _nrm, _idx = target.closest_point_on_mesh(local_cursor)
+        start_world = target.matrix_world @ location if hit else cursor_world
 
         me = bpy.data.meshes.new("GT_Line")
         me.from_pydata([start_world], [], [])
@@ -585,12 +625,12 @@ class GTSPLIT_OT_close_loop(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
-# Operator: thuc hien cat -> Gingiva / Teeth
+# Operator: tao cutter de xem truoc / chinh sua
 # ---------------------------------------------------------------------------
-class GTSPLIT_OT_execute_cut(bpy.types.Operator):
-    """Dung cutter tu vong line da ve va tach Target thanh Gingiva / Teeth"""
-    bl_idname = "object.gtsplit_execute_cut"
-    bl_label = "Tach object"
+class GTSPLIT_OT_create_cutter(bpy.types.Operator):
+    """Tao cutter tu vong line de xem truoc va chinh sua (chua cat object)"""
+    bl_idname = "object.gtsplit_create_cutter"
+    bl_label = "Create Cutter"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -609,6 +649,68 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
             self.report({'ERROR'}, "Chua co line. Hay 'Ve duong cat' truoc.")
             return {'CANCELLED'}
 
+        # Ve Object Mode de doc/xu ly an toan.
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        raw_pts, closed = _ordered_world_loop(line)
+        if not closed:
+            self.report({'ERROR'},
+                        "Vong chua kin. Hay nhan 'Noi diem dau-cuoi' truoc.")
+            return {'CANCELLED'}
+        if len(raw_pts) < 3:
+            self.report({'ERROR'}, "Can it nhat 3 diem de tao vong kin")
+            return {'CANCELLED'}
+
+        loop_pts, loop_nrms = _resample_loop_on_surface(
+            target, raw_pts, samples_per_edge=props.samples_per_edge)
+        if len(loop_pts) < 3:
+            self.report({'ERROR'}, "Khong dung duoc vong tren be mat")
+            return {'CANCELLED'}
+
+        # Xoa cutter cu neu con.
+        if props.cutter_object is not None and props.cutter_object.name in bpy.data.objects:
+            bpy.data.objects.remove(props.cutter_object, do_unlink=True)
+
+        # Giu Solidify dang modifier de co the chinh sua / doi Gap truoc khi Split.
+        cutter = _build_cutter(context, target, loop_pts, loop_nrms,
+                               props.offset, props.gap,
+                               apply_solidify=False, name="GT_Cutter")
+        if cutter is None:
+            self.report({'ERROR'}, "Khong dung duoc cutter")
+            return {'CANCELLED'}
+
+        props.cutter_object = cutter
+        viewlayer = context.view_layer
+        bpy.ops.object.select_all(action='DESELECT')
+        _set_active_object(cutter, viewlayer)
+        _select_object(cutter, True, viewlayer)
+
+        self.report({'INFO'},
+                    "Da tao cutter. Co the chinh sua, doi Gap, roi nhan 'Split Object'.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Operator: thuc hien cat -> Gingiva / Teeth
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_execute_cut(bpy.types.Operator):
+    """Tach Target thanh Gingiva / Teeth bang cutter (tu cutter da tao hoac tu line)"""
+    bl_idname = "object.gtsplit_execute_cut"
+    bl_label = "Split Object"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if not hw_read_key():
+            self.report({'ERROR'}, "Vui long dang ky key de kich hoat su dung")
+            return {'CANCELLED'}
+
+        props = context.scene.gt_split
+        target = props.target_object
+        if target is None or target.type != 'MESH':
+            self.report({'ERROR'}, "Chua co Target Object")
+            return {'CANCELLED'}
+
         gap = props.gap
         if gap <= 0:
             self.report({'ERROR'}, "Gap phai > 0")
@@ -618,28 +720,37 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Doc vong line (da snap tren be mat nho Shrinkwrap) theo thu tu.
-        raw_pts, closed = _ordered_world_loop(line)
-        if not closed:
-            self.report({'ERROR'},
-                        "Vong chua kin. Hay nhan 'Noi diem dau-cuoi' truoc khi tach.")
-            return {'CANCELLED'}
-        if len(raw_pts) < 3:
-            self.report({'ERROR'}, "Can it nhat 3 diem de tao vong kin")
-            return {'CANCELLED'}
+        # Uu tien cutter da tao (xem truoc/chinh sua); neu chua co thi dung tu line.
+        cutter = props.cutter_object
+        if cutter is not None and cutter.name in bpy.data.objects:
+            _apply_cutter_solidify(context, cutter, gap)
+        else:
+            line = props.line_object
+            if line is None or line.name not in bpy.data.objects:
+                self.report({'ERROR'},
+                            "Chua co cutter/line. Hay 'Ve duong cat' & 'Create Cutter' truoc.")
+                return {'CANCELLED'}
 
-        # Resample + snap toan vong ve be mat -> vong kin day diem.
-        loop_pts, loop_nrms = _resample_loop_on_surface(
-            target, raw_pts, samples_per_edge=props.samples_per_edge)
-        if len(loop_pts) < 3:
-            self.report({'ERROR'}, "Khong dung duoc vong tren be mat")
-            return {'CANCELLED'}
+            raw_pts, closed = _ordered_world_loop(line)
+            if not closed:
+                self.report({'ERROR'},
+                            "Vong chua kin. Hay nhan 'Noi diem dau-cuoi' truoc khi tach.")
+                return {'CANCELLED'}
+            if len(raw_pts) < 3:
+                self.report({'ERROR'}, "Can it nhat 3 diem de tao vong kin")
+                return {'CANCELLED'}
 
-        # Dung cutter.
-        cutter = _build_cutter(context, target, loop_pts, loop_nrms, props.offset, gap)
-        if cutter is None:
-            self.report({'ERROR'}, "Khong dung duoc cutter")
-            return {'CANCELLED'}
+            loop_pts, loop_nrms = _resample_loop_on_surface(
+                target, raw_pts, samples_per_edge=props.samples_per_edge)
+            if len(loop_pts) < 3:
+                self.report({'ERROR'}, "Khong dung duoc vong tren be mat")
+                return {'CANCELLED'}
+
+            cutter = _build_cutter(context, target, loop_pts, loop_nrms,
+                                   props.offset, gap, apply_solidify=True)
+            if cutter is None:
+                self.report({'ERROR'}, "Khong dung duoc cutter")
+                return {'CANCELLED'}
 
         viewlayer = context.view_layer
 
@@ -658,6 +769,7 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
 
         # Xoa cutter.
         bpy.data.objects.remove(cutter, do_unlink=True)
+        props.cutter_object = None
 
         # Separate by LOOSE.
         before = set(context.scene.objects)
@@ -725,17 +837,26 @@ class GTSPLIT_OT_clear(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.gt_split
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        removed_any = False
+        if props.cutter_object is not None and props.cutter_object.name in bpy.data.objects:
+            bpy.data.objects.remove(props.cutter_object, do_unlink=True)
+            props.cutter_object = None
+            removed_any = True
+
         line = props.line_object
         if line is not None and line.name in bpy.data.objects:
-            if context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
             bpy.data.objects.remove(line, do_unlink=True)
             props.line_object = None
-            _restore_snap(context)
-            self.report({'INFO'}, "Da xoa line")
+            removed_any = True
+
+        _restore_snap(context)
+        if removed_any:
+            self.report({'INFO'}, "Da xoa line / cutter")
         else:
-            _restore_snap(context)
-            self.report({'INFO'}, "Khong co line de xoa")
+            self.report({'INFO'}, "Khong co line/cutter de xoa")
         return {'FINISHED'}
 
 
@@ -775,22 +896,37 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
 
         line = props.line_object
         has_line = line is not None and line.name in bpy.data.objects
+        col.label(text="Diem dau = vi tri 3D Cursor", icon='PIVOT_CURSOR')
         col.label(text="Edit Mode: E them diem (da bat snap be mat)", icon='INFO')
         sub = col.column(align=True)
         sub.enabled = has_line
         sub.operator(GTSPLIT_OT_close_loop.bl_idname, text="Noi diem dau-cuoi (F)",
                      icon='MESH_CIRCLE')
-        sub.operator(GTSPLIT_OT_clear.bl_idname, text="Xoa line", icon='X')
+        sub.operator(GTSPLIT_OT_clear.bl_idname, text="Xoa line / cutter", icon='X')
 
-        # 3) Tham so + tach.
+        cutter = props.cutter_object
+        has_cutter = cutter is not None and cutter.name in bpy.data.objects
+
+        # 3) Tao cutter (xem truoc + chinh sua).
         box = layout.box()
-        box.label(text="3. Tach object", icon='MOD_BOOLEAN')
+        box.label(text="3. Create Cutter (xem truoc)", icon='MOD_SOLIDIFY')
         box.prop(props, "offset")
-        box.prop(props, "gap")
         box.prop(props, "samples_per_edge")
         row = box.row()
         row.enabled = has_line and target is not None
-        row.operator(GTSPLIT_OT_execute_cut.bl_idname, text="Tach object", icon='MOD_BOOLEAN')
+        row.operator(GTSPLIT_OT_create_cutter.bl_idname, text="Create Cutter",
+                     icon='MOD_SOLIDIFY')
+        if has_cutter:
+            box.label(text="Cutter san sang - co the chinh sua", icon='CHECKMARK')
+
+        # 4) Chon Gap + Split.
+        box = layout.box()
+        box.label(text="4. Split Object", icon='MOD_BOOLEAN')
+        box.prop(props, "gap")
+        row = box.row()
+        row.enabled = (has_cutter or has_line) and target is not None
+        row.operator(GTSPLIT_OT_execute_cut.bl_idname, text="Split Object",
+                     icon='MOD_BOOLEAN')
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +937,7 @@ _classes = [
     GTSPLIT_OT_set_target,
     GTSPLIT_OT_create_line,
     GTSPLIT_OT_close_loop,
+    GTSPLIT_OT_create_cutter,
     GTSPLIT_OT_execute_cut,
     GTSPLIT_OT_clear,
     GTSPLIT_PT_panel,
