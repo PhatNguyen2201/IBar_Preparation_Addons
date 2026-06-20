@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Gingiva/Teeth Surface Splitter",
     "author": "Phat Nguyen",
-    "version": (2, 6, 0),
+    "version": (2, 7, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > IBAR Split",
     "description": "Ve mot vong line dang object bam tren be mat Target va tach thanh Gingiva / Teeth",
@@ -14,7 +14,119 @@ import os
 import math
 import uuid
 import hashlib
+import re
+import json
+import shutil
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
 from mathutils import Vector
+
+
+# ---------------------------------------------------------------------------
+# Auto-update tu GitHub (giong add-on iBar to ORG). Kiem tra version tren repo,
+# tai file moi ve ghi de file add-on hien tai (luu backup .bak). Chay NEN luc
+# khoi dong (timer) + co nut "Check Update" / "Update" tren panel.
+# ---------------------------------------------------------------------------
+GITHUB_OWNER = "PhatNguyen2201"
+GITHUB_REPO = "IBar_Preparation_Addons"
+GITHUB_BRANCH = "main"
+GITHUB_FILE_PATH = "Gingiva_Teeth_Splitter.py"   # ten file add-on tren repo
+GITHUB_BRANCH_FALLBACKS = ("main", "master")
+
+
+def _version_to_str(version_tuple):
+    return ".".join(str(v) for v in version_tuple)
+
+
+def _http_get_text(url):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Blender-GingivaSplit-Updater"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read().decode("utf-8")
+
+
+def _discover_remote_download_url():
+    """Tim download_url cua file add-on tren GitHub (thu cac branch + ten file)."""
+    branches = [GITHUB_BRANCH] + [b for b in GITHUB_BRANCH_FALLBACKS if b != GITHUB_BRANCH]
+    file_candidates = [GITHUB_FILE_PATH]
+    try:
+        file_candidates.append(Path(__file__).name)
+    except Exception:
+        pass
+    last_error = None
+
+    for branch in branches:
+        api_url = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+                   f"/contents/?ref={branch}")
+        try:
+            root_items = json.loads(_http_get_text(api_url))
+        except Exception as err:
+            last_error = err
+            continue
+
+        if not isinstance(root_items, list):
+            continue
+
+        for candidate in file_candidates:
+            for item in root_items:
+                if item.get("type") == "file" and item.get("name") == candidate:
+                    download_url = item.get("download_url")
+                    if download_url:
+                        return download_url
+
+    raise FileNotFoundError(
+        f"Khong tim thay file add-on tren GitHub ({GITHUB_OWNER}/{GITHUB_REPO}). "
+        f"Loi cuoi: {last_error}")
+
+
+def _fetch_remote_addon_source():
+    return _http_get_text(_discover_remote_download_url())
+
+
+def _extract_version_from_source(source_text):
+    match = re.search(r'"version"\s*:\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)', source_text)
+    if not match:
+        raise ValueError("Khong tim thay thong tin version trong file update")
+    return tuple(int(item) for item in match.groups())
+
+
+def _get_remote_version_and_source():
+    source_text = _fetch_remote_addon_source()
+    return _extract_version_from_source(source_text), source_text
+
+
+def _auto_update_worker():
+    """Chay trong thread nen luc khoi dong: neu repo co ban moi hon -> tai ve ghi de."""
+    local_version = tuple(bl_info.get("version", (0, 0, 0)))
+    try:
+        remote_version, remote_source = _get_remote_version_and_source()
+    except Exception as e:
+        print(f"[Gingiva Split Auto-Update] Khong the kiem tra update: {e}")
+        return
+    if remote_version <= local_version:
+        print(f"[Gingiva Split Auto-Update] Dang dung ban moi nhat "
+              f"{_version_to_str(local_version)}")
+        return
+    try:
+        addon_file = Path(__file__)
+    except Exception:
+        return
+    backup_file = addon_file.with_suffix(addon_file.suffix + ".bak")
+    try:
+        shutil.copy2(addon_file, backup_file)
+        addon_file.write_text(remote_source, encoding="utf-8")
+        print(f"[Gingiva Split Auto-Update] Da cap nhat len "
+              f"{_version_to_str(remote_version)}. Vui long disable/enable lai "
+              "add-on hoac khoi dong lai Blender.")
+    except Exception as e:
+        print(f"[Gingiva Split Auto-Update] Cap nhat that bai: {e}")
+
+
+def _schedule_auto_update():
+    threading.Thread(target=_auto_update_worker, daemon=True).start()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1771,18 +1883,93 @@ class GTSPLIT_OT_export_stl(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# Operator: kiem tra / cap nhat add-on tu GitHub (giong iBar to ORG)
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_check_update(bpy.types.Operator):
+    """Kiem tra xem co ban add-on moi hon tren GitHub khong"""
+    bl_idname = "object.gtsplit_check_update"
+    bl_label = "Check Update"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        local_version = tuple(bl_info.get("version", (0, 0, 0)))
+        try:
+            remote_version, _ = _get_remote_version_and_source()
+        except urllib.error.HTTPError as err:
+            self.report({'ERROR'}, "Loi HTTP khi kiem tra update: %s" % err.code)
+            return {'FINISHED'}
+        except Exception as err:
+            self.report({'ERROR'}, "Khong the kiem tra update: %s" % err)
+            return {'FINISHED'}
+
+        if remote_version > local_version:
+            self.report({'INFO'}, "Co ban moi: %s -> %s" % (
+                _version_to_str(local_version), _version_to_str(remote_version)))
+        else:
+            self.report({'INFO'}, "Dang la ban moi nhat: %s"
+                        % _version_to_str(local_version))
+        return {'FINISHED'}
+
+
+class GTSPLIT_OT_update_from_github(bpy.types.Operator):
+    """Tai ban add-on moi nhat tu GitHub ve ghi de (luu backup .bak)"""
+    bl_idname = "object.gtsplit_update_from_github"
+    bl_label = "Update From GitHub"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        local_version = tuple(bl_info.get("version", (0, 0, 0)))
+        try:
+            remote_version, remote_source = _get_remote_version_and_source()
+        except urllib.error.HTTPError as err:
+            self.report({'ERROR'}, "Loi HTTP khi tai update: %s" % err.code)
+            return {'FINISHED'}
+        except Exception as err:
+            self.report({'ERROR'}, "Khong the tai update: %s" % err)
+            return {'FINISHED'}
+
+        if remote_version <= local_version:
+            self.report({'INFO'}, "Khong co ban moi hon %s"
+                        % _version_to_str(local_version))
+            return {'FINISHED'}
+
+        try:
+            addon_file = Path(__file__)
+        except Exception:
+            self.report({'ERROR'}, "Khong xac dinh duoc duong dan file add-on")
+            return {'FINISHED'}
+        backup_file = addon_file.with_suffix(addon_file.suffix + ".bak")
+        try:
+            shutil.copy2(addon_file, backup_file)
+            addon_file.write_text(remote_source, encoding="utf-8")
+        except Exception as err:
+            self.report({'ERROR'}, "Cap nhat that bai: %s" % err)
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "Da cap nhat len %s. Vui long disable/enable lai "
+                    "add-on hoac khoi dong lai Blender." % _version_to_str(remote_version))
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
 class GTSPLIT_PT_panel(bpy.types.Panel):
-    bl_label = "Gingiva / Teeth Split"
+    bl_label = "Gingiva Split"
     bl_idname = "OBJECT_PT_gtsplit"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Split"
+    bl_category = "Gingiva Split"
 
     def draw(self, context):
         layout = self.layout
         props = context.scene.gt_split
+
+        # 0) Cap nhat add-on tu GitHub.
+        row0 = layout.row(align=True)
+        row0.operator(GTSPLIT_OT_check_update.bl_idname, text="Check Update", icon='URL')
+        row0.operator(GTSPLIT_OT_update_from_github.bl_idname, text="Update",
+                      icon='FILE_REFRESH')
 
         # 1) Target Object - nut doi ten thanh ten Target khi da chon.
         box = layout.box()
@@ -1890,6 +2077,8 @@ _classes = [
     GTSPLIT_OT_clear,
     GTSPLIT_OT_install_pymeshlab,
     GTSPLIT_OT_export_stl,
+    GTSPLIT_OT_check_update,
+    GTSPLIT_OT_update_from_github,
     GTSPLIT_PT_panel,
 ]
 
@@ -1907,9 +2096,19 @@ def register():
         threading.Thread(target=_pymeshlab_ready, daemon=True).start()
     except Exception:
         pass
+    # Tu dong kiem tra/cap nhat add-on tu GitHub sau 5s (giong iBar to ORG).
+    try:
+        bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
+    except Exception:
+        pass
 
 
 def unregister():
+    try:
+        if bpy.app.timers.is_registered(_schedule_auto_update):
+            bpy.app.timers.unregister(_schedule_auto_update)
+    except Exception:
+        pass
     if hasattr(bpy.types.Scene, "gt_split"):
         del bpy.types.Scene.gt_split
     for cls in reversed(_classes):
