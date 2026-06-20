@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Gingiva/Teeth Surface Splitter",
     "author": "Phat Nguyen",
-    "version": (2, 5, 3),
+    "version": (2, 6, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > IBAR Split",
     "description": "Ve mot vong line dang object bam tren be mat Target va tach thanh Gingiva / Teeth",
@@ -50,6 +50,12 @@ MARGIN_SHRINKWRAP_OFFSET = 0.1   # Shrinkwrap Offset (Above Surface) ~0.1 mm.
 MARGIN_SMOOTH_FACTOR = 0.5       # Smooth Factor.
 MARGIN_SMOOTH_REPEAT = 4         # Smooth Repeat (iterations).
 MARGIN_LOOP_SMOOTH_ITERS = 10    # so vong lam muot + cach deu duong rim (khu rang cua).
+
+# Mau hien thi (viewport) cho tung doi tuong (R, G, B, Alpha). Alpha < 1 = trong suot.
+TARGET_COLOR = (0.55, 0.75, 1.00, 1.0)    # Target: xanh duong nhat.
+CUTTER_COLOR = (0.20, 0.80, 0.30, 1.0)    # Cutter: xanh la.
+GINGIVA_COLOR = (0.80, 0.10, 0.12, 0.6)   # Gingiva: do, transparency 40% (alpha 0.6).
+TEETH_COLOR = (0.96, 0.93, 0.80, 1.0)     # Teeth: trang nga vang.
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +883,7 @@ def _remesh_basin_pymeshlab(env, bm, loop_pts, target_len, iterations):
 
 
 def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
-                  apply_solidify=True, name="GT_Cutter"):
+                  add_solidify=True, apply_solidify=True, name="GT_Cutter"):
     """Dung cutter "long chao" theo thuat toan extrude + be mat offset + remesh.
 
     Quy trinh:
@@ -890,10 +896,9 @@ def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
          (buoc "Create Cutter"). Moi dinh day duoc chieu ve dung be mat offset
          (robust ca khi margin lom/hinh mong ngua, khong dung quat-ve-tam).
 
-    Giu Solidify (do day gap) dang modifier de xem truoc / boolean.
-
-    apply_solidify=True  -> apply luon Solidify (dung khi cat ngay).
-    apply_solidify=False -> giu Solidify dang modifier de xem truoc / chinh sua.
+    add_solidify=False   -> KHONG them Solidify (buoc Create Cutter: de nguoi dung
+                            sculpt lai cutter truoc, do day gap them o buoc Split).
+    add_solidify=True + apply_solidify=True -> them & apply luon (cat ngay tu line).
 
     Tra ve object cutter, hoac None neu loi.
     """
@@ -1049,19 +1054,25 @@ def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
     for poly in cutter.data.polygons:
         poly.use_smooth = True
 
+    # Mau cutter: xanh la.
+    _set_display_color(cutter, CUTTER_COLOR, "GT_CutterMat")
+
     # Solidify len do day Gap. use_flip_normals=False -> day vao trong than object
     # (normal da huong ra ngoai) de boolean DIFFERENCE cat dut, tach 2 manh.
-    mod = cutter.modifiers.new(name="Solidify", type='SOLIDIFY')
-    mod.solidify_mode = 'NON_MANIFOLD'
-    mod.nonmanifold_thickness_mode = 'FIXED'
-    mod.thickness = gap
-    mod.use_flip_normals = False
+    # Buoc Create Cutter (add_solidify=False) KHONG them Solidify: nguoi dung sculpt
+    # lai cutter truoc; do day gap se them & apply o buoc 4 (Split).
+    if add_solidify:
+        mod = cutter.modifiers.new(name="Solidify", type='SOLIDIFY')
+        mod.solidify_mode = 'NON_MANIFOLD'
+        mod.nonmanifold_thickness_mode = 'FIXED'
+        mod.thickness = gap
+        mod.use_flip_normals = False
 
-    if apply_solidify:
-        bpy.ops.object.select_all(action='DESELECT')
-        _set_active_object(cutter, context.view_layer)
-        _select_object(cutter, True, context.view_layer)
-        bpy.ops.object.modifier_apply(modifier=mod.name)
+        if apply_solidify:
+            bpy.ops.object.select_all(action='DESELECT')
+            _set_active_object(cutter, context.view_layer)
+            _select_object(cutter, True, context.view_layer)
+            bpy.ops.object.modifier_apply(modifier=mod.name)
 
     return cutter
 
@@ -1092,6 +1103,58 @@ def _mesh_volume(obj):
     vol = abs(bm.calc_volume(signed=True))
     bm.free()
     return vol
+
+
+def _set_display_color(obj, rgba, mat_name):
+    """Dat mau hien thi cho obj: ca material (Principled BSDF + alpha) lan obj.color
+    -> hien dung mau o Solid (Material/Object color), Material Preview va Rendered.
+    Alpha < 1 -> bat trong suot (BLEND). Thay the toan bo material slot cua obj."""
+    if obj is None or obj.type != 'MESH':
+        return
+    r, g, b, a = rgba
+    obj.color = (r, g, b, a)
+
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(mat_name)
+    mat.use_nodes = True
+    mat.diffuse_color = (r, g, b, a)   # mau viewport Solid (color_type = MATERIAL)
+
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf is None:
+        for nd in mat.node_tree.nodes:
+            if nd.type == 'BSDF_PRINCIPLED':
+                bsdf = nd
+                break
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = a
+
+    # Trong suot: ho tro ca EEVEE cu (blend_method) lan EEVEE Next 4.2+ (render method).
+    if a < 1.0:
+        if hasattr(mat, "blend_method"):
+            try:
+                mat.blend_method = 'BLEND'
+            except Exception:
+                pass
+        if hasattr(mat, "surface_render_method"):
+            try:
+                mat.surface_render_method = 'BLENDED'
+            except Exception:
+                pass
+        if hasattr(mat, "show_transparent_back"):
+            mat.show_transparent_back = False
+    else:
+        if hasattr(mat, "blend_method"):
+            try:
+                mat.blend_method = 'OPAQUE'
+            except Exception:
+                pass
+
+    me = obj.data
+    me.materials.clear()
+    me.materials.append(mat)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1191,16 @@ class GTSplitProps(bpy.types.PropertyGroup):
         description="Cutter xem truoc (co the chinh sua truoc khi Split)",
         type=bpy.types.Object,
     )
+    teeth_object: bpy.props.PointerProperty(
+        name="Teeth Object",
+        description="Manh Teeth sau khi tach (de luu STL)",
+        type=bpy.types.Object,
+    )
+    gingiva_object: bpy.props.PointerProperty(
+        name="Gingiva Object",
+        description="Manh Gingiva sau khi tach (de luu STL)",
+        type=bpy.types.Object,
+    )
     offset: bpy.props.FloatProperty(
         name="Offset",
         description="Khoang cach mat cat so voi be mat object",
@@ -1156,6 +1229,8 @@ class GTSPLIT_OT_set_target(bpy.types.Operator):
             self.report({'ERROR'}, "Hay chon mot object MESH lam active truoc")
             return {'CANCELLED'}
         context.scene.gt_split.target_object = obj
+        # Mau Target: xanh duong nhat.
+        _set_display_color(obj, TARGET_COLOR, "GT_TargetMat")
         self.report({'INFO'}, "Da dat Target: %s" % obj.name)
         return {'FINISHED'}
 
@@ -1327,10 +1402,12 @@ class GTSPLIT_OT_create_cutter(bpy.types.Operator):
         if props.cutter_object is not None and props.cutter_object.name in bpy.data.objects:
             bpy.data.objects.remove(props.cutter_object, do_unlink=True)
 
-        # Giu Solidify dang modifier de co the chinh sua / doi Gap truoc khi Split.
+        # KHONG them Solidify o buoc nay: de nguoi dung sculpt lai cutter truoc.
+        # Do day gap se duoc them & apply o buoc 4 (Split).
         cutter = _build_cutter(context, target, loop_pts, loop_nrms,
                                props.offset, props.gap,
-                               apply_solidify=False, name="GT_Cutter")
+                               add_solidify=False, apply_solidify=False,
+                               name="GT_Cutter")
         if cutter is None:
             self.report({'ERROR'}, "Khong dung duoc cutter")
             return {'CANCELLED'}
@@ -1343,10 +1420,49 @@ class GTSPLIT_OT_create_cutter(bpy.types.Operator):
 
         if _PYMESHLAB_ENV is not None:
             self.report({'INFO'},
-                        "Da tao cutter (luoi min PyMeshLab). Chinh sua/doi Gap roi 'Split Object'.")
+                        "Da tao cutter (luoi min PyMeshLab). Co the 'Sculpt Cutter' roi chon Gap & 'Split Object'.")
         else:
             self.report({'WARNING'},
                         "Da tao cutter voi luoi co ban. Bam 'Cai PyMeshLab' de co luoi min nhu iBar.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Operator: sculpt lai cutter (truoc khi them do day & cat)
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_sculpt_cutter(bpy.types.Operator):
+    """Vao Sculpt Mode de chinh sua (sculpt) be mat cutter truoc khi Split.
+    Nhan Tab (hoac nut nay lan nua) de quay lai Object Mode."""
+    bl_idname = "object.gtsplit_sculpt_cutter"
+    bl_label = "Sculpt Cutter"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = context.scene.gt_split
+        cutter = props.cutter_object
+        if cutter is None or cutter.name not in bpy.data.objects:
+            self.report({'ERROR'}, "Chua co cutter. Hay 'Create Cutter' truoc.")
+            return {'CANCELLED'}
+
+        viewlayer = context.view_layer
+        # Dang sculpt chinh cutter -> bam lan nua = thoat ve Object Mode.
+        if context.mode == 'SCULPT' and context.active_object == cutter:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            self.report({'INFO'}, "Da thoat Sculpt Mode.")
+            return {'FINISHED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        _set_active_object(cutter, viewlayer)
+        _select_object(cutter, True, viewlayer)
+        try:
+            bpy.ops.object.mode_set(mode='SCULPT')
+        except Exception as ex:
+            self.report({'ERROR'}, "Khong vao duoc Sculpt Mode: %s" % ex)
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    "Sculpt Mode: chinh sua cutter. Tab (hoac bam 'Sculpt Cutter' lai) de xong.")
         return {'FINISHED'}
 
 
@@ -1461,6 +1577,12 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
         gingiva_obj, _gv = kept[1]
         teeth_obj.name = "Teeth"
         gingiva_obj.name = "Gingiva"
+
+        # Mau: Gingiva do (transparency 40%), Teeth trang nga vang.
+        _set_display_color(gingiva_obj, GINGIVA_COLOR, "GT_GingivaMat")
+        _set_display_color(teeth_obj, TEETH_COLOR, "GT_TeethMat")
+        props.teeth_object = teeth_obj
+        props.gingiva_object = gingiva_obj
 
         # Don dep line + khoi phuc cai dat snap cua nguoi dung.
         if props.line_object is not None and props.line_object.name in bpy.data.objects:
@@ -1586,6 +1708,69 @@ class GTSPLIT_OT_install_pymeshlab(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# Operator: luu STL (Teeth / Gingiva) - mo hop thoai chon duong dan
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_export_stl(bpy.types.Operator):
+    """Luu manh (Teeth hoac Gingiva) ra file STL - chon duong dan luu"""
+    bl_idname = "object.gtsplit_export_stl"
+    bl_label = "Luu STL"
+    bl_options = {'REGISTER'}
+
+    which: bpy.props.StringProperty(default="teeth")  # "teeth" hoac "gingiva"
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filename_ext = ".stl"
+    filter_glob: bpy.props.StringProperty(default="*.stl", options={'HIDDEN'})
+
+    def _target_obj(self, context):
+        props = context.scene.gt_split
+        obj = props.teeth_object if self.which == "teeth" else props.gingiva_object
+        if obj is not None and obj.name in bpy.data.objects:
+            return obj
+        return None
+
+    def invoke(self, context, event):
+        obj = self._target_obj(context)
+        if obj is None:
+            self.report({'ERROR'}, "Chua co manh de luu. Hay 'Split Object' truoc.")
+            return {'CANCELLED'}
+        if not self.filepath:
+            self.filepath = obj.name + ".stl"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        obj = self._target_obj(context)
+        if obj is None:
+            self.report({'ERROR'}, "Manh khong con ton tai")
+            return {'CANCELLED'}
+
+        fp = bpy.path.abspath(self.filepath)
+        if not fp.lower().endswith(".stl"):
+            fp += ".stl"
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        viewlayer = context.view_layer
+        bpy.ops.object.select_all(action='DESELECT')
+        _set_active_object(obj, viewlayer)
+        _select_object(obj, True, viewlayer)
+
+        # Blender 4.x: exporter STL moi la bpy.ops.wm.stl_export; fallback ban cu.
+        try:
+            bpy.ops.wm.stl_export(filepath=fp, export_selected_objects=True,
+                                  apply_modifiers=True)
+        except Exception:
+            try:
+                bpy.ops.export_mesh.stl(filepath=fp, use_selection=True)
+            except Exception as ex:
+                self.report({'ERROR'}, "Khong xuat duoc STL: %s" % ex)
+                return {'CANCELLED'}
+
+        self.report({'INFO'}, "Da luu %s: %s" % (obj.name, fp))
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
 class GTSPLIT_PT_panel(bpy.types.Panel):
@@ -1641,7 +1826,13 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
         row.operator(GTSPLIT_OT_create_cutter.bl_idname, text="Create Cutter",
                      icon='MOD_SOLIDIFY')
         if has_cutter:
-            box.label(text="Cutter san sang - co the chinh sua", icon='CHECKMARK')
+            box.label(text="Cutter san sang - co the sculpt lai", icon='CHECKMARK')
+            sculpting = (context.mode == 'SCULPT'
+                         and context.active_object == cutter)
+            box.operator(GTSPLIT_OT_sculpt_cutter.bl_idname,
+                         text="Xong Sculpt (ve Object Mode)" if sculpting
+                         else "Sculpt Cutter",
+                         icon='SCULPTMODE_HLT')
 
         # Trang thai PyMeshLab (luoi min nhu iBar). Chi DOC cache (khong chay
         # subprocess trong draw). Kiem tra that su xay ra o Create Cutter.
@@ -1655,7 +1846,7 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
             box.operator(GTSPLIT_OT_install_pymeshlab.bl_idname,
                          text="Cai PyMeshLab (luoi min nhu iBar)", icon='IMPORT')
 
-        # 4) Chon Gap + Split.
+        # 4) Chon Gap + Split (Gap se duoc them & apply vao cutter khi Split).
         box = layout.box()
         box.label(text="4. Split Object", icon='MOD_BOOLEAN')
         box.prop(props, "gap")
@@ -1663,6 +1854,26 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
         row.enabled = (has_cutter or has_line) and target is not None
         row.operator(GTSPLIT_OT_execute_cut.bl_idname, text="Split Object",
                      icon='MOD_BOOLEAN')
+
+        # 5) Luu STL Teeth / Gingiva.
+        teeth = props.teeth_object
+        gingiva = props.gingiva_object
+        has_teeth = teeth is not None and teeth.name in bpy.data.objects
+        has_gingiva = gingiva is not None and gingiva.name in bpy.data.objects
+        if has_teeth or has_gingiva:
+            box = layout.box()
+            box.label(text="5. Luu STL", icon='EXPORT')
+            col = box.column(align=True)
+            r = col.row()
+            r.enabled = has_teeth
+            op = r.operator(GTSPLIT_OT_export_stl.bl_idname, text="Luu Teeth (STL)",
+                            icon='EXPORT')
+            op.which = "teeth"
+            r = col.row()
+            r.enabled = has_gingiva
+            op = r.operator(GTSPLIT_OT_export_stl.bl_idname, text="Luu Gingiva (STL)",
+                            icon='EXPORT')
+            op.which = "gingiva"
 
 
 # ---------------------------------------------------------------------------
@@ -1674,9 +1885,11 @@ _classes = [
     GTSPLIT_OT_create_line,
     GTSPLIT_OT_close_loop,
     GTSPLIT_OT_create_cutter,
+    GTSPLIT_OT_sculpt_cutter,
     GTSPLIT_OT_execute_cut,
     GTSPLIT_OT_clear,
     GTSPLIT_OT_install_pymeshlab,
+    GTSPLIT_OT_export_stl,
     GTSPLIT_PT_panel,
 ]
 
