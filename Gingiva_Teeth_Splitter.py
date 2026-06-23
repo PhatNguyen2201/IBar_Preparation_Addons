@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Gingiva/Teeth Surface Splitter",
     "author": "Phat Nguyen",
-    "version": (2, 7, 0),
+    "version": (2, 8, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > IBAR Split",
     "description": "Ve mot vong line dang object bam tren be mat Target va tach thanh Gingiva / Teeth",
@@ -168,6 +168,14 @@ TARGET_COLOR = (0.55, 0.75, 1.00, 1.0)    # Target: xanh duong nhat.
 CUTTER_COLOR = (0.20, 0.80, 0.30, 1.0)    # Cutter: xanh la.
 GINGIVA_COLOR = (0.80, 0.10, 0.12, 0.6)   # Gingiva: do, transparency 40% (alpha 0.6).
 TEETH_COLOR = (0.96, 0.93, 0.80, 1.0)     # Teeth: trang nga vang.
+
+# Alpha Target khi bam nut "trong suot" o buoc 3 (nhin xuyen qua de sculpt cutter
+# ben duoi). Nut nay bat/tat giua gia tri nay va 1.0 (hien ro).
+TARGET_ALPHA_FADED = 0.4
+
+# Khoa duong hoan tat (rim/margin) khi sculpt cutter: rim + so vong ke ben duoc
+# dat sculpt mask = 1.0 (brush khong tac dong) -> sculpt khong lam bien dang margin.
+MARGIN_LOCK_RINGS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +635,53 @@ def _orient_faces_outward(obj, bbox_center):
             bmesh.ops.reverse_faces(bm, faces=bm.faces[:])
     bm.to_mesh(obj.data)
     bm.free()
+
+
+def _lock_margin_mask(obj, rings=MARGIN_LOCK_RINGS):
+    """Khoa DUONG HOAN TAT (rim/boundary) cua cutter bang sculpt mask = 1.0, lan
+    them `rings` vong ke ben. Trong Sculpt Mode, dinh co mask=1.0 KHONG bi brush
+    tac dong -> nguoi dung sculpt mat long chao ma KHONG lam bien dang duong hoan
+    tat (margin). Mask=0.0 = sculpt tu do."""
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    locked = set(v for e in bm.edges if e.is_boundary for v in e.verts)
+    if not locked:
+        bm.free()
+        return
+    # Mo rong dai khoa them `rings` vong ke duong hoan tat (giu margin that su cung).
+    frontier = set(locked)
+    for _ in range(max(0, rings)):
+        nxt = set()
+        for v in frontier:
+            for e in v.link_edges:
+                ov = e.other_vert(v)
+                if ov not in locked:
+                    nxt.add(ov)
+        locked |= nxt
+        frontier = nxt
+    # Ghi sculpt mask qua bmesh paint_mask (on dinh nhieu ban Blender).
+    try:
+        layer = bm.verts.layers.paint_mask.verify()
+        for v in bm.verts:
+            v[layer] = 1.0 if v in locked else 0.0
+        bm.to_mesh(me)
+        bm.free()
+        return
+    except Exception:
+        idx = set(v.index for v in locked)
+        bm.free()
+    # Fallback: ghi thang attribute .sculpt_mask (Blender 4.x).
+    try:
+        mask = me.attributes.get(".sculpt_mask")
+        if mask is None:
+            mask = me.attributes.new(".sculpt_mask", 'FLOAT', 'POINT')
+        for i, d in enumerate(mask.data):
+            d.value = 1.0 if i in idx else 0.0
+    except Exception as ex:
+        print("[GTSplit] Khong khoa duoc duong hoan tat (mask):", ex)
 
 
 def _smooth_floor_bmesh(bm, move_layer, factor, iterations):
@@ -1169,6 +1224,10 @@ def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
     # Mau cutter: xanh la.
     _set_display_color(cutter, CUTTER_COLOR, "GT_CutterMat")
 
+    # Khoa duong hoan tat (rim) bang sculpt mask -> sculpt cutter KHONG lam bien
+    # dang margin. Lam khi topo da chot (truoc Solidify).
+    _lock_margin_mask(cutter)
+
     # Solidify len do day Gap. use_flip_normals=False -> day vao trong than object
     # (normal da huong ra ngoai) de boolean DIFFERENCE cat dut, tach 2 manh.
     # Buoc Create Cutter (add_solidify=False) KHONG them Solidify: nguoi dung sculpt
@@ -1574,7 +1633,34 @@ class GTSPLIT_OT_sculpt_cutter(bpy.types.Operator):
             self.report({'ERROR'}, "Khong vao duoc Sculpt Mode: %s" % ex)
             return {'CANCELLED'}
         self.report({'INFO'},
-                    "Sculpt Mode: chinh sua cutter. Tab (hoac bam 'Sculpt Cutter' lai) de xong.")
+                    "Sculpt Mode: chinh sua cutter (duong hoan tat da khoa). "
+                    "Tab (hoac bam 'Sculpt Cutter' lai) de xong.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Operator: bat/tat trong suot Target (de nhin xuyen qua khi sculpt cutter)
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_toggle_target_alpha(bpy.types.Operator):
+    """Bat/tat trong suot Target: alpha 40% (nhin xuyen qua de sculpt cutter ben
+    duoi) <-> 100% (hien ro)"""
+    bl_idname = "object.gtsplit_toggle_target_alpha"
+    bl_label = "Target: trong suot 40% / 100%"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.gt_split
+        target = props.target_object
+        if target is None or target.name not in bpy.data.objects:
+            self.report({'ERROR'}, "Chua co Target Object")
+            return {'CANCELLED'}
+        r, g, b, a = target.color
+        new_alpha = TARGET_ALPHA_FADED if a >= 0.7 else 1.0
+        _set_display_color(target, (r, g, b, new_alpha), "GT_TargetMat")
+        if new_alpha < 1.0:
+            self.report({'INFO'}, "Target trong suot %d%%" % round(new_alpha * 100))
+        else:
+            self.report({'INFO'}, "Target hien ro 100%")
         return {'FINISHED'}
 
 
@@ -2012,6 +2098,16 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
         row.enabled = has_line and target is not None
         row.operator(GTSPLIT_OT_create_cutter.bl_idname, text="Create Cutter",
                      icon='MOD_SOLIDIFY')
+
+        # Bat/tat trong suot Target de nhin xuyen qua khi sculpt cutter ben duoi.
+        if target is not None and target.name in bpy.data.objects:
+            faded = target.color[3] < 0.7
+            row = box.row()
+            row.operator(GTSPLIT_OT_toggle_target_alpha.bl_idname,
+                         text="Target: hien ro 100%" if faded
+                         else "Target: trong suot 40%",
+                         icon='HIDE_OFF' if faded else 'GHOST_ENABLED')
+
         if has_cutter:
             box.label(text="Cutter san sang - co the sculpt lai", icon='CHECKMARK')
             sculpting = (context.mode == 'SCULPT'
@@ -2073,6 +2169,7 @@ _classes = [
     GTSPLIT_OT_close_loop,
     GTSPLIT_OT_create_cutter,
     GTSPLIT_OT_sculpt_cutter,
+    GTSPLIT_OT_toggle_target_alpha,
     GTSPLIT_OT_execute_cut,
     GTSPLIT_OT_clear,
     GTSPLIT_OT_install_pymeshlab,
