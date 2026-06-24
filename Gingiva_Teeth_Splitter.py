@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Gingiva/Teeth Surface Splitter",
     "author": "Phat Nguyen",
-    "version": (2, 8, 0),
+    "version": (2, 9, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > IBAR Split",
     "description": "Ve mot vong line dang object bam tren be mat Target va tach thanh Gingiva / Teeth",
@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from mathutils import Vector
+from bpy_extras import view3d_utils
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +488,69 @@ def _smooth_loop_on_surface(target, bbox_center, pts, iterations, factor, snap):
     return out
 
 
+def _add_margin_modifier_stack(obj, target, editmode_display=False):
+    """Gan stack modifier tinh chinh duong margin len obj (giong anh tham chieu):
+
+        Subdivision Surface (Catmull-Clark, Levels Viewport=MARGIN_SUBDIV_LEVELS,
+                             Render=2, Optimal Display)
+          -> Shrinkwrap (Nearest Surface Point, Above Surface, Offset)
+          -> Smooth (X/Y/Z, Factor, Repeat).
+
+    editmode_display=True: hien ket qua modifier ngay trong Edit Mode (de thay
+    duong muot khi dang ve line); van giu dinh dieu khien dung tren be mat
+    (show_on_cage=False) de chon/keo cho dung.
+    Tra ve (sub, sw, sm).
+    """
+    obj.modifiers.clear()
+
+    # 1) Subdivision Surface: lam muot + tang mat do duong margin.
+    sub = obj.modifiers.new(name="GT_Subsurf", type='SUBSURF')
+    sub.subdivision_type = 'CATMULL_CLARK'
+    sub.levels = MARGIN_SUBDIV_LEVELS
+    if hasattr(sub, "render_levels"):
+        sub.render_levels = 2
+    if hasattr(sub, "show_only_control_edges"):
+        sub.show_only_control_edges = True   # Optimal Display
+    for attr, val in (("use_limit_surface", True), ("quality", 3),
+                      ("use_creases", True), ("uv_smooth", 'PRESERVE_BOUNDARIES'),
+                      ("boundary_smooth", 'ALL')):
+        if hasattr(sub, attr):
+            try:
+                setattr(sub, attr, val)
+            except Exception:
+                pass
+
+    # 2) Shrinkwrap: bam ve be mat Target, nho len tren be mat (Above Surface).
+    sw = obj.modifiers.new(name="GT_Shrinkwrap", type='SHRINKWRAP')
+    sw.target = target
+    sw.wrap_method = 'NEAREST_SURFACEPOINT'
+    sw.wrap_mode = 'ABOVE_SURFACE'
+    sw.offset = MARGIN_SHRINKWRAP_OFFSET
+
+    # 3) Smooth: lam diu (relax) vong margin.
+    sm = obj.modifiers.new(name="GT_Smooth", type='SMOOTH')
+    for axis in ("use_x", "use_y", "use_z"):
+        if hasattr(sm, axis):
+            setattr(sm, axis, True)
+    sm.factor = MARGIN_SMOOTH_FACTOR
+    sm.iterations = MARGIN_SMOOTH_REPEAT
+
+    if editmode_display:
+        for m in (sub, sw, sm):
+            m.show_in_editmode = True
+        # "On Cage" (Select Box) cho cac modifier bien dang (Shrinkwrap + Smooth):
+        # keo edit cage trung voi ket qua da lam muot -> tren man hinh chi con 1
+        # line (thay vi line dieu khien + line ket qua chong nhau). Subdivision la
+        # modifier doi topology nen khong co On Cage.
+        for m, on_cage in ((sub, False), (sw, True), (sm, True)):
+            if hasattr(m, "show_on_cage"):
+                try:
+                    m.show_on_cage = on_cage
+                except Exception:
+                    pass
+    return sub, sw, sm
+
+
 def _processed_margin_loop(context, line, target):
     """Tinh chinh duong margin (line) bang stack modifier giong anh tham chieu:
 
@@ -502,37 +566,9 @@ def _processed_margin_loop(context, line, target):
     tmp = bpy.data.objects.new("GT_MarginTmp", tmp_me)
     tmp.matrix_world = line.matrix_world.copy()
     context.collection.objects.link(tmp)
-    tmp.modifiers.clear()
-
-    # 1) Subdivision Surface: lam muot + tang mat do duong margin.
-    sub = tmp.modifiers.new(name="GT_Subsurf", type='SUBSURF')
-    sub.subdivision_type = 'CATMULL_CLARK'
-    sub.levels = MARGIN_SUBDIV_LEVELS
-    if hasattr(sub, "render_levels"):
-        sub.render_levels = 2
-    for attr, val in (("use_limit_surface", True), ("quality", 3),
-                      ("use_creases", True), ("uv_smooth", 'PRESERVE_BOUNDARIES'),
-                      ("boundary_smooth", 'ALL')):
-        if hasattr(sub, attr):
-            try:
-                setattr(sub, attr, val)
-            except Exception:
-                pass
-
-    # 2) Shrinkwrap: bam ve be mat Target, nho len tren be mat (Above Surface).
-    sw = tmp.modifiers.new(name="GT_Shrinkwrap", type='SHRINKWRAP')
-    sw.target = target
-    sw.wrap_method = 'NEAREST_SURFACEPOINT'
-    sw.wrap_mode = 'ABOVE_SURFACE'
-    sw.offset = MARGIN_SHRINKWRAP_OFFSET
-
-    # 3) Smooth: lam diu (relax) vong margin.
-    sm = tmp.modifiers.new(name="GT_Smooth", type='SMOOTH')
-    for axis in ("use_x", "use_y", "use_z"):
-        if hasattr(sm, axis):
-            setattr(sm, axis, True)
-    sm.factor = MARGIN_SMOOTH_FACTOR
-    sm.iterations = MARGIN_SMOOTH_REPEAT
+    # Stack modifier tinh chinh: Subdivision -> Shrinkwrap -> Smooth (dung chung
+    # voi line de cutter khop voi duong nguoi dung thay khi ve).
+    _add_margin_modifier_stack(tmp, target)
 
     depsgraph = context.evaluated_depsgraph_get()
     eval_obj = tmp.evaluated_get(depsgraph)
@@ -1410,7 +1446,8 @@ class GTSPLIT_OT_set_target(bpy.types.Operator):
 # Operator: tao line object + vao edit mode de ve
 # ---------------------------------------------------------------------------
 class GTSPLIT_OT_create_line(bpy.types.Operator):
-    """Tao object line bam tren be mat Target va vao Edit Mode de ve (E de extrude diem)"""
+    """Tao object line bam tren be mat Target va vao che do ve theo con tro
+    (E hoac click de them diem NGAY tai vi tri con tro, khong bi offset)"""
     bl_idname = "object.gtsplit_create_line"
     bl_label = "Ve duong cat (tao line)"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1447,13 +1484,9 @@ class GTSPLIT_OT_create_line(bpy.types.Operator):
         line = bpy.data.objects.new("GT_Line", me)
         context.collection.objects.link(line)
 
-        # Shrinkwrap giu moi dinh line dung tren be mat Target.
-        sw = line.modifiers.new(name="GT_Shrinkwrap", type='SHRINKWRAP')
-        sw.target = target
-        sw.wrap_method = 'NEAREST_SURFACEPOINT'
-        sw.wrap_mode = 'ON_SURFACE'
-        sw.show_in_editmode = True
-        sw.show_on_cage = True
+        # Stack modifier tinh chinh duong margin (Subdivision -> Shrinkwrap ->
+        # Smooth) giong anh tham chieu; hien ngay trong Edit Mode de thay duong muot.
+        _add_margin_modifier_stack(line, target, editmode_display=True)
 
         props.line_object = line
 
@@ -1469,8 +1502,284 @@ class GTSPLIT_OT_create_line(bpy.types.Operator):
 
         self.report(
             {'INFO'},
-            "Nhan E de extrude diem tiep theo, xoay view tu do. Xong nhan 'Noi diem dau-cuoi'.")
+            "Di chuot tren be mat, nhan E (hoac click) de them diem TAI con tro."
+            " Xong nhan 'Noi diem dau-cuoi'.")
+        # Tu dong vao che do ve theo con tro (diem nhay dung vi tri con tro,
+        # khong bi offset nhu extrude goc).
+        try:
+            bpy.ops.object.gtsplit_draw_line('INVOKE_DEFAULT')
+        except Exception:
+            pass
         return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Operator (modal): ve line theo VI TRI CON TRO chuot.
+# Khac voi extrude (E) goc cua Blender - von tao diem trung vi tri diem cu roi
+# "grab" theo OFFSET di chuyen chuot - operator nay raycast tu con tro xuong be
+# mat Target va dat diem moi NGAY TAI vi tri con tro.
+# ---------------------------------------------------------------------------
+class GTSPLIT_OT_draw_line(bpy.types.Operator):
+    """Ve duong cat theo con tro: di chuot tren be mat Target roi nhan E (hoac
+    click chuot trai) de them diem NGAY TAI vi tri con tro. Cuon/giua chuot de
+    xoay-zoom, Backspace xoa diem cuoi, Enter/Esc/chuot phai de ket thuc."""
+    bl_idname = "object.gtsplit_draw_line"
+    bl_label = "Ve duong cat (theo con tro)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _find_view(self, context):
+        """Tim area VIEW_3D + region WINDOW + region_3d de raycast on dinh du
+        operator duoc goi tu nut tren N-panel (region UI)."""
+        area = context.area
+        if area is None or area.type != 'VIEW_3D':
+            area = None
+            for a in context.screen.areas:
+                if a.type == 'VIEW_3D':
+                    area = a
+                    break
+        if area is None:
+            return None, None, None
+        region = None
+        for r in area.regions:
+            if r.type == 'WINDOW':
+                region = r
+        rv3d = area.spaces.active.region_3d
+        return area, region, rv3d
+
+    def _raycast(self, context, mouse_x, mouse_y):
+        """Tra ve vi tri WORLD tren be mat Target ngay duoi con tro, hoac None."""
+        if self.region is None or self.rv3d is None:
+            return None
+        coord = (mouse_x - self.region.x, mouse_y - self.region.y)
+        if (coord[0] < 0 or coord[1] < 0
+                or coord[0] > self.region.width or coord[1] > self.region.height):
+            return None
+        view_vector = view3d_utils.region_2d_to_vector_3d(self.region, self.rv3d, coord)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(self.region, self.rv3d, coord)
+        depsgraph = context.evaluated_depsgraph_get()
+        result, location, _n, _i, _obj, _m = context.scene.ray_cast(
+            depsgraph, ray_origin, view_vector)
+        if not result:
+            return None
+        world = location
+        # Bao dam diem nam dung tren be mat Target (giong phan con lai cua pipeline,
+        # phong khi tia trung object khac).
+        try:
+            hit, loc_t, _nt, _it = self.target.closest_point_on_mesh(
+                self.target.matrix_world.inverted() @ world)
+            if hit:
+                world = self.target.matrix_world @ loc_t
+        except Exception:
+            pass
+        return world
+
+    def _pick_tip(self):
+        """Chon dinh dau line dang ho (de noi diem moi vao)."""
+        bm = self.bm
+        bm.verts.ensure_lookup_table()
+        tip = None
+        if bm.select_history:
+            last = bm.select_history[-1]
+            if isinstance(last, bmesh.types.BMVert) and last.is_valid:
+                tip = last
+        if tip is None:
+            open_ends = [v for v in bm.verts if len(v.link_edges) <= 1]
+            sel = [v for v in open_ends if v.select]
+            if sel:
+                tip = sel[-1]
+            elif open_ends:
+                tip = open_ends[-1]
+            elif bm.verts:
+                tip = bm.verts[-1]
+        return tip
+
+    def _select_only(self, vert):
+        bm = self.bm
+        for v in bm.verts:
+            v.select_set(False)
+        for e in bm.edges:
+            e.select_set(False)
+        bm.select_history.clear()
+        if vert is not None and vert.is_valid:
+            vert.select_set(True)
+            bm.select_history.add(vert)
+
+    def _add_point(self, context, event):
+        world = self._raycast(context, event.mouse_x, event.mouse_y)
+        if world is None:
+            return
+        local = self.line.matrix_world.inverted() @ world
+        nv = self.bm.verts.new(local)
+        if self.tip is not None and self.tip.is_valid:
+            try:
+                self.bm.edges.new((self.tip, nv))
+            except ValueError:
+                pass
+        self._select_only(nv)
+        self.tip = nv
+        self.bm.verts.ensure_lookup_table()
+        bmesh.update_edit_mesh(self.line.data, destructive=False)
+        if self.area:
+            self.area.tag_redraw()
+
+    def _remove_last(self, context):
+        bm = self.bm
+        if self.tip is None or not self.tip.is_valid or len(bm.verts) <= 1:
+            return
+        neighbor = None
+        for e in self.tip.link_edges:
+            neighbor = e.other_vert(self.tip)
+            break
+        try:
+            bm.verts.remove(self.tip)
+        except Exception:
+            pass
+        bm.verts.ensure_lookup_table()
+        if neighbor is None or not neighbor.is_valid:
+            neighbor = self._pick_tip()
+        self.tip = neighbor
+        self._select_only(neighbor)
+        bmesh.update_edit_mesh(self.line.data, destructive=True)
+        if self.area:
+            self.area.tag_redraw()
+
+    def _set_status(self, context, on=True):
+        try:
+            if on:
+                context.workspace.status_text_set(
+                    "Ve duong cat | E hoac Click chuot trai: them diem tai con tro"
+                    " | Backspace: xoa diem cuoi | Cuon/Giua chuot: zoom-xoay"
+                    " | Enter/Esc/Chuot phai: xong")
+            else:
+                context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
+    def _draw_cb(self):
+        """Ve duong 'cao su' tu dinh dau toi vi tri con tro (preview)."""
+        if self.hit_world is None or self.tip is None or not self.tip.is_valid:
+            return
+        try:
+            import gpu
+            from gpu_extras.batch import batch_for_shader
+        except Exception:
+            return
+        tip_world = self.line.matrix_world @ self.tip.co
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('NONE')
+        gpu.state.line_width_set(2.0)
+        gpu.state.point_size_set(9.0)
+        try:
+            batch_l = batch_for_shader(shader, 'LINES',
+                                       {"pos": [tip_world, self.hit_world]})
+            shader.bind()
+            shader.uniform_float("color", (1.0, 0.8, 0.1, 0.9))
+            batch_l.draw(shader)
+            batch_p = batch_for_shader(shader, 'POINTS', {"pos": [self.hit_world]})
+            shader.bind()
+            shader.uniform_float("color", (1.0, 0.3, 0.1, 1.0))
+            batch_p.draw(shader)
+        except Exception:
+            pass
+        finally:
+            gpu.state.line_width_set(1.0)
+            gpu.state.point_size_set(1.0)
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.blend_set('NONE')
+
+    def invoke(self, context, event):
+        props = context.scene.gt_split
+        target = props.target_object
+        line = props.line_object
+        if target is None or target.type != 'MESH':
+            self.report({'ERROR'}, "Hay dat Target Object truoc")
+            return {'CANCELLED'}
+        if line is None or line.name not in bpy.data.objects:
+            self.report({'ERROR'}, "Chua co line. Bam 'Ve duong cat (tao line)' truoc.")
+            return {'CANCELLED'}
+
+        self.target = target
+        self.line = line
+        self.hit_world = None
+        self._draw_handle = None
+
+        self.area, self.region, self.rv3d = self._find_view(context)
+        if self.region is None or self.rv3d is None:
+            self.report({'ERROR'}, "Khong tim thay vung 3D View")
+            return {'CANCELLED'}
+
+        # Dam bao dang Edit Mode tren line (de cap nhat bmesh truc tiep).
+        if not (context.mode == 'EDIT_MESH' and context.edit_object == line):
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            viewlayer = context.view_layer
+            bpy.ops.object.select_all(action='DESELECT')
+            _set_active_object(line, viewlayer)
+            _select_object(line, True, viewlayer)
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        _enable_surface_snap(context)
+        self.bm = bmesh.from_edit_mesh(line.data)
+        self.tip = self._pick_tip()
+        self._select_only(self.tip)
+        bmesh.update_edit_mesh(line.data, destructive=False)
+
+        self._set_status(context, True)
+        try:
+            self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+                self._draw_cb, (), 'WINDOW', 'POST_VIEW')
+        except Exception:
+            self._draw_handle = None
+        context.window_manager.modal_handler_add(self)
+        if self.area:
+            self.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context):
+        self._set_status(context, False)
+        if self._draw_handle is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, 'WINDOW')
+            except Exception:
+                pass
+            self._draw_handle = None
+        if self.area:
+            self.area.tag_redraw()
+
+    def modal(self, context, event):
+        # Them diem tai con tro: E hoac click trai (cho phep Alt+trai de xoay).
+        if event.value == 'PRESS' and (
+                event.type == 'E'
+                or (event.type == 'LEFTMOUSE' and not event.alt)):
+            self._add_point(context, event)
+            return {'RUNNING_MODAL'}
+
+        if event.value == 'PRESS' and event.type in {'BACK_SPACE', 'DEL'}:
+            self._remove_last(context)
+            return {'RUNNING_MODAL'}
+
+        if event.value == 'PRESS' and event.type in {'RET', 'NUMPAD_ENTER',
+                                                     'SPACE', 'ESC', 'RIGHTMOUSE'}:
+            self._finish(context)
+            self.report({'INFO'}, "Da xong ve. Bam 'Noi diem dau-cuoi' de khep vong.")
+            return {'FINISHED'}
+
+        if event.type == 'MOUSEMOVE':
+            self.hit_world = self._raycast(context, event.mouse_x, event.mouse_y)
+            if self.area:
+                self.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # Cho qua cac thao tac dieu huong view (xoay/zoom/pan).
+        if (event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
+                           'WHEELINMOUSE', 'WHEELOUTMOUSE', 'TRACKPADPAN',
+                           'TRACKPADZOOM'}
+                or (event.type == 'LEFTMOUSE' and event.alt)
+                or (event.type.startswith('NUMPAD_') and event.type != 'NUMPAD_ENTER')):
+            return {'PASS_THROUGH'}
+
+        return {'RUNNING_MODAL'}
 
 
 # ---------------------------------------------------------------------------
@@ -2080,9 +2389,11 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
         line = props.line_object
         has_line = line is not None and line.name in bpy.data.objects
         col.label(text="Diem dau = vi tri 3D Cursor", icon='PIVOT_CURSOR')
-        col.label(text="Edit Mode: E them diem (da bat snap be mat)", icon='INFO')
+        col.label(text="E hoac Click: them diem NGAY tai con tro", icon='INFO')
         sub = col.column(align=True)
         sub.enabled = has_line
+        sub.operator(GTSPLIT_OT_draw_line.bl_idname, text="Ve tiep (theo con tro)",
+                     icon='GREASEPENCIL')
         sub.operator(GTSPLIT_OT_close_loop.bl_idname, text="Noi diem dau-cuoi (F)",
                      icon='MESH_CIRCLE')
         sub.operator(GTSPLIT_OT_clear.bl_idname, text="Xoa line / cutter", icon='X')
@@ -2166,6 +2477,7 @@ _classes = [
     GTSplitProps,
     GTSPLIT_OT_set_target,
     GTSPLIT_OT_create_line,
+    GTSPLIT_OT_draw_line,
     GTSPLIT_OT_close_loop,
     GTSPLIT_OT_create_cutter,
     GTSPLIT_OT_sculpt_cutter,
