@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 0),
+    "version": (2, 4, 1),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -35,6 +35,10 @@ GITHUB_REPO = "IBar_Preparation_Addons"
 GITHUB_BRANCH = "main"
 GITHUB_FILE_PATH = "Final_addon_Ibar_to_ORG.py"
 GITHUB_BRANCH_FALLBACKS = ("main", "master")
+MAX_STL_SIZE_BYTES = 30 * 1024 * 1024
+TARGET_STL_TRIANGLES = 600000
+STL_BINARY_HEADER_BYTES = 84
+STL_BINARY_TRIANGLE_BYTES = 50
 
 
 def _version_to_str(version_tuple):
@@ -141,6 +145,252 @@ def _select_object(obj, state=True, viewlayer=None):
         return False
     obj.select_set(state)
     return True
+
+
+def _should_guard_stl_mesh(obj):
+    if obj is None:
+        return False
+    name = obj.name
+    return (
+        name == "Hybrid"
+        or name.startswith("Hybrid_Shell")
+        or name == "iBar"
+        or name.startswith("iBar_")
+    )
+
+
+def _report_stl_guard(reporter, level, message):
+    if reporter is not None:
+        reporter.report({level}, message)
+    else:
+        print(f"[IBar STL Guard] {level}: {message}")
+
+
+def _format_file_size(size_bytes):
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _estimated_binary_stl_size(triangle_count):
+    return STL_BINARY_HEADER_BYTES + (triangle_count * STL_BINARY_TRIANGLE_BYTES)
+
+
+def _mesh_triangle_count(mesh):
+    mesh.calc_loop_triangles()
+    return len(mesh.loop_triangles)
+
+
+def _ensure_object_mode():
+    if bpy.ops.object.mode_set.poll():
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError:
+            pass
+
+
+def _export_selected_stl(filepath):
+    legacy_error = None
+    try:
+        bpy.ops.export_mesh.stl(
+            filepath=str(filepath),
+            use_selection=True,
+            ascii=False)
+        return
+    except TypeError as err:
+        legacy_error = err
+        try:
+            bpy.ops.export_mesh.stl(
+                filepath=str(filepath),
+                use_selection=True)
+            return
+        except Exception as fallback_err:
+            legacy_error = fallback_err
+    except Exception as err:
+        legacy_error = err
+
+    try:
+        bpy.ops.wm.stl_export(
+            filepath=str(filepath),
+            export_selected_objects=True,
+            ascii_format=False,
+            apply_modifiers=True)
+    except TypeError:
+        bpy.ops.wm.stl_export(
+            filepath=str(filepath),
+            export_selected_objects=True)
+    except Exception as err:
+        raise RuntimeError(f"STL export failed: {legacy_error}; {err}") from err
+
+
+def _temp_stl_path(filepath):
+    path = Path(filepath)
+    suffix = path.suffix if path.suffix else ".stl"
+    return str(path.with_name(path.stem + ".tmp_export" + suffix))
+
+
+def _create_evaluated_mesh_object(source_obj):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated_obj = source_obj.evaluated_get(depsgraph)
+    mesh = bpy.data.meshes.new_from_object(evaluated_obj, depsgraph=depsgraph)
+    temp_obj = bpy.data.objects.new(source_obj.name + "_stl_guard_tmp", mesh)
+    temp_obj.matrix_world = source_obj.matrix_world.copy()
+    bpy.context.scene.collection.objects.link(temp_obj)
+    bpy.context.view_layer.update()
+    return temp_obj
+
+
+def _remove_temp_mesh_object(obj):
+    if obj is None:
+        return
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _apply_decimate_modifier(obj, viewlayer, modifier_name, decimate_type, ratio=None, angle_limit=None):
+    if not _set_active_object(obj, viewlayer):
+        raise RuntimeError("Temporary export object is not in the current ViewLayer")
+    bpy.ops.object.select_all(action='DESELECT')
+    if not _select_object(obj, True, viewlayer):
+        raise RuntimeError("Temporary export object cannot be selected")
+    modifier = obj.modifiers.new(name=modifier_name, type='DECIMATE')
+    modifier.decimate_type = decimate_type
+    if ratio is not None:
+        modifier.ratio = max(0.001, min(1.0, ratio))
+    if angle_limit is not None:
+        modifier.angle_limit = angle_limit
+        modifier.use_dissolve_boundaries = False
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
+    _select_object(obj, False, viewlayer)
+    return True
+
+
+def _export_temp_object_to_stl(temp_obj, temp_path, viewlayer):
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    bpy.ops.object.select_all(action='DESELECT')
+    if not _set_active_object(temp_obj, viewlayer):
+        raise RuntimeError("Temporary export object is not in the current ViewLayer")
+    if not _select_object(temp_obj, True, viewlayer):
+        raise RuntimeError("Temporary export object cannot be selected")
+    _export_selected_stl(temp_path)
+    _select_object(temp_obj, False, viewlayer)
+    return os.path.getsize(temp_path)
+
+
+def _optimize_temp_stl_mesh(temp_obj, viewlayer, start_triangles):
+    triangles = start_triangles
+    if triangles > TARGET_STL_TRIANGLES:
+        _apply_decimate_modifier(
+            temp_obj,
+            viewlayer,
+            "STL_Guard_Dissolve",
+            'DISSOLVE',
+            angle_limit=math.radians(1.0),
+        )
+        triangles = _mesh_triangle_count(temp_obj.data)
+
+    if triangles > TARGET_STL_TRIANGLES:
+        ratio = (TARGET_STL_TRIANGLES / triangles) * 0.98
+        _apply_decimate_modifier(
+            temp_obj,
+            viewlayer,
+            "STL_Guard_Collapse",
+            'COLLAPSE',
+            ratio=ratio,
+        )
+        triangles = _mesh_triangle_count(temp_obj.data)
+    return triangles
+
+
+def _export_guarded_stl_object(obj, filepath, viewlayer, reporter=None):
+    _ensure_object_mode()
+    temp_obj = None
+    temp_path = _temp_stl_path(filepath)
+    try:
+        temp_obj = _create_evaluated_mesh_object(obj)
+        start_triangles = _mesh_triangle_count(temp_obj.data)
+        start_estimated_size = _estimated_binary_stl_size(start_triangles)
+        final_triangles = start_triangles
+
+        if start_estimated_size > MAX_STL_SIZE_BYTES:
+            final_triangles = _optimize_temp_stl_mesh(temp_obj, viewlayer, start_triangles)
+
+        final_size = _export_temp_object_to_stl(temp_obj, temp_path, viewlayer)
+        retry_count = 0
+        while final_size > MAX_STL_SIZE_BYTES and retry_count < 3:
+            current_triangles = _mesh_triangle_count(temp_obj.data)
+            if current_triangles <= 1:
+                break
+            ratio_by_size = (MAX_STL_SIZE_BYTES / final_size) * 0.96
+            ratio_by_triangles = (TARGET_STL_TRIANGLES / current_triangles) * 0.96
+            retry_ratio = min(ratio_by_size, ratio_by_triangles, 0.95)
+            _apply_decimate_modifier(
+                temp_obj,
+                viewlayer,
+                "STL_Guard_Collapse_Retry",
+                'COLLAPSE',
+                ratio=retry_ratio,
+            )
+            final_triangles = _mesh_triangle_count(temp_obj.data)
+            final_size = _export_temp_object_to_stl(temp_obj, temp_path, viewlayer)
+            retry_count += 1
+
+        if final_size > MAX_STL_SIZE_BYTES:
+            _report_stl_guard(
+                reporter,
+                'ERROR',
+                (
+                    f"{obj.name}: STL van tren 30 MB sau khi giam mesh "
+                    f"({_format_file_size(final_size)}). Khong ghi de file dich."
+                ),
+            )
+            return False
+
+        os.replace(temp_path, filepath)
+        if start_estimated_size > MAX_STL_SIZE_BYTES or final_triangles < start_triangles:
+            _report_stl_guard(
+                reporter,
+                'INFO',
+                (
+                    f"{obj.name}: {_format_file_size(start_estimated_size)} -> "
+                    f"{_format_file_size(final_size)}, "
+                    f"{start_triangles:,} -> {final_triangles:,} tris"
+                ),
+            )
+        return True
+    except Exception as err:
+        _report_stl_guard(reporter, 'ERROR', f"Khong the export {obj.name}: {err}")
+        return False
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        _remove_temp_mesh_object(temp_obj)
+
+
+def _export_stl_with_mesh_guard(obj, filepath, viewlayer, reporter=None):
+    if _should_guard_stl_mesh(obj):
+        return _export_guarded_stl_object(obj, filepath, viewlayer, reporter)
+
+    try:
+        _ensure_object_mode()
+        bpy.ops.object.select_all(action='DESELECT')
+        if not _set_active_object(obj, viewlayer):
+            _report_stl_guard(reporter, 'ERROR', f"Object '{obj.name}' khong nam trong ViewLayer hien tai")
+            return False
+        _select_object(obj, True, viewlayer)
+        _export_selected_stl(filepath)
+        _select_object(obj, False, viewlayer)
+        return True
+    except Exception as err:
+        _report_stl_guard(reporter, 'ERROR', f"Khong the export {obj.name}: {err}")
+        return False
+    finally:
+        if obj is not None and _is_in_view_layer(obj, viewlayer):
+            _select_object(obj, False, viewlayer)
 
 
 class IBAR_OT_CheckAddonUpdate(bpy.types.Operator):
@@ -265,12 +515,8 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
         path = bpy.path.abspath("//")
         for ob in obs:
             if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         return {'FINISHED'}
 
 class buttonOperator_SaveSTLORG(bpy.types.Operator):
@@ -336,12 +582,8 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
         
         for ob in obs:
             if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         bpy.ops.object.select_all(action='DESELECT')
         objectArrows = bpy.data.objects['fileORG']
         _select_object(objectArrows, True, viewlayer)
@@ -795,12 +1037,8 @@ class buttonOperator_SaveAllSTL(bpy.types.Operator):
         path = bpy.path.abspath("//")
         for ob in obs:
             if _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         return {'FINISHED'}
         
 class buttonOperator_CreateTubes(bpy.types.Operator):
@@ -1856,12 +2094,8 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj] if o is not None]
         for ob in objects_to_save:
             if _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
 
         # === Phần 6: Clear parent và xóa fileORG ===
         bpy.ops.object.select_all(action='DESELECT')
