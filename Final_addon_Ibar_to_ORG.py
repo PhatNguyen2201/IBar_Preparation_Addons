@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 1),
+    "version": (2, 4, 2),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -35,7 +35,7 @@ GITHUB_REPO = "IBar_Preparation_Addons"
 GITHUB_BRANCH = "main"
 GITHUB_FILE_PATH = "Final_addon_Ibar_to_ORG.py"
 GITHUB_BRANCH_FALLBACKS = ("main", "master")
-MAX_STL_SIZE_BYTES = 30 * 1024 * 1024
+MAX_STL_SIZE_BYTES = 15 * 1024 * 1024
 TARGET_STL_TRIANGLES = 600000
 STL_BINARY_HEADER_BYTES = 84
 STL_BINARY_TRIANGLE_BYTES = 50
@@ -322,9 +322,7 @@ def _export_guarded_stl_object(obj, filepath, viewlayer, reporter=None):
             current_triangles = _mesh_triangle_count(temp_obj.data)
             if current_triangles <= 1:
                 break
-            ratio_by_size = (MAX_STL_SIZE_BYTES / final_size) * 0.96
-            ratio_by_triangles = (TARGET_STL_TRIANGLES / current_triangles) * 0.96
-            retry_ratio = min(ratio_by_size, ratio_by_triangles, 0.95)
+            retry_ratio = 0.5
             _apply_decimate_modifier(
                 temp_obj,
                 viewlayer,
