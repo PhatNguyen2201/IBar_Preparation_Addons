@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Gingiva/Teeth Surface Splitter",
     "author": "Phat Nguyen",
-    "version": (2, 9, 0),
+    "version": (2, 10, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > IBAR Split",
     "description": "Ve mot vong line dang object bam tren be mat Target va tach thanh Gingiva / Teeth",
@@ -135,26 +135,17 @@ def _schedule_auto_update():
 # the dua len UI neu can.
 # ---------------------------------------------------------------------------
 WALL_RINGS = 3         # so vong chia "thanh" khi extrude margin vao trong.
-FLOOR_FILL_CUTS = 2    # chia DEU moi canh (ap dung toan bo) - chi can du bat cong
-                       # be mat offset; PyMeshLab lo mat do cuoi nen khong can cao.
-SMOOTH_CONTINUITY_FACTOR = 0.5   # Smooth lam lien tuc be mat cutter (tru rim).
-SMOOTH_CONTINUITY_ITERS = 8      # so vong Smooth lien tuc (0 = tat).
-SMOOTH_RIM_WEIGHT = 0.0          # rim phai giu cung tren be mat -> tach moi chay (0).
+# Collar DAM XUYEN: extrude margin RA NGOAI (nho len tren be mat) de tao "luoi cat"
+# vuong goc DAM XUYEN qua mang (skin) tai DUNG duong hoan tat -> Boolean cat dut chinh
+# xac theo duong da ve (neu chi di vao trong, tuong khong xuyen het mang -> khong tach).
+WALL_UP = 0.5          # do nho cua collar len tren be mat (mm).
+WALL_UP_RINGS = 2      # so vong chia collar.
 MARGIN_LOOP_SNAP = 0.4           # muc keo rim ve be mat sau khi lam muot (thap=muot hon).
 
-# Remesh ISOTROPIC bang PyMeshLab (mac dinh, giong cutter iBar): luoi tam giac DEU.
-ISO_PML_ITERS = 8          # so vong isotropic remeshing cua PyMeshLab.
-ISO_PML_TARGET_FACTOR = 1.0  # do dai canh muc tieu = (chu vi rim / so diem) * factor.
-# Lam muot day TRUOC PyMeshLab (khong chieu lai) -> khu tu cat o vung lom (ke rang)
-# de PyMeshLab khong ra non-manifold/nhieu vien (nguyen nhan rot fallback tren ca that).
-PML_PRESMOOTH_ITERS = 8    # so vong Laplacian lam muot day moi lan thu (cong don).
-PML_PRESMOOTH_FACTOR = 0.5 # he so moi vong.
-PML_MAX_ATTEMPTS = 4       # so lan thu PyMeshLab (moi lan muot them + remesh tho hon).
-
-# Fallback (khi khong co PyMeshLab): flip (Delaunay) + Laplacian nhe, chi thao tac
-# AN TOAN ve topo (xem ghi chu trong _isotropic_remesh).
-ISO_REMESH_ITERS = 20     # so vong flip + relax day (cang cao cang muot, 0 = tat).
-ISO_RELAX_FACTOR = 0.5    # he so Laplacian relaxation moi vong (0..1).
+# Cutback "long chao": do sau phan giua day cutter day vao trong theo be mat waxup.
+# La HANG SO NOI BO (khong lo ra UI): chi mo ta hinh dang day cutter, dong thoi phai
+# du sau de Boolean cat dut 2 manh. Chinh o day neu can.
+CUTBACK_DEPTH = 0.8       # do sau long chao o phan giua (mm).
 
 # Tinh chinh duong margin (line) bang stack modifier: Subdivision -> Shrinkwrap
 # -> Smooth (theo dung thong so trong anh tham chieu).
@@ -622,42 +613,6 @@ def _smooth_normals(normals, iterations=2):
     return result
 
 
-def _smooth_cutter_continuity(context, cutter):
-    """Lam mat cutter LIEN TUC hon: Smooth toan bo dinh TRU vien rim.
-
-    Dung vertex group (rim=0, con lai=1) + Smooth modifier -> bo bump/rang cua,
-    bo mat muot lien tuc. Rim (boundary) giu nguyen tuyet doi -> vet cat van cham
-    be mat doc margin nen tach duoc 2 manh.
-    """
-    me = cutter.data
-    if len(me.polygons) < 8 or SMOOTH_CONTINUITY_ITERS <= 0:
-        return
-    bm = bmesh.new()
-    bm.from_mesh(me)
-    boundary = set(v.index for e in bm.edges if e.is_boundary for v in e.verts)
-    bm.free()
-    interior = [v.index for v in me.vertices if v.index not in boundary]
-    if not interior:
-        return
-    vg = cutter.vertex_groups.new(name="gt_interior")
-    vg.add(interior, 1.0, 'REPLACE')
-    # Rim (boundary) duoc lam muot NHE (weight thap) -> bot rang cua nhung gan nhu
-    # giu nguyen vi tri tren be mat -> tach 2 manh van chay.
-    if boundary:
-        vg.add(list(boundary), SMOOTH_RIM_WEIGHT, 'REPLACE')
-    sm = cutter.modifiers.new(name="GT_Continuity", type='SMOOTH')
-    sm.factor = SMOOTH_CONTINUITY_FACTOR
-    sm.iterations = SMOOTH_CONTINUITY_ITERS
-    sm.vertex_group = vg.name
-    bpy.ops.object.select_all(action='DESELECT')
-    _set_active_object(cutter, context.view_layer)
-    _select_object(cutter, True, context.view_layer)
-    bpy.ops.object.modifier_apply(modifier=sm.name)
-    g = cutter.vertex_groups.get("gt_interior")
-    if g is not None:
-        cutter.vertex_groups.remove(g)
-
-
 def _orient_faces_outward(obj, bbox_center):
     """Lat toan bo normal cua obj huong RA NGOAI than (xa tam bbox)."""
     bm = bmesh.new()
@@ -720,391 +675,23 @@ def _lock_margin_mask(obj, rings=MARGIN_LOCK_RINGS):
         print("[GTSplit] Khong khoa duoc duong hoan tat (mask):", ex)
 
 
-def _smooth_floor_bmesh(bm, move_layer, factor, iterations):
-    """Laplacian smooth DAY long chao (KHONG chieu lai be mat) -> khu cac nep tu cat
-    (self-intersection) khi be mat offset huong vao trong tu cat o vung lom (ke rang).
-    Bat buoc chay TRUOC PyMeshLab: PyMeshLab tren luoi tu cat se ra non-manifold/
-    nhieu vien -> bi guard loai. CHI di chuyen dinh day (move_layer==1); rim/thanh
-    giu nguyen."""
-    for _ in range(max(0, iterations)):
-        moved = {}
-        for v in bm.verts:
-            if not v[move_layer]:
-                continue
-            nbrs = [e.other_vert(v) for e in v.link_edges]
-            if not nbrs:
-                continue
-            avg = Vector((0.0, 0.0, 0.0))
-            for p in nbrs:
-                avg += p.co
-            avg /= len(nbrs)
-            moved[v] = v.co.lerp(avg, factor)
-        for v, co in moved.items():
-            v.co = co
-    bm.normal_update()
-
-
-def _isotropic_remesh(bm, move_layer, project_fn, iterations, relax_factor):
-    """FALLBACK (khi khong co PyMeshLab): lam DEU + MUOT luoi day long chao bang
-    cac thao tac AN TOAN ve topo: beautify edge-flip (Delaunay) + Laplacian nhe co
-    chieu lai be mat that (project_fn). CHI dinh "noi that day" (move_layer==1);
-    rim/thanh/vong day-thanh GIU CO DINH -> tach 2 manh van chay.
-
-    GHI CHU: remesh ISOTROPIC thuc su (Botsch-Kobbelt: split + COLLAPSE diem qua
-    gan + flip + relax) cho luoi DEU nhu cutter iBar (CV~0.15, 0 sliver) duoc lam
-    bang PyMeshLab trong _remesh_basin_pymeshlab (mac dinh). MOI cach collapse
-    trong bmesh thuan (bmesh.ops.collapse, remove_doubles) deu lam DAM THUNG /
-    NON-MANIFOLD luoi day (vi lap tu n-gon co nhieu diem gan nhau ve KHONG-GIAN
-    nhung xa ve TOPO) -> Boolean vo vun; nen bmesh chi dung lam fallback flip+relax
-    (giu boundary_loops=1, non-manifold=0)."""
-    if iterations <= 0:
-        return
-    for _ in range(iterations):
-        # FLIP (beautify/Delaunay): cai thien hinh tam giac, bo tam giac tua tua,
-        # keo valence ve ~6 -> KHONG tao/xoa dinh nen KHONG dam thung luoi. Chi canh
-        # co CA HAI dinh movable (giu nguyen vong day-thanh, thanh va rim).
-        tris = [f for f in bm.faces if len(f.verts) == 3]
-        if tris:
-            tri_edges = list({e for f in tris for e in f.edges
-                              if e.verts[0][move_layer] and e.verts[1][move_layer]})
-            if tri_edges:
-                bmesh.ops.beautify_fill(bm, faces=tris, edges=tri_edges)
-
-        # RELAXATION nhe (Laplacian nua duong) + chieu lai be mat that. Di chuyen
-        # NHE + chieu lai -> KHONG gap mep/self-intersect (truot manh lam boolean vo
-        # vun). Chi dinh movable (move_layer==1).
-        moved = {}
-        for v in bm.verts:
-            if not v[move_layer]:
-                continue
-            nbrs = [e.other_vert(v) for e in v.link_edges]
-            if not nbrs:
-                continue
-            avg = Vector((0.0, 0.0, 0.0))
-            for p in nbrs:
-                avg += p.co
-            avg /= len(nbrs)
-            tgt = v.co.lerp(avg, relax_factor)
-            pr = project_fn(tgt)
-            moved[v] = pr if pr is not None else tgt
-        for v, co in moved.items():
-            v.co = co
-
-    bm.normal_update()
-
-
-# ---------------------------------------------------------------------------
-# Isotropic remesh bang PyMeshLab (giong cutter iBar). PyMeshLab la ban Python
-# cua MeshLab; filter meshing_isotropic_explicit_remeshing cho luoi tam giac DEU
-# (CV~0.15, 0 sliver), GIU duoc vien ho (rim).
-#
-# QUAN TRONG: KHONG import pymeshlab TRONG tien trinh Blender - cac thu vien native
-# (Qt/MSVCP140) cua no XUNG DOT voi cua Blender -> EXCEPTION_ACCESS_VIOLATION (crash).
-# Vi vay chay pymeshlab O TIEN TRINH RIENG (subprocess) bang chinh python.exe cua
-# Blender (chay doc lap khong load Blender -> khong xung dot). Trao doi mesh qua file
-# .npz. Neu khong cai/chay duoc -> fallback flip+relax (_isotropic_remesh).
-# ---------------------------------------------------------------------------
-_PYMESHLAB_ENV = None
-_PYMESHLAB_TRIED = False
-
-# Script worker chay trong subprocess (python.exe cua Blender, KHONG co Blender).
-_PML_WORKER = r'''
-import sys, numpy as np, pymeshlab as ml
-inp, out, tlen, iters = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4])
-d = np.load(inp)
-ms = ml.MeshSet()
-ms.add_mesh(ml.Mesh(vertex_matrix=d["v"].astype("float64"),
-                    face_matrix=d["f"].astype("int32")), "m")
-
-def _try(name, **kw):
-    try:
-        getattr(ms, name)(**kw)
-    except Exception:
-        pass
-
-# Lam sach input truoc khi remesh -> tranh remesh ra non-manifold.
-_try("meshing_remove_duplicate_vertices")
-_try("meshing_remove_duplicate_faces")
-_try("meshing_remove_unreferenced_vertices")
-_try("meshing_remove_null_faces")
-_try("meshing_repair_non_manifold_edges")
-_try("meshing_repair_non_manifold_vertices")
-
-ms.meshing_isotropic_explicit_remeshing(targetlen=ml.PureValue(tlen), iterations=iters)
-
-# Don lai sau remesh (dam bao 1 vien rim, 0 non-manifold).
-_try("meshing_repair_non_manifold_edges")
-_try("meshing_remove_unreferenced_vertices")
-
-cm = ms.current_mesh()
-np.savez(out, v=cm.vertex_matrix(), f=cm.face_matrix())
-'''
-
-
-def _blender_python_exe():
-    """Tra ve duong dan python.exe cua Blender (chay subprocess), khong phai blender.exe."""
-    import sys
-    if sys.platform == "win32":
-        cand = os.path.join(sys.prefix, "bin", "python.exe")
-        if os.path.exists(cand):
-            return cand
-    else:
-        import glob
-        for c in sorted(glob.glob(os.path.join(sys.prefix, "bin", "python*"))):
-            if os.path.exists(c):
-                return c
-    return sys.executable
-
-
-_PML_MODULES_DIR = None   # cache thu muc modules cua user (lay tren MAIN thread)
-
-
-def _pml_modules_dir():
-    """Thu muc modules cua user (cache). Goi bpy.utils.user_resource CHI tren main
-    thread (warm o register) -> luong nen kiem tra PyMeshLab khong dung bpy."""
-    global _PML_MODULES_DIR
-    if _PML_MODULES_DIR is None:
-        _PML_MODULES_DIR = bpy.utils.user_resource('SCRIPTS', path='modules',
-                                                   create=True)
-    return _PML_MODULES_DIR
-
-
-def _pml_env():
-    """Moi truong cho subprocess: them thu muc modules cua user vao PYTHONPATH."""
-    target = _pml_modules_dir()
-    env = dict(os.environ)
-    env['PYTHONPATH'] = target + os.pathsep + env.get('PYTHONPATH', '')
-    return target, env
-
-
-def _pymeshlab_ready(force=False):
-    """KIEM TRA (cache) xem PyMeshLab dung duoc trong subprocess chua. KHONG cai dat
-    -> goi trong Create Cutter se KHONG bao gio lam dung Blender bat ngo. Tra ve
-    (python_exe, env) hoac None. force=True de kiem tra lai sau khi cai."""
-    global _PYMESHLAB_ENV, _PYMESHLAB_TRIED
-    if _PYMESHLAB_TRIED and not force:
-        return _PYMESHLAB_ENV
-    _PYMESHLAB_TRIED = True
-    _PYMESHLAB_ENV = None
-    import subprocess
-    py = _blender_python_exe()
-    target, env = _pml_env()
-    try:
-        r = subprocess.run([py, "-c", "import pymeshlab"], env=env,
-                           capture_output=True, text=True, timeout=180)
-        if r.returncode == 0:
-            _PYMESHLAB_ENV = (py, env)
-    except Exception:
-        pass
-    return _PYMESHLAB_ENV
-
-
-def _install_pymeshlab_blocking():
-    """pip install PyMeshLab vao thu muc modules cua user (KHONG can admin). Ham nay
-    CHAN (blocking) -> goi trong luong nen (thread) cua operator de Blender khong dung.
-    Tra ve (ok, message)."""
-    if _pymeshlab_ready(force=True) is not None:
-        return True, "Da co san."
-    import subprocess
-    py = _blender_python_exe()
-    target, _env = _pml_env()
-    try:
-        subprocess.run([py, "-m", "pip", "install", "--target", target, "pymeshlab"],
-                       check=True, capture_output=True, text=True, timeout=1800)
-    except subprocess.CalledProcessError as e:
-        return False, ((e.stderr or e.stdout or "")[-300:])
-    except Exception as e:
-        return False, str(e)[-300:]
-    ok = _pymeshlab_ready(force=True) is not None
-    return ok, ("" if ok else "Cai xong nhung van khong import duoc.")
-
-
-def _closest_on_polyline(pts, p):
-    """Diem gan nhat tren duong gap kin pts (de bam rim ve dung margin)."""
-    best = pts[0]
-    bestd = (p - pts[0]).length_squared
-    n = len(pts)
-    for i in range(n):
-        a = pts[i]; b = pts[(i + 1) % n]
-        ab = b - a
-        L2 = ab.length_squared
-        t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, (p - a).dot(ab) / L2))
-        c = a + ab * t
-        d = (p - c).length_squared
-        if d < bestd:
-            bestd = d; best = c
-    return best
-
-
-def _boundary_loops_edges(bm):
-    """Gom cac canh vien thanh tung vong (list cac list canh)."""
-    from collections import defaultdict
-    bm.edges.ensure_lookup_table()
-    bnd = [e for e in bm.edges if e.is_boundary]
-    eadj = defaultdict(list)
-    for e in bnd:
-        eadj[e.verts[0].index].append(e); eadj[e.verts[1].index].append(e)
-    seen = set(); loops = []
-    for e in bnd:
-        if e in seen:
-            continue
-        comp = []; st = [e]
-        while st:
-            ce = st.pop()
-            if ce in seen:
-                continue
-            seen.add(ce); comp.append(ce)
-            for v in ce.verts:
-                for ne_ in eadj[v.index]:
-                    if ne_ not in seen:
-                        st.append(ne_)
-        loops.append(comp)
-    return loops
-
-
-def _fill_small_holes(bm):
-    """Va moi vong vien TRU vong lon nhat (rim) -> chi con 1 vien rim duy nhat. Cac
-    lo nho la do PyMeshLab repair (khong xac dinh) de lai o vung tu cat."""
-    loops = _boundary_loops_edges(bm)
-    if len(loops) <= 1:
-        return
-    loops.sort(key=len, reverse=True)
-    small = [e for comp in loops[1:] for e in comp]
-    if small:
-        bmesh.ops.holes_fill(bm, edges=small, sides=0)
-        ntri = [f for f in bm.faces if len(f.verts) > 3]
-        if ntri:
-            bmesh.ops.triangulate(bm, faces=ntri, quad_method='BEAUTY',
-                                  ngon_method='BEAUTY')
-    bm.verts.ensure_lookup_table()
-    bm.edges.ensure_lookup_table()
-    bm.faces.ensure_lookup_table()
-
-
-def _remesh_basin_pymeshlab(env, bm, loop_pts, target_len, iterations):
-    """Remesh isotropic toan bo long chao bang PyMeshLab (O SUBPROCESS) roi dung lai
-    vao bm. Trao doi mesh qua file .npz. Sau remesh: chieu cac dinh VIEN (rim) ve
-    dung duong margin (loop_pts) -> duong cat khop be mat -> tach 2 manh chuan.
-    Tra ve True neu thanh cong, False -> caller fallback flip+relax.
-    """
-    import numpy as np, subprocess, tempfile, shutil
-    py, runenv = env
-    # PyMeshLab can luoi tam giac -> tam giac hoa truoc khi xuat.
-    bmesh.ops.triangulate(bm, faces=bm.faces[:], quad_method='BEAUTY',
-                          ngon_method='BEAUTY')
-    bm.verts.ensure_lookup_table()
-    for i, v in enumerate(bm.verts):
-        v.index = i
-    vmat = np.array([(v.co.x, v.co.y, v.co.z) for v in bm.verts], dtype=np.float64)
-    fmat = np.array([[vt.index for vt in f.verts] for f in bm.faces], dtype=np.int64)
-    if len(vmat) < 4 or len(fmat) < 2:
-        return False
-
-    tmpdir = tempfile.mkdtemp(prefix="gtsplit_")
-    try:
-        inp = os.path.join(tmpdir, "in.npz")
-        out = os.path.join(tmpdir, "out.npz")
-        worker = os.path.join(tmpdir, "worker.py")
-        np.savez(inp, v=vmat, f=fmat)
-        with open(worker, "w", encoding="utf-8") as fh:
-            fh.write(_PML_WORKER)
-        try:
-            r = subprocess.run([py, worker, inp, out, str(target_len), str(iterations)],
-                               env=runenv, capture_output=True, text=True, timeout=600)
-        except Exception as ex:
-            print("[GTSplit] PyMeshLab subprocess loi, fallback:", ex)
-            return False
-        if r.returncode != 0 or not os.path.exists(out):
-            tail = (r.stderr or "")[-600:]
-            print("[GTSplit] PyMeshLab worker loi, fallback:", tail)
-            return False
-        data = np.load(out)
-        nv = data["v"]; nf = data["f"]
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-    if len(nv) < 4 or len(nf) < 2:
-        return False
-
-    # SAFETY: chi commit ket qua remesh khi topo SACH (dung 1 vien rim, 0 canh
-    # non-manifold). Neu input long chao go ghe/tu cat khien remesh sinh lo hoac
-    # non-manifold -> tra False de caller fallback flip+relax (khong bao gio xuat
-    # cutter hong lam Boolean vo vun). bm chua bi dung lai nen fallback chay duoc.
-    from collections import defaultdict
-    ef = defaultdict(int)
-    for f in nf:
-        a, b, c = int(f[0]), int(f[1]), int(f[2])
-        for x, y in ((a, b), (b, c), (c, a)):
-            ef[(x, y) if x < y else (y, x)] += 1
-    if any(cnt > 2 for cnt in ef.values()):
-        print("[GTSplit] PyMeshLab ra non-manifold -> fallback flip+relax.")
-        return False
-    # Gom vong vien + kich thuoc. PyMeshLab tren vung tu cat (ke rang) co the de lai
-    # vai LO NHO khong xac dinh -> KHONG bo het; chi bo neu RIM bi XE (co 2 vong lon
-    # tuong duong). Cac lo nho se duoc va lai trong bmesh -> 1 vien rim duy nhat.
-    adj = defaultdict(list)
-    for (a, b), cnt in ef.items():
-        if cnt == 1:
-            adj[a].append(b); adj[b].append(a)
-    seen = set(); loop_sizes = []
-    for v0 in list(adj):
-        if v0 in seen:
-            continue
-        cnt = 0; st = [v0]
-        while st:
-            x = st.pop()
-            if x in seen:
-                continue
-            seen.add(x); cnt += 1
-            st.extend(y for y in adj[x] if y not in seen)
-        loop_sizes.append(cnt)
-    if not loop_sizes:
-        return False
-    loop_sizes.sort(reverse=True)
-    if len(loop_sizes) > 1 and loop_sizes[1] > loop_sizes[0] * 0.25:
-        print(f"[GTSplit] PyMeshLab xe rim {loop_sizes[:3]} -> fallback flip+relax.")
-        return False
-
-    # Dung lai bm tu ket qua remesh.
-    bm.clear()
-    nverts = [bm.verts.new((float(p[0]), float(p[1]), float(p[2]))) for p in nv]
-    bm.verts.ensure_lookup_table()
-    for f in nf:
-        try:
-            bm.faces.new((nverts[int(f[0])], nverts[int(f[1])], nverts[int(f[2])]))
-        except (ValueError, IndexError):
-            pass
-    bm.normal_update()
-    # Va cac lo nho (tru vong rim lon nhat) -> chi con 1 vien rim.
-    _fill_small_holes(bm)
-    # Chieu rim ve dung margin (loop_pts) -> bam be mat, tach chuan.
-    for v in bm.verts:
-        if v.is_boundary:
-            v.co = _closest_on_polyline(loop_pts, v.co)
-    bm.normal_update()
-    return True
-
-
 def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
-                  add_solidify=True, apply_solidify=True, name="GT_Cutter"):
-    """Dung cutter "long chao" theo thuat toan extrude + be mat offset + remesh.
+                  cutback=CUTBACK_DEPTH, add_solidify=True, apply_solidify=True,
+                  name="GT_Cutter"):
+    """Cutter "long chao" theo thuat toan iBar: TRICH XUAT mot mang be mat cua chinh
+    Target ben trong duong margin (-> day BAM DUNG hinh dang be mat waxup), lam sach
+    vien (Taubin band-pass: khong tua, giu scallop nhu nuou), CUTBACK phan giua vao
+    sau (long chao), roi COLLAR DAM XUYEN tai DUNG duong margin (extrude vien len tren
+    be mat theo normal) -> Boolean FAST cat dut chinh xac theo duong da ve.
 
-    Quy trinh:
-      1) Extrude toan bo duong margin VAO TRONG (nguoc Face Normal cua Target),
-         sau = offset -> tao "thanh" (curtain wall).
-      2) Tao be mat OFFSET cat ngang day thanh, gioi han trong vung margin
-         (be mat Target offset vao trong = offset) -> lam "day" long chao,
-         noi lien voi thanh.
-      3) Lap day (fill) + chia nho thanh luoi mesh co the EDIT/SMOOTH/FREEFORM
-         (buoc "Create Cutter"). Moi dinh day duoc chieu ve dung be mat offset
-         (robust ca khi margin lom/hinh mong ngua, khong dung quat-ve-tam).
-
-    add_solidify=False   -> KHONG them Solidify (buoc Create Cutter: de nguoi dung
-                            sculpt lai cutter truoc, do day gap them o buoc Split).
-    add_solidify=True + apply_solidify=True -> them & apply luon (cat ngay tu line).
+      cutback : do sau long chao o phan giua (day vao trong theo normal be mat, mm).
+      gap     : do day Solidify (khe ho giua 2 manh).
+      offset  : (giu de tuong thich; rim nam ngay tren be mat, collar lo dam xuyen).
+      add_solidify=False -> KHONG Solidify (buoc Create Cutter: sculpt truoc khi Split).
 
     Tra ve object cutter, hoac None neu loi.
     """
+    from collections import deque, defaultdict
     n = len(loop_pts)
     if n < 3:
         return None
@@ -1112,169 +699,227 @@ def _build_cutter(context, target, loop_pts, loop_nrms, offset, gap,
     bbox_center = _bbox_center_world(target)
     mw = target.matrix_world
     mwi = mw.inverted()
+    P = [Vector(p) for p in loop_pts]
 
-    # Normal be mat tai rim, lat ra NGOAI than object (huong +Face Normal), lam muot.
-    out_nrms = []
-    for p, nrm in zip(loop_pts, loop_nrms):
-        nn = nrm.normalized()
-        if nn.dot(p - bbox_center) < 0:   # phai huong ra ngoai (roi xa tam bbox)
-            nn = -nn
-        out_nrms.append(nn)
-    out_nrms = _smooth_normals(out_nrms, iterations=2)
-    in_nrms = [-nn for nn in out_nrms]
+    # --- Duplicate Target -> cutter (mang be mat that = BAM be mat 100%) ---
+    bpy.ops.object.select_all(action='DESELECT')
+    _set_active_object(target, context.view_layer)
+    _select_object(target, True, context.view_layer)
+    bpy.ops.object.duplicate()
+    cutter = context.view_layer.objects.active
+    cutter.name = name
+    cutter.modifiers.clear()
+    for g in list(cutter.vertex_groups):
+        cutter.vertex_groups.remove(g)
 
-    def _project_offset(world_co):
-        """Chieu 1 diem ve be mat Target roi day vao trong = offset (be mat offset)."""
-        hit, loc, nor, _idx = target.closest_point_on_mesh(mwi @ world_co)
-        if not hit:
-            return None
-        surf = mw @ loc
-        nworld = _world_normal(target, nor)
-        if nworld.dot(surf - bbox_center) < 0:
-            nworld = -nworld
-        return surf - nworld * offset
+    def _fail():
+        try:
+            bpy.data.objects.remove(cutter, do_unlink=True)
+        except Exception:
+            pass
+        return None
+
+    # --- 1) Trich mang TRONG margin: "hang rao" = dinh gan polyline margin; vung trong
+    #   margin = thanh phan lien thong NHO nhat khi bo hang rao. Giu inside | fence. ---
+    FENCE = max(gap * 2.0, 0.2)
+    cellf = max(FENCE, 1e-3)
+    gridf = defaultdict(list)
+    for p in P:
+        gridf[(int(p.x // cellf), int(p.y // cellf), int(p.z // cellf))].append(p)
+
+    def _near_margin(co):
+        kx, ky, kz = int(co.x // cellf), int(co.y // cellf), int(co.z // cellf)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for qq in gridf.get((kx + dx, ky + dy, kz + dz), ()):
+                        if (qq - co).length_squared < FENCE * FENCE:
+                            return True
+        return False
 
     bm = bmesh.new()
-    # Layer danh dau dinh "noi that day" (movable) cho remesh isotropic. Tao TRUOC
-    # khi them dinh (tao layer sau se lam mat tham chieu dinh do op cap phat lai).
-    move = bm.verts.layers.int.new("gt_move")
-
-    # --- 1) Extrude margin vao trong tao "thanh" (rim -> day thanh sau = offset) -
-    rings = []
-    for s in range(WALL_RINGS + 1):
-        f = s / float(WALL_RINGS)
-        ring = [bm.verts.new(loop_pts[i] + in_nrms[i] * (offset * f)) for i in range(n)]
-        rings.append(ring)
+    bm.from_mesh(cutter.data)
     bm.verts.ensure_lookup_table()
-    for ring_a, ring_b in zip(rings[:-1], rings[1:]):
+    fence = set(v.index for v in bm.verts if _near_margin(mw @ v.co))
+    seen = set()
+    comps = []
+    for s in bm.verts:
+        if s.index in fence or s.index in seen:
+            continue
+        comp = {s.index}; dq = deque([s]); seen.add(s.index)
+        while dq:
+            v = dq.popleft()
+            for e in v.link_edges:
+                o = e.other_vert(v)
+                if o.index in seen or o.index in fence:
+                    continue
+                seen.add(o.index); comp.add(o.index); dq.append(o)
+        comps.append(comp)
+    if not comps:
+        bm.free(); return _fail()
+    comps.sort(key=len)
+    inside = comps[0] | fence
+    kill = [v for v in bm.verts if v.index not in inside]
+    bmesh.ops.delete(bm, geom=kill, context='VERTS')
+    bm.verts.ensure_lookup_table(); bm.edges.ensure_lookup_table()
+    if len(bm.verts) < 8:
+        bm.free(); return _fail()
+
+    # ring distance tu vien (rim ring=0)
+    ring = {}; q = deque()
+    for v in bm.verts:
+        if v.is_boundary:
+            ring[v.index] = 0; q.append(v)
+    while q:
+        v = q.popleft()
+        for e in v.link_edges:
+            o = e.other_vert(v)
+            if o.index not in ring:
+                ring[o.index] = ring[v.index] + 1; q.append(o)
+    if not ring:
+        bm.free(); return _fail()
+
+    # --- PRECISION: keo vien patch ve DUNG duong margin (nearest tren polyline) ---
+    def _snap_poly(co):
+        best = None; bd = 1e18
         for i in range(n):
-            j = (i + 1) % n
+            a = P[i]; b = P[(i + 1) % n]
+            ab = b - a; L2 = ab.length_squared
+            t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, (co - a).dot(ab) / L2))
+            pt = a + ab * t; dd = (pt - co).length_squared
+            if dd < bd:
+                bd = dd; best = pt
+        return best
+    for v in bm.verts:
+        if v.is_boundary:
+            sp = _snap_poly(mw @ v.co)
+            if sp is not None:
+                v.co = mwi @ sp
+
+    # boundary loop adjacency + rim band
+    bnd_adj = defaultdict(list)
+    for e in bm.edges:
+        if e.is_boundary:
+            bnd_adj[e.verts[0].index].append(e.verts[1])
+            bnd_adj[e.verts[1].index].append(e.verts[0])
+    NRIM = 6
+    rimband = [v for v in bm.verts if ring.get(v.index, 99) <= NRIM]
+    LAM, MU = 0.63, -0.67
+
+    def _wf(v):
+        return max(0.0, 1.0 - ring.get(v.index, 0) / float(NRIM))
+
+    def _taubin_rim(iters):
+        for it in range(iters):
+            lam = LAM if it % 2 == 0 else MU
+            new = {}
+            for v in rimband:
+                nb = (bnd_adj.get(v.index) if v.is_boundary
+                      else [e.other_vert(v) for e in v.link_edges])
+                if not nb:
+                    continue
+                a = Vector((0.0, 0.0, 0.0))
+                for p in nb:
+                    a += p.co
+                a /= len(nb)
+                new[v] = v.co + (a - v.co) * (lam * _wf(v))
+            for v, c in new.items():
+                v.co = c
+
+    # --- 2) RIM CLEAN: Taubin band-pass (khu "tua", giu scallop) ---
+    _taubin_rim(30)
+
+    # --- 3) Day mang VAO TRONG theo normal-MUOT. RIM (ring 0 = margin) GIU tren be mat
+    #   (la duong cat + cho gan collar); NGAY ring 1 da TUT xuong = offset (vach vuong
+    #   goc, HET doan phang trung waxup) -> sau dan toi cutback o giua (long chao). ---
+    bm.normal_update()
+    RAMPR = 12
+    nrm = {v.index: v.normal.copy() for v in bm.verts}
+    for _ in range(10):
+        nn = {}
+        for v in bm.verts:
+            a = nrm[v.index].copy()
+            for e in v.link_edges:
+                a += nrm[e.other_vert(v).index]
+            nn[v.index] = a.normalized() if a.length > 1e-9 else nrm[v.index]
+        nrm = nn
+
+    def _ramp(r):
+        t = min(1.0, max(0.0, (r - 1) / float(RAMPR)))
+        return t * t * (3.0 - 2.0 * t)
+    # do sau: ring0 = 0 (tren be mat); ring>=1 = offset, sau dan toi cutback o giua
+    depth = {}
+    for v in bm.verts:
+        r = ring.get(v.index, 99)
+        depth[v.index] = 0.0 if r <= 0 else offset + (cutback - offset) * _ramp(r)
+    # blur do sau NHUNG bo qua ring 0 -> GIU vach tut vuong goc giua ring0 va ring1
+    for _ in range(10):
+        nw = {}
+        for v in bm.verts:
+            r = ring.get(v.index, 99)
+            if r <= 0:
+                nw[v.index] = 0.0
+                continue
+            sgw = depth[v.index]; c = 1
+            for e in v.link_edges:
+                o = e.other_vert(v)
+                if ring.get(o.index, 99) >= 1:
+                    sgw += depth[o.index]; c += 1
+            nw[v.index] = sgw / c
+        depth = nw
+    for v in bm.verts:
+        if depth[v.index] <= 0:
+            continue
+        d = nrm[v.index]
+        if d.dot((mw @ v.co) - bbox_center) < 0:   # bao dam huong RA NGOAI
+            d = -d
+        v.co = v.co - d * depth[v.index]            # day VAO TRONG than
+
+    # --- 4) COLLAR DAM XUYEN: extrude vien (margin, ring 0, dang TREN be mat) RA NGOAI
+    #   theo normal-muot, nho len tren be mat -> mat cat vuong goc XUYEN het mang tai
+    #   DUNG margin (FAST cat dut). Ring 0 phang dung tren be mat (= duong cat), ngay
+    #   ring 1 da tut xuong offset -> KHONG con DAI phang trung waxup. ---
+    bm.normal_update()
+    bedges = [e for e in bm.edges if e.is_boundary]
+    bvset = set()
+    for e in bedges:
+        bvset.add(e.verts[0]); bvset.add(e.verts[1])
+    up = {}
+    for v in bvset:
+        d = nrm[v.index]
+        if d.dot((mw @ v.co) - bbox_center) < 0:
+            d = -d   # huong RA NGOAI (len tren)
+        up[v] = [bm.verts.new(v.co + d * (WALL_UP * (k / float(WALL_UP_RINGS))))
+                 for k in range(1, WALL_UP_RINGS + 1)]
+    bm.verts.ensure_lookup_table()
+    for e in bedges:
+        a, b = e.verts[0], e.verts[1]
+        ca = [a] + up[a]; cb = [b] + up[b]
+        for k in range(WALL_UP_RINGS):
             try:
-                bm.faces.new((ring_a[i], ring_a[j], ring_b[j], ring_b[i]))
+                bm.faces.new((ca[k], cb[k], cb[k + 1], ca[k + 1]))
             except ValueError:
                 pass
 
-    # --- 2+3) Lap day long chao + chia luoi DEU (TAT CA tam giac, KHONG n-gon) ---
-    # QUAN TRONG (sua bug): truoc day day lap bang 1 n-gon 320 canh, roi subdivide
-    # cac canh cua no - von DUNG CHUNG voi thanh (wall) - khien mat thanh bi bien
-    # thanh n-gon 9 canh, tam giac hoa ra non-manifold -> luoi hong + PyMeshLab bi
-    # loai. Cach moi: lap day bang triangle_fill (Delaunay), TAM GIAC HOA TOAN BO
-    # (wall quads -> tris), roi subdivide TAT CA canh (moi tam giac chia deu) -> chi
-    # con tam giac sach, KHONG n-gon -> PyMeshLab nhan input sach -> luoi DEU.
-    bottom = rings[-1]
-    bottom_edges = []
-    for i in range(n):
-        e = bm.edges.get((bottom[i], bottom[(i + 1) % n]))
-        if e is not None:
-            bottom_edges.append(e)
-    floor_faces = []
-    if bottom_edges:
-        fres = bmesh.ops.triangle_fill(bm, edges=bottom_edges, use_beauty=True)
-        floor_faces = [g for g in fres.get('geom', [])
-                       if isinstance(g, bmesh.types.BMFace)]
-    if not floor_faces:
-        try:
-            floor_faces = [bm.faces.new(bottom)]
-        except ValueError:
-            pass
-
-    # Tam giac hoa TOAN BO (wall quads + bat ky n-gon nao) -> dong nhat tam giac.
-    nontri = [f for f in bm.faces if len(f.verts) > 3]
-    if nontri:
-        bmesh.ops.triangulate(bm, faces=nontri, quad_method='BEAUTY',
-                              ngon_method='BEAUTY')
-    # Chia DEU tat ca canh: moi tam giac da bi chia het canh -> tach sach 4 tam
-    # giac/lan, KHONG tao n-gon (khac han subdivide tap con cu).
-    if FLOOR_FILL_CUTS > 0:
-        bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=FLOOR_FILL_CUTS,
-                                  use_grid_fill=True)
-    # Danh dau dinh DAY (move=1) + chieu ve be mat offset that. Dinh "day" = co do
-    # sau vao trong >= ~offset (phan biet voi thanh dang nong, depth < offset).
-    mw = target.matrix_world
-    mwi = mw.inverted()
-    bm.verts.ensure_lookup_table()
-    for v in bm.verts:
-        hit, loc, _nor, _idx = target.closest_point_on_mesh(mwi @ v.co)
-        if not hit:
-            continue
-        depth = (v.co - (mw @ loc)).length
-        if depth >= offset * 0.85:        # dinh thuoc DAY long chao
-            v[move] = 1
-            proj = _project_offset(v.co)
-            if proj is not None:
-                v.co = proj
-
-    # --- REMESH (buoc "Create Cutter"): luoi tam giac DEU giong cutter iBar ---
-    # Do dai canh muc tieu = mat do rim (chu vi / so diem) * he so.
-    perim = sum((loop_pts[(i + 1) % n] - loop_pts[i]).length for i in range(n))
-    target_len = (perim / n) * ISO_PML_TARGET_FACTOR if n else 0.0
-
-    # B1) LUON flip + relax truoc: don sach topo + bo tam giac tua tua cua luoi day
-    #     lap tu n-gon (88% sliver, gan suy bien). Day la dieu kien BAT BUOC de
-    #     PyMeshLab chay sach - dua THANG luoi n-gon tho vao PyMeshLab se ra
-    #     non-manifold -> guard loai -> rot fallback (da kiem chung tren data that).
-    #     Day cung la ket qua fallback neu PyMeshLab khong dung duoc.
-    _isotropic_remesh(bm, move, _project_offset, ISO_REMESH_ITERS, ISO_RELAX_FACTOR)
-
-    # B1.5 + B2) Lam muot day (KHONG chieu lai) de khu nep TU CAT o vung lom (be mat
-    #   offset huong vao trong tu cat o ke rang) -> roi PyMeshLab isotropic remesh ->
-    #   luoi tam giac DEU (giong iBar). Tu cat khong on dinh nen LAP: moi vong lam
-    #   muot THEM + remesh THO hon mot chut roi thu lai; tang dan dam bao khu het tu
-    #   cat -> luon dung duoc PyMeshLab tren ca lom (khong rot fallback). Het vong ma
-    #   van loi -> giu ket qua da lam muot (fallback se tinh chinh tiep).
-    pml_env = _pymeshlab_ready()
-    used_pml = False
-    if pml_env is not None and target_len > 0:
-        for attempt in range(PML_MAX_ATTEMPTS):
-            _smooth_floor_bmesh(bm, move, PML_PRESMOOTH_FACTOR, PML_PRESMOOTH_ITERS)
-            tl = target_len * (1.0 + 0.5 * attempt)
-            used_pml = _remesh_basin_pymeshlab(pml_env, bm, loop_pts, tl, ISO_PML_ITERS)
-            if used_pml:
-                break
-
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-    mv = bm.verts.layers.int.get("gt_move")   # co the da bi xoa khi PyMeshLab dung lai bm
-    if mv is not None:
-        bm.verts.layers.int.remove(mv)
-
-    me = bpy.data.meshes.new(name)
-    bm.to_mesh(me)
+    bm.normal_update()
+    bm.to_mesh(cutter.data)
     bm.free()
 
-    cutter = bpy.data.objects.new(name, me)
-    context.collection.objects.link(cutter)
-
-    # Chi can lam lien tuc them khi DUNG fallback (flip+relax). PyMeshLab da cho mat
-    # muot + DEU san; smooth them se keo dinh roi be mat offset, giam do net.
-    if not used_pml:
-        _smooth_cutter_continuity(context, cutter)
-
-    # Lat normal huong RA NGOAI than (xa tam bbox). Nho the Solidify voi
-    # use_flip_normals=False luon day do day VAO TRONG than -> boolean cat sach.
+    # Lat normal huong RA NGOAI than -> Solidify use_flip_normals=False day VAO TRONG.
     _orient_faces_outward(cutter, bbox_center)
 
-    # Smooth shading: mat long chao muot, san sang edit/sculpt/freeform.
     for poly in cutter.data.polygons:
         poly.use_smooth = True
-
-    # Mau cutter: xanh la.
     _set_display_color(cutter, CUTTER_COLOR, "GT_CutterMat")
-
-    # Khoa duong hoan tat (rim) bang sculpt mask -> sculpt cutter KHONG lam bien
-    # dang margin. Lam khi topo da chot (truoc Solidify).
     _lock_margin_mask(cutter)
 
-    # Solidify len do day Gap. use_flip_normals=False -> day vao trong than object
-    # (normal da huong ra ngoai) de boolean DIFFERENCE cat dut, tach 2 manh.
-    # Buoc Create Cutter (add_solidify=False) KHONG them Solidify: nguoi dung sculpt
-    # lai cutter truoc; do day gap se them & apply o buoc 4 (Split).
     if add_solidify:
         mod = cutter.modifiers.new(name="Solidify", type='SOLIDIFY')
         mod.solidify_mode = 'NON_MANIFOLD'
         mod.nonmanifold_thickness_mode = 'FIXED'
         mod.thickness = gap
         mod.use_flip_normals = False
-
         if apply_solidify:
             bpy.ops.object.select_all(action='DESELECT')
             _set_active_object(cutter, context.view_layer)
@@ -1410,7 +1055,9 @@ class GTSplitProps(bpy.types.PropertyGroup):
     )
     offset: bpy.props.FloatProperty(
         name="Offset",
-        description="Khoang cach mat cat so voi be mat object",
+        description="Do sau TUT VUONG GOC ngay tai duong hoan tat: tu margin, mat cat "
+                    "tut thang xuong = offset roi moi vao long chao (khong co doan nam "
+                    "phang trung be mat waxup)",
         default=0.3, min=0.0, unit='LENGTH',
     )
     gap: bpy.props.FloatProperty(
@@ -1898,12 +1545,8 @@ class GTSPLIT_OT_create_cutter(bpy.types.Operator):
         _set_active_object(cutter, viewlayer)
         _select_object(cutter, True, viewlayer)
 
-        if _PYMESHLAB_ENV is not None:
-            self.report({'INFO'},
-                        "Da tao cutter (luoi min PyMeshLab). Co the 'Sculpt Cutter' roi chon Gap & 'Split Object'.")
-        else:
-            self.report({'WARNING'},
-                        "Da tao cutter voi luoi co ban. Bam 'Cai PyMeshLab' de co luoi min nhu iBar.")
+        self.report({'INFO'},
+                    "Da tao cutter. Co the 'Sculpt Cutter' roi chon Gap & 'Split Object'.")
         return {'FINISHED'}
 
 
@@ -2023,19 +1666,22 @@ class GTSPLIT_OT_execute_cut(bpy.types.Operator):
                 return {'CANCELLED'}
 
             cutter = _build_cutter(context, target, loop_pts, loop_nrms,
-                                   props.offset, gap, apply_solidify=True)
+                                   props.offset, gap,
+                                   apply_solidify=True)
             if cutter is None:
                 self.report({'ERROR'}, "Khong dung duoc cutter")
                 return {'CANCELLED'}
 
         viewlayer = context.view_layer
 
-        # Boolean DIFFERENCE (giong pattern add-on iBar).
+        # Boolean DIFFERENCE (giong pattern add-on iBar -> dung FAST, KHONG EXACT).
+        # EXACT lam VO VUN target khi cutter long chao co diem tu cat o ke rang (da
+        # kiem chung); FAST cat sach + dam xuyen mang nho collar (giong iBar).
         boolean = target.modifiers.new(name="GT_Boolean", type='BOOLEAN')
         boolean.object = cutter
         boolean.operation = 'DIFFERENCE'
         try:
-            boolean.solver = 'EXACT'
+            boolean.solver = 'FAST'
         except Exception:
             pass
         bpy.ops.object.select_all(action='DESELECT')
@@ -2139,78 +1785,6 @@ class GTSPLIT_OT_clear(bpy.types.Operator):
             self.report({'INFO'}, "Da xoa line / cutter")
         else:
             self.report({'INFO'}, "Khong co line/cutter de xoa")
-        return {'FINISHED'}
-
-
-# ---------------------------------------------------------------------------
-# Operator: cai PyMeshLab (luoi cutter min nhu iBar) - co canh bao + chay nen
-# ---------------------------------------------------------------------------
-class GTSPLIT_OT_install_pymeshlab(bpy.types.Operator):
-    """Cai PyMeshLab de tao luoi cutter MIN, DEU nhu iBar (chay nen, ~100MB)"""
-    bl_idname = "object.gtsplit_install_pymeshlab"
-    bl_label = "Cai PyMeshLab (luoi min)"
-    bl_options = {'REGISTER'}
-
-    def invoke(self, context, event):
-        # Hien hop thoai CANH BAO TRUOC khi cai -> nguoi dung khong bo ngo.
-        return context.window_manager.invoke_props_dialog(self, width=420)
-
-    def draw(self, context):
-        col = self.layout.column(align=True)
-        col.label(text="Se tai & cai PyMeshLab (~100MB) cho luoi cutter", icon='INFO')
-        col.label(text="MIN, DEU nhu iBar (khong rang cua).")
-        col.separator()
-        col.label(text="- Can ket noi Internet.", icon='WORLD')
-        col.label(text="- Cai chay NEN, Blender van dung duoc; co the", icon='SORTTIME')
-        col.label(text="  mat vai phut. Theo doi thanh trang thai ben duoi.")
-        col.label(text="- Nhan OK de bat dau, hoac Cancel de bo qua", icon='CHECKMARK')
-        col.label(text="  (van tao cutter duoc voi luoi co ban).")
-
-    def execute(self, context):
-        import threading
-        self._result = None
-        self._timer = None
-
-        def _work():
-            self._result = _install_pymeshlab_blocking()
-
-        self._thread = threading.Thread(target=_work, daemon=True)
-        self._thread.start()
-        wm = context.window_manager
-        self._timer = wm.event_timer_add(0.5, window=context.window)
-        wm.modal_handler_add(self)
-        try:
-            context.workspace.status_text_set(
-                "Dang cai PyMeshLab... vui long doi, dung tat Blender")
-        except Exception:
-            pass
-        self.report({'INFO'}, "Bat dau cai PyMeshLab (chay nen)...")
-        return {'RUNNING_MODAL'}
-
-    def modal(self, context, event):
-        if event.type != 'TIMER':
-            return {'RUNNING_MODAL'}
-        if self._result is None:
-            return {'RUNNING_MODAL'}     # van dang cai
-        wm = context.window_manager
-        if self._timer is not None:
-            wm.event_timer_remove(self._timer)
-            self._timer = None
-        try:
-            context.workspace.status_text_set(None)
-        except Exception:
-            pass
-        ok, msg = self._result
-        if ok:
-            self.report({'INFO'},
-                        "Da cai PyMeshLab. Tu gio cutter se co luoi min nhu iBar.")
-        else:
-            self.report({'WARNING'},
-                        "Cai PyMeshLab that bai (van dung luoi co ban). " + (msg or ""))
-        # Cap nhat lai panel.
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
         return {'FINISHED'}
 
 
@@ -2428,18 +2002,6 @@ class GTSPLIT_PT_panel(bpy.types.Panel):
                          else "Sculpt Cutter",
                          icon='SCULPTMODE_HLT')
 
-        # Trang thai PyMeshLab (luoi min nhu iBar). Chi DOC cache (khong chay
-        # subprocess trong draw). Kiem tra that su xay ra o Create Cutter.
-        if _PYMESHLAB_ENV is not None:
-            box.label(text="Luoi min: PyMeshLab da san sang", icon='CHECKMARK')
-        elif _PYMESHLAB_TRIED:
-            box.label(text="Dang dung luoi co ban (chua co PyMeshLab)", icon='INFO')
-            box.operator(GTSPLIT_OT_install_pymeshlab.bl_idname,
-                         text="Cai PyMeshLab (luoi min nhu iBar)", icon='IMPORT')
-        else:
-            box.operator(GTSPLIT_OT_install_pymeshlab.bl_idname,
-                         text="Cai PyMeshLab (luoi min nhu iBar)", icon='IMPORT')
-
         # 4) Chon Gap + Split (Gap se duoc them & apply vao cutter khi Split).
         box = layout.box()
         box.label(text="4. Split Object", icon='MOD_BOOLEAN')
@@ -2484,7 +2046,6 @@ _classes = [
     GTSPLIT_OT_toggle_target_alpha,
     GTSPLIT_OT_execute_cut,
     GTSPLIT_OT_clear,
-    GTSPLIT_OT_install_pymeshlab,
     GTSPLIT_OT_export_stl,
     GTSPLIT_OT_check_update,
     GTSPLIT_OT_update_from_github,
@@ -2496,15 +2057,6 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.gt_split = bpy.props.PointerProperty(type=GTSplitProps)
-    # Kiem tra trang thai PyMeshLab o luong nen -> panel hien dung ngay tu dau ma
-    # KHONG lam dung Blender (khong chay subprocess trong main thread / draw).
-    # Warm cache thu muc modules tren MAIN thread truoc -> luong nen khong dung bpy.
-    try:
-        import threading
-        _pml_modules_dir()
-        threading.Thread(target=_pymeshlab_ready, daemon=True).start()
-    except Exception:
-        pass
     # Tu dong kiem tra/cap nhat add-on tu GitHub sau 5s (giong iBar to ORG).
     try:
         bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
