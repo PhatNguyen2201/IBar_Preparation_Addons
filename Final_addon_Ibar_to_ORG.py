@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 4),
+    "version": (2, 4, 5),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -544,7 +544,7 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
 
         path = bpy.path.abspath("//")
         for ob in obs:
-            if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
+            if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar" or ob.name == "Opaque_Layer") and _set_active_object(ob, viewlayer):
                 stl_path = path + f"{ob.name}.stl"
                 _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         return {'FINISHED'}
@@ -2046,6 +2046,8 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
                 _select_object(ob, True, viewlayer)
             if ob.name == "iBar":
                 _select_object(ob, True, viewlayer)
+            if ob.name == "Opaque_Layer":
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
         file_pathORG = path + "before.txt"
         try:
@@ -2082,6 +2084,7 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         hybrid_obj = bpy.data.objects.get("Hybrid_Shell")
         ibar_obj = bpy.data.objects.get("iBar")
         closedbar_obj = bpy.data.objects.get("Closed_Bar")
+        opaque_obj = bpy.data.objects.get("Opaque_Layer")
         ibar_new_name = _make_name("iBar", part_suffix)
         if hybrid_obj:
             hybrid_obj.name = _make_name("Hybrid_Shell", part_suffix)
@@ -2133,7 +2136,7 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
                 self.report({'WARNING'}, f"Không thể tạo constructionInfo mới: {e}")
 
         # === Phần 5: Xuất STL cho các object đã đổi tên (giống dòng 284-302 SaveSTLORG) ===
-        objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj] if o is not None]
+        objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj, opaque_obj] if o is not None]
         for ob in objects_to_save:
             if _set_active_object(ob, viewlayer):
                 stl_path = path + f"{ob.name}.stl"
@@ -2175,7 +2178,7 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
             self.report({'ERROR'}, "Không tìm thấy object 'i_Bar' — hủy Create Opaque Layer")
             return {'CANCELLED'}
 
-        for name in ("Opaque Layer", "Offset Opaque"):
+        for name in ("Opaque_Layer", "Offset Opaque"):
             old = bpy.data.objects.get(name)
             if old is not None:
                 bpy.data.objects.remove(old, do_unlink=True)
@@ -2187,8 +2190,8 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
 
         new_obj = source.copy()
         new_obj.data = source.data.copy()
-        new_obj.name = "Opaque Layer"
-        new_obj.data.name = "Opaque Layer"
+        new_obj.name = "Opaque_Layer"
+        new_obj.data.name = "Opaque_Layer"
         for c in list(new_obj.users_collection):
             c.objects.unlink(new_obj)
         coll.objects.link(new_obj)
@@ -2208,7 +2211,7 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
                 m.thickness = y
 
         if not _apply_all_modifiers(new_obj, viewlayer):
-            self.report({'ERROR'}, "Object 'Opaque Layer' không nằm trong ViewLayer hiện tại")
+            self.report({'ERROR'}, "Object 'Opaque_Layer' không nằm trong ViewLayer hiện tại")
             return {'CANCELLED'}
         if not _apply_all_modifiers(offset_obj, viewlayer):
             self.report({'ERROR'}, "Object 'Offset Opaque' không nằm trong ViewLayer hiện tại")
@@ -2220,7 +2223,7 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
         new_obj.color = (1.0, 1.0, 0.0, 1.0)
         offset_obj.hide_set(True)
 
-        self.report({'INFO'}, "Đã tạo Opaque Layer + Offset Opaque")
+        self.report({'INFO'}, "Đã tạo Opaque_Layer + Offset Opaque")
         return {'FINISHED'}
 
 class IbarPrepPanel(bpy.types.Panel):
