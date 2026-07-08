@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 2),
+    "version": (2, 4, 3),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -39,6 +39,7 @@ MAX_STL_SIZE_BYTES = 15 * 1024 * 1024
 TARGET_STL_TRIANGLES = 600000
 STL_BINARY_HEADER_BYTES = 84
 STL_BINARY_TRIANGLE_BYTES = 50
+STL_EXPORT_PASSWORD = "password123"
 
 
 def _version_to_str(version_tuple):
@@ -501,7 +502,19 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
     bl_idname = "object.pnfunction2"
     bl_label = "STLs"
 
+    password: bpy.props.StringProperty(name="Password", subtype='PASSWORD', default="")
+
+    def invoke(self, context, event):
+        self.password = ""
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "password", text="Mật khẩu")
+
     def execute(self, context):
+        if self.password != STL_EXPORT_PASSWORD:
+            self.report({'ERROR'}, "Sai mật khẩu, không thể xuất STL")
+            return {'CANCELLED'}
         if not hw_read_key():
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
@@ -1023,7 +1036,19 @@ class buttonOperator_SaveAllSTL(bpy.types.Operator):
     bl_idname = "object.pnfunction16"
     bl_label = "STLs"
 
+    password: bpy.props.StringProperty(name="Password", subtype='PASSWORD', default="")
+
+    def invoke(self, context, event):
+        self.password = ""
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "password", text="Mật khẩu")
+
     def execute(self, context):
+        if self.password != STL_EXPORT_PASSWORD:
+            self.report({'ERROR'}, "Sai mật khẩu, không thể xuất STL")
+            return {'CANCELLED'}
         if not hw_read_key():
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
@@ -2108,6 +2133,67 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         self.report({'INFO'}, f"Đã lưu STL cho phần: {self.part_name}")
         return {'FINISHED'}
 
+class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
+    """Create Opaque Layer from Spacer_in_Process intersected with Hybrid_Shell"""
+    bl_idname = "object.pnfunction46"
+    bl_label = "Create Opaque Layer"
+
+    def execute(self, context):
+        _ensure_object_mode()
+        viewlayer = context.view_layer
+        x = context.scene.opaque_layer_thickness
+
+        source = bpy.data.objects.get("Spacer_in_Process")
+        if source is None:
+            self.report({'ERROR'}, "Không tìm thấy object 'Spacer_in_Process'")
+            return {'FINISHED'}
+
+        hybrid_shell = bpy.data.objects.get("Hybrid_Shell")
+        if hybrid_shell is None:
+            self.report({'ERROR'}, "Không tìm thấy object 'Hybrid_Shell'")
+            return {'FINISHED'}
+
+        old = bpy.data.objects.get("Opaque Layer")
+        if old is not None:
+            bpy.data.objects.remove(old, do_unlink=True)
+
+        coll = bpy.data.collections.get("Opaque Layer Collection")
+        if coll is None:
+            coll = bpy.data.collections.new("Opaque Layer Collection")
+            context.scene.collection.children.link(coll)
+
+        new_obj = source.copy()
+        new_obj.data = source.data.copy()
+        new_obj.name = "Opaque Layer"
+        new_obj.data.name = "Opaque Layer"
+        for c in list(new_obj.users_collection):
+            c.objects.unlink(new_obj)
+        coll.objects.link(new_obj)
+
+        for m in new_obj.modifiers:
+            if m.type == 'SOLIDIFY':
+                m.thickness = x
+
+        bpy.ops.object.select_all(action='DESELECT')
+        if not _set_active_object(new_obj, viewlayer):
+            self.report({'ERROR'}, "Object 'Opaque Layer' không nằm trong ViewLayer hiện tại")
+            return {'FINISHED'}
+        _select_object(new_obj, True, viewlayer)
+        for m in list(new_obj.modifiers):
+            bpy.ops.object.modifier_apply(modifier=m.name)
+
+        bool_mod = new_obj.modifiers.new(name="Boolean", type='BOOLEAN')
+        bool_mod.operation = 'INTERSECT'
+        bool_mod.solver = 'FAST'
+        bool_mod.object = hybrid_shell
+        _set_active_object(new_obj, viewlayer)
+        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+
+        new_obj.color = (1.0, 1.0, 0.0, 1.0)
+
+        self.report({'INFO'}, "Đã tạo Opaque Layer")
+        return {'FINISHED'}
+
 class IbarPrepPanel(bpy.types.Panel):
     bl_label = "IBar Function Prepare"
     bl_idname = "OBJECT_PT_Ibar_Transform"
@@ -2241,6 +2327,19 @@ class IbarRetentionPanel(bpy.types.Panel):
         row2.operator(buttonOperator_ApplyRetentionCutter.bl_idname, text = "Cut on Cutter", icon = 'CHECKBOX_HLT')
         row2.operator(buttonOperator_ApplyRetention.bl_idname, text = "Cut on Bar", icon = 'CHECKBOX_HLT')
         
+class AddOpaqueLayerPanel(bpy.types.Panel):
+    bl_label = "Add Opaque Layer"
+    bl_idname = "OBJECT_PT_AddOpaqueLayer"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IBAR Prep"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(context.scene, "opaque_layer_thickness", slider=True)
+        layout.operator(buttonOperator_CreateOpaqueLayer.bl_idname,
+                        text="Create Opaque Layer", icon='MOD_SOLIDIFY')
+
 class SaveSTLIPSPanel(bpy.types.Panel):
     bl_label = "IBar Save STL"
     bl_idname = "OBJECT_PT_SaveSTL"
@@ -2275,6 +2374,7 @@ buttonOperator_SetORG,
 buttonFramework_Thickness,
 buttonOperator_RemoveHybrid,
 buttonOperator_FixJumpToCutter,
+buttonOperator_CreateOpaqueLayer,
 buttonDeleteOther,
 buttonSnapToScrews,
 buttonSetAsGingiva,
@@ -2321,18 +2421,29 @@ OcclusalAlignment,
 IbarAddCustomPanel,
 IbarMeshControlPanel,
 IbarRetentionPanel,
+AddOpaqueLayerPanel,
 SaveSTLIPSPanel]
 
 def register():
     for cls in _classes:
         register_class(cls)
     bpy.types.Scene.construction_files = bpy.props.CollectionProperty(type=ConstructionFileItem)
+    bpy.types.Scene.opaque_layer_thickness = bpy.props.FloatProperty(
+        name="Thickness",
+        description="Độ dày của Opaque Layer (mm)",
+        default=0.2,
+        min=0.0,
+        max=2.0,
+        step=1,
+        precision=2,
+    )
     bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
 
 def unregister():
     if bpy.app.timers.is_registered(_schedule_auto_update):
         bpy.app.timers.unregister(_schedule_auto_update)
     del bpy.types.Scene.construction_files
+    del bpy.types.Scene.opaque_layer_thickness
     for cls in _classes:
         unregister_class(cls)
 
