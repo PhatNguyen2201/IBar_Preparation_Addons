@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 3),
+    "version": (2, 4, 4),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -186,6 +186,25 @@ def _ensure_object_mode():
             bpy.ops.object.mode_set(mode='OBJECT')
         except RuntimeError:
             pass
+
+
+def _apply_all_modifiers(obj, viewlayer):
+    bpy.ops.object.select_all(action='DESELECT')
+    if not _set_active_object(obj, viewlayer):
+        return False
+    _select_object(obj, True, viewlayer)
+    for m in list(obj.modifiers):
+        bpy.ops.object.modifier_apply(modifier=m.name)
+    return True
+
+
+def _apply_boolean(obj, target, operation, viewlayer, name="Boolean"):
+    mod = obj.modifiers.new(name=name, type='BOOLEAN')
+    mod.operation = operation
+    mod.solver = 'FAST'
+    mod.object = target
+    _set_active_object(obj, viewlayer)
+    bpy.ops.object.modifier_apply(modifier=mod.name)
 
 
 def _export_selected_stl(filepath):
@@ -2134,7 +2153,7 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         return {'FINISHED'}
 
 class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
-    """Create Opaque Layer from Spacer_in_Process intersected with Hybrid_Shell"""
+    """Create Opaque Layer (intersect i_Bar) + Offset Opaque (carve i_Bar)"""
     bl_idname = "object.pnfunction46"
     bl_label = "Create Opaque Layer"
 
@@ -2142,20 +2161,24 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
         _ensure_object_mode()
         viewlayer = context.view_layer
         x = context.scene.opaque_layer_thickness
+        y = context.scene.opaque_layer_gap
+        if y <= x:
+            self.report({'ERROR'}, "Opaque Gap (Y) phải lớn hơn Thickness (X)")
+            return {'CANCELLED'}
 
         source = bpy.data.objects.get("Spacer_in_Process")
         if source is None:
-            self.report({'ERROR'}, "Không tìm thấy object 'Spacer_in_Process'")
-            return {'FINISHED'}
+            self.report({'ERROR'}, "Không tìm thấy object 'Spacer_in_Process' — hủy Create Opaque Layer")
+            return {'CANCELLED'}
+        bar = bpy.data.objects.get("i_Bar")
+        if bar is None:
+            self.report({'ERROR'}, "Không tìm thấy object 'i_Bar' — hủy Create Opaque Layer")
+            return {'CANCELLED'}
 
-        hybrid_shell = bpy.data.objects.get("Hybrid_Shell")
-        if hybrid_shell is None:
-            self.report({'ERROR'}, "Không tìm thấy object 'Hybrid_Shell'")
-            return {'FINISHED'}
-
-        old = bpy.data.objects.get("Opaque Layer")
-        if old is not None:
-            bpy.data.objects.remove(old, do_unlink=True)
+        for name in ("Opaque Layer", "Offset Opaque"):
+            old = bpy.data.objects.get(name)
+            if old is not None:
+                bpy.data.objects.remove(old, do_unlink=True)
 
         coll = bpy.data.collections.get("Opaque Layer Collection")
         if coll is None:
@@ -2169,29 +2192,35 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
         for c in list(new_obj.users_collection):
             c.objects.unlink(new_obj)
         coll.objects.link(new_obj)
-
         for m in new_obj.modifiers:
             if m.type == 'SOLIDIFY':
                 m.thickness = x
 
-        bpy.ops.object.select_all(action='DESELECT')
-        if not _set_active_object(new_obj, viewlayer):
-            self.report({'ERROR'}, "Object 'Opaque Layer' không nằm trong ViewLayer hiện tại")
-            return {'FINISHED'}
-        _select_object(new_obj, True, viewlayer)
-        for m in list(new_obj.modifiers):
-            bpy.ops.object.modifier_apply(modifier=m.name)
+        offset_obj = new_obj.copy()
+        offset_obj.data = new_obj.data.copy()
+        offset_obj.name = "Offset Opaque"
+        offset_obj.data.name = "Offset Opaque"
+        for c in list(offset_obj.users_collection):
+            c.objects.unlink(offset_obj)
+        coll.objects.link(offset_obj)
+        for m in offset_obj.modifiers:
+            if m.type == 'SOLIDIFY':
+                m.thickness = y
 
-        bool_mod = new_obj.modifiers.new(name="Boolean", type='BOOLEAN')
-        bool_mod.operation = 'INTERSECT'
-        bool_mod.solver = 'FAST'
-        bool_mod.object = hybrid_shell
-        _set_active_object(new_obj, viewlayer)
-        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+        if not _apply_all_modifiers(new_obj, viewlayer):
+            self.report({'ERROR'}, "Object 'Opaque Layer' không nằm trong ViewLayer hiện tại")
+            return {'CANCELLED'}
+        if not _apply_all_modifiers(offset_obj, viewlayer):
+            self.report({'ERROR'}, "Object 'Offset Opaque' không nằm trong ViewLayer hiện tại")
+            return {'CANCELLED'}
+
+        _apply_boolean(new_obj, bar, 'INTERSECT', viewlayer)
+        _apply_boolean(bar, offset_obj, 'DIFFERENCE', viewlayer)
 
         new_obj.color = (1.0, 1.0, 0.0, 1.0)
+        offset_obj.hide_set(True)
 
-        self.report({'INFO'}, "Đã tạo Opaque Layer")
+        self.report({'INFO'}, "Đã tạo Opaque Layer + Offset Opaque")
         return {'FINISHED'}
 
 class IbarPrepPanel(bpy.types.Panel):
@@ -2337,6 +2366,7 @@ class AddOpaqueLayerPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.prop(context.scene, "opaque_layer_thickness", slider=True)
+        layout.prop(context.scene, "opaque_layer_gap", slider=True)
         layout.operator(buttonOperator_CreateOpaqueLayer.bl_idname,
                         text="Create Opaque Layer", icon='MOD_SOLIDIFY')
 
@@ -2437,6 +2467,15 @@ def register():
         step=1,
         precision=2,
     )
+    bpy.types.Scene.opaque_layer_gap = bpy.props.FloatProperty(
+        name="Opaque Gap",
+        description="Khe hở của Opaque Layer (mm), phải lớn hơn Thickness",
+        default=0.3,
+        min=0.0,
+        max=2.0,
+        step=1,
+        precision=2,
+    )
     bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
 
 def unregister():
@@ -2444,6 +2483,7 @@ def unregister():
         bpy.app.timers.unregister(_schedule_auto_update)
     del bpy.types.Scene.construction_files
     del bpy.types.Scene.opaque_layer_thickness
+    del bpy.types.Scene.opaque_layer_gap
     for cls in _classes:
         unregister_class(cls)
 
