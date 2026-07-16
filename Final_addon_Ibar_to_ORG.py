@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 5),
+    "version": (2, 4, 6),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -29,6 +29,7 @@ from pathlib import Path
 from mathutils import Vector
 import xml.etree.ElementTree as ET
 from typing import List, Dict
+from datetime import datetime
 
 GITHUB_OWNER = "PhatNguyen2201"
 GITHUB_REPO = "IBar_Preparation_Addons"
@@ -2075,10 +2076,11 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         patient_suffix = ""
         if patient_first_name:
             patient_suffix += "_" + patient_first_name
+        export_time_prefix = datetime.now().strftime("%y%m%d-%H%M") + "_"
         part_suffix = "_" + self.part_name + patient_suffix
 
         def _make_name(prefix, suffix, max_len=63):
-            full = prefix + suffix
+            full = export_time_prefix + prefix + suffix
             return full[:max_len] if len(full) > max_len else full
 
         hybrid_obj = bpy.data.objects.get("Hybrid_Shell")
