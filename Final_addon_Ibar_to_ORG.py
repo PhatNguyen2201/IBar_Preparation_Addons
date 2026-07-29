@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 6),
+    "version": (2, 4, 7),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -41,6 +41,9 @@ TARGET_STL_TRIANGLES = 600000
 STL_BINARY_HEADER_BYTES = 84
 STL_BINARY_TRIANGLE_BYTES = 50
 STL_EXPORT_PASSWORD = "password123"
+STL_GUARD_BASE_NAMES = ("Hybrid_Shell", "Hybrid", "iBar", "Closed_Bar", "Opaque_Layer")
+STL_GUARD_TIME_PREFIX_RE = re.compile(r"^\d{6}-\d{4}_")
+STL_GUARD_DUP_SUFFIX_RE = re.compile(r"\.\d{3}$")
 
 
 def _version_to_str(version_tuple):
@@ -150,14 +153,13 @@ def _select_object(obj, state=True, viewlayer=None):
 
 
 def _should_guard_stl_mesh(obj):
-    if obj is None:
+    """True cho moi object thuoc bo phan iBar, bat ke tien to thoi gian khi export."""
+    if obj is None or obj.type != 'MESH':
         return False
-    name = obj.name
-    return (
-        name == "Hybrid"
-        or name.startswith("Hybrid_Shell")
-        or name == "iBar"
-        or name.startswith("iBar_")
+    name = STL_GUARD_DUP_SUFFIX_RE.sub("", STL_GUARD_TIME_PREFIX_RE.sub("", obj.name))
+    return any(
+        name == base or name.startswith(base + "_")
+        for base in STL_GUARD_BASE_NAMES
     )
 
 
@@ -360,8 +362,9 @@ def _export_guarded_stl_object(obj, filepath, viewlayer, reporter=None):
                 reporter,
                 'ERROR',
                 (
-                    f"{obj.name}: STL van tren 30 MB sau khi giam mesh "
-                    f"({_format_file_size(final_size)}). Khong ghi de file dich."
+                    f"{obj.name}: STL van tren {_format_file_size(MAX_STL_SIZE_BYTES)} "
+                    f"sau khi giam mesh ({_format_file_size(final_size)}). "
+                    f"Khong ghi de file dich."
                 ),
             )
             return False
