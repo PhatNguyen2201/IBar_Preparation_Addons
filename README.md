@@ -52,7 +52,7 @@ Blender addon dành cho thiết kế khung xương hàm giả (iBar) trong nha k
 | **Cursor to Object** | Di chuyển 3D cursor đến đối tượng được chọn |
 | **Clean other mesh** | Xóa tất cả mesh ngoại trừ object "Models" |
 | **Create Tubes Automatically** | Tự động tạo tubes dựa trên file `.constructionInfo` và `.xml` |
-| **Create Framework thickness** | Tạo độ dày khung xương (1.5mm) từ Waxup design |
+| **Create Framework thickness** | Tạo framework **1 lớp** từ Waxup design: Remesh kín rồi offset bề mặt theo ô **Dày** (không dùng Solidify nên không còn 2 lớp ngoài–trong) |
 
 **Tạo Tubes tự động:**
 - Đọc file `.constructionInfo` (XML format) để lấy thông tin implant

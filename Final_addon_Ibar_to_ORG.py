@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 4, 0),
+    "version": (2, 7, 0),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -11,6 +11,7 @@ bl_info = {
 }
 
 import bpy
+import bmesh
 import uuid
 import os
 import hashlib
@@ -636,17 +637,22 @@ class buttonFramework_Thickness(bpy.types.Operator):
         bpy.context.object.modifiers["Remesh"].use_smooth_shade = True
         bpy.ops.object.modifier_apply(modifier="Remesh")
 
-        bpy.ops.object.modifier_add(type='SOLIDIFY')
-        bpy.context.object.modifiers["Solidify"].solidify_mode = 'NON_MANIFOLD'
-        bpy.context.object.modifiers["Solidify"].thickness = 1.5
-        bpy.context.object.modifiers["Solidify"].nonmanifold_thickness_mode = 'FIXED'
-        bpy.context.object.modifiers["Solidify"].use_flip_normals = True
-        bpy.ops.object.modifier_apply(modifier="Solidify")
+        # Khong dung Solidify (lop fill) nua: no sinh vo thu 2 ngoai+trong va
+        # separate LOOSE tach thanh 2 object. Thay bang offset toan bo dinh doc
+        # theo phap tuyen -> GIU NGUYEN 1 LOP FACE, 1 object duy nhat.
+        # Gia tri lay tu o "Day" canh nut: duong = ra ngoai, am = vao trong.
+        fill_thickness = getattr(bpy.context.scene, 'framework_fill_thickness', 1.5)
 
-        bpy.ops.object.editmode_toggle()
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.separate(type='LOOSE')
-        bpy.ops.object.editmode_toggle()
+        if abs(fill_thickness) > 1e-6:
+            bm = bmesh.new()
+            bm.from_mesh(new_obj.data)
+            bm.verts.ensure_lookup_table()
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+            for v in bm.verts:
+                v.co += v.normal * fill_thickness
+            bm.to_mesh(new_obj.data)
+            bm.free()
+            new_obj.data.update()
 
         scene = bpy.context.scene
         viewlayer = bpy.context.view_layer
@@ -656,11 +662,6 @@ class buttonFramework_Thickness(bpy.types.Operator):
         matg.diffuse_color = (0.8, 0, 0, 0.3)
         for obj in obs:
             if obj.name.find(new_obj.name) > -1 and _set_active_object(obj, viewlayer):
-                bpy.ops.object.modifier_add(type='REMESH')
-                bpy.context.object.modifiers["Remesh"].mode = 'SMOOTH'
-                bpy.context.object.modifiers["Remesh"].octree_depth = 7
-                bpy.context.object.modifiers["Remesh"].use_smooth_shade = True
-                bpy.ops.object.modifier_apply(modifier="Remesh")
                 obj.active_material = matg
         return {'FINISHED'}
 
@@ -1935,7 +1936,8 @@ class IbarAddCustomPanel(bpy.types.Panel):
         row2.operator(buttonDeleteOther.bl_idname, text = "Clean other mesh", icon = 'TRASH')
         row3 = layout.row()
         row3.operator(buttonOperator_CreateTubes.bl_idname, text = "Create Tubes Automatically", icon = 'ORIENTATION_LOCAL')
-        row4 = layout.row()
+        row4 = layout.row(align=True)
+        row4.prop(context.scene, "framework_fill_thickness", text=u"Dày")
         row4.operator(buttonFramework_Thickness.bl_idname, text = "Create Framework thickness", icon = 'MOD_THICKNESS')
         row5 = layout.row()
         row5.operator(buttonOperator_RemoveHybrid.bl_idname, text = "Remove Hybrid", icon = 'TRASH')
@@ -2095,12 +2097,18 @@ def register():
     for cls in _classes:
         register_class(cls)
     bpy.types.Scene.construction_files = bpy.props.CollectionProperty(type=ConstructionFileItem)
+    bpy.types.Scene.framework_fill_thickness = bpy.props.FloatProperty(
+        name=u"Độ dày Fill",
+        description="Offset be mat framework theo phap tuyen (duong = ra ngoai, am = vao trong). 0 = giu nguyen",
+        default=1.5, min=-50.0, max=50.0, soft_min=-5.0, soft_max=5.0,
+        step=10.0, precision=3)
     bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
 
 def unregister():
     if bpy.app.timers.is_registered(_schedule_auto_update):
         bpy.app.timers.unregister(_schedule_auto_update)
     del bpy.types.Scene.construction_files
+    del bpy.types.Scene.framework_fill_thickness
     for cls in _classes:
         unregister_class(cls)
 
