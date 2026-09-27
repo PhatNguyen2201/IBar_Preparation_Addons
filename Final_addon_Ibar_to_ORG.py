@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 7, 0),
+    "version": (2, 8, 0),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -30,12 +30,21 @@ from pathlib import Path
 from mathutils import Vector
 import xml.etree.ElementTree as ET
 from typing import List, Dict
+from datetime import datetime
 
 GITHUB_OWNER = "PhatNguyen2201"
 GITHUB_REPO = "IBar_Preparation_Addons"
 GITHUB_BRANCH = "main"
 GITHUB_FILE_PATH = "Final_addon_Ibar_to_ORG.py"
 GITHUB_BRANCH_FALLBACKS = ("main", "master")
+MAX_STL_SIZE_BYTES = 15 * 1024 * 1024
+TARGET_STL_TRIANGLES = 600000
+STL_BINARY_HEADER_BYTES = 84
+STL_BINARY_TRIANGLE_BYTES = 50
+STL_EXPORT_PASSWORD = "password123"
+STL_GUARD_BASE_NAMES = ("Hybrid_Shell", "Hybrid", "iBar", "Closed_Bar", "Opaque_Layer")
+STL_GUARD_TIME_PREFIX_RE = re.compile(r"^\d{6}-\d{4}_")
+STL_GUARD_DUP_SUFFIX_RE = re.compile(r"\.\d{3}$")
 
 
 def _version_to_str(version_tuple):
@@ -142,6 +151,269 @@ def _select_object(obj, state=True, viewlayer=None):
         return False
     obj.select_set(state)
     return True
+
+
+def _should_guard_stl_mesh(obj):
+    """True cho moi object thuoc bo phan iBar, bat ke tien to thoi gian khi export."""
+    if obj is None or obj.type != 'MESH':
+        return False
+    name = STL_GUARD_DUP_SUFFIX_RE.sub("", STL_GUARD_TIME_PREFIX_RE.sub("", obj.name))
+    return any(
+        name == base or name.startswith(base + "_")
+        for base in STL_GUARD_BASE_NAMES
+    )
+
+
+def _report_stl_guard(reporter, level, message):
+    if reporter is not None:
+        reporter.report({level}, message)
+    else:
+        print(f"[IBar STL Guard] {level}: {message}")
+
+
+def _format_file_size(size_bytes):
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _estimated_binary_stl_size(triangle_count):
+    return STL_BINARY_HEADER_BYTES + (triangle_count * STL_BINARY_TRIANGLE_BYTES)
+
+
+def _mesh_triangle_count(mesh):
+    mesh.calc_loop_triangles()
+    return len(mesh.loop_triangles)
+
+
+def _ensure_object_mode():
+    if bpy.ops.object.mode_set.poll():
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError:
+            pass
+
+
+def _apply_all_modifiers(obj, viewlayer):
+    bpy.ops.object.select_all(action='DESELECT')
+    if not _set_active_object(obj, viewlayer):
+        return False
+    _select_object(obj, True, viewlayer)
+    for m in list(obj.modifiers):
+        bpy.ops.object.modifier_apply(modifier=m.name)
+    return True
+
+
+def _apply_boolean(obj, target, operation, viewlayer, name="Boolean"):
+    mod = obj.modifiers.new(name=name, type='BOOLEAN')
+    mod.operation = operation
+    mod.solver = 'FAST'
+    mod.object = target
+    _set_active_object(obj, viewlayer)
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+
+
+def _export_selected_stl(filepath):
+    legacy_error = None
+    try:
+        bpy.ops.export_mesh.stl(
+            filepath=str(filepath),
+            use_selection=True,
+            ascii=False)
+        return
+    except TypeError as err:
+        legacy_error = err
+        try:
+            bpy.ops.export_mesh.stl(
+                filepath=str(filepath),
+                use_selection=True)
+            return
+        except Exception as fallback_err:
+            legacy_error = fallback_err
+    except Exception as err:
+        legacy_error = err
+
+    try:
+        bpy.ops.wm.stl_export(
+            filepath=str(filepath),
+            export_selected_objects=True,
+            ascii_format=False,
+            apply_modifiers=True)
+    except TypeError:
+        bpy.ops.wm.stl_export(
+            filepath=str(filepath),
+            export_selected_objects=True)
+    except Exception as err:
+        raise RuntimeError(f"STL export failed: {legacy_error}; {err}") from err
+
+
+def _temp_stl_path(filepath):
+    path = Path(filepath)
+    suffix = path.suffix if path.suffix else ".stl"
+    return str(path.with_name(path.stem + ".tmp_export" + suffix))
+
+
+def _create_evaluated_mesh_object(source_obj):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated_obj = source_obj.evaluated_get(depsgraph)
+    mesh = bpy.data.meshes.new_from_object(evaluated_obj, depsgraph=depsgraph)
+    temp_obj = bpy.data.objects.new(source_obj.name + "_stl_guard_tmp", mesh)
+    temp_obj.matrix_world = source_obj.matrix_world.copy()
+    bpy.context.scene.collection.objects.link(temp_obj)
+    bpy.context.view_layer.update()
+    return temp_obj
+
+
+def _remove_temp_mesh_object(obj):
+    if obj is None:
+        return
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _apply_decimate_modifier(obj, viewlayer, modifier_name, decimate_type, ratio=None, angle_limit=None):
+    if not _set_active_object(obj, viewlayer):
+        raise RuntimeError("Temporary export object is not in the current ViewLayer")
+    bpy.ops.object.select_all(action='DESELECT')
+    if not _select_object(obj, True, viewlayer):
+        raise RuntimeError("Temporary export object cannot be selected")
+    modifier = obj.modifiers.new(name=modifier_name, type='DECIMATE')
+    modifier.decimate_type = decimate_type
+    if ratio is not None:
+        modifier.ratio = max(0.001, min(1.0, ratio))
+    if angle_limit is not None:
+        modifier.angle_limit = angle_limit
+        modifier.use_dissolve_boundaries = False
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
+    _select_object(obj, False, viewlayer)
+    return True
+
+
+def _export_temp_object_to_stl(temp_obj, temp_path, viewlayer):
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    bpy.ops.object.select_all(action='DESELECT')
+    if not _set_active_object(temp_obj, viewlayer):
+        raise RuntimeError("Temporary export object is not in the current ViewLayer")
+    if not _select_object(temp_obj, True, viewlayer):
+        raise RuntimeError("Temporary export object cannot be selected")
+    _export_selected_stl(temp_path)
+    _select_object(temp_obj, False, viewlayer)
+    return os.path.getsize(temp_path)
+
+
+def _optimize_temp_stl_mesh(temp_obj, viewlayer, start_triangles):
+    triangles = start_triangles
+    if triangles > TARGET_STL_TRIANGLES:
+        _apply_decimate_modifier(
+            temp_obj,
+            viewlayer,
+            "STL_Guard_Dissolve",
+            'DISSOLVE',
+            angle_limit=math.radians(1.0),
+        )
+        triangles = _mesh_triangle_count(temp_obj.data)
+
+    if triangles > TARGET_STL_TRIANGLES:
+        ratio = (TARGET_STL_TRIANGLES / triangles) * 0.98
+        _apply_decimate_modifier(
+            temp_obj,
+            viewlayer,
+            "STL_Guard_Collapse",
+            'COLLAPSE',
+            ratio=ratio,
+        )
+        triangles = _mesh_triangle_count(temp_obj.data)
+    return triangles
+
+
+def _export_guarded_stl_object(obj, filepath, viewlayer, reporter=None):
+    _ensure_object_mode()
+    temp_obj = None
+    temp_path = _temp_stl_path(filepath)
+    try:
+        temp_obj = _create_evaluated_mesh_object(obj)
+        start_triangles = _mesh_triangle_count(temp_obj.data)
+        start_estimated_size = _estimated_binary_stl_size(start_triangles)
+        final_triangles = start_triangles
+
+        if start_estimated_size > MAX_STL_SIZE_BYTES:
+            final_triangles = _optimize_temp_stl_mesh(temp_obj, viewlayer, start_triangles)
+
+        final_size = _export_temp_object_to_stl(temp_obj, temp_path, viewlayer)
+        retry_count = 0
+        while final_size > MAX_STL_SIZE_BYTES and retry_count < 3:
+            current_triangles = _mesh_triangle_count(temp_obj.data)
+            if current_triangles <= 1:
+                break
+            retry_ratio = 0.5
+            _apply_decimate_modifier(
+                temp_obj,
+                viewlayer,
+                "STL_Guard_Collapse_Retry",
+                'COLLAPSE',
+                ratio=retry_ratio,
+            )
+            final_triangles = _mesh_triangle_count(temp_obj.data)
+            final_size = _export_temp_object_to_stl(temp_obj, temp_path, viewlayer)
+            retry_count += 1
+
+        if final_size > MAX_STL_SIZE_BYTES:
+            _report_stl_guard(
+                reporter,
+                'ERROR',
+                (
+                    f"{obj.name}: STL van tren {_format_file_size(MAX_STL_SIZE_BYTES)} "
+                    f"sau khi giam mesh ({_format_file_size(final_size)}). "
+                    f"Khong ghi de file dich."
+                ),
+            )
+            return False
+
+        os.replace(temp_path, filepath)
+        if start_estimated_size > MAX_STL_SIZE_BYTES or final_triangles < start_triangles:
+            _report_stl_guard(
+                reporter,
+                'INFO',
+                (
+                    f"{obj.name}: {_format_file_size(start_estimated_size)} -> "
+                    f"{_format_file_size(final_size)}, "
+                    f"{start_triangles:,} -> {final_triangles:,} tris"
+                ),
+            )
+        return True
+    except Exception as err:
+        _report_stl_guard(reporter, 'ERROR', f"Khong the export {obj.name}: {err}")
+        return False
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        _remove_temp_mesh_object(temp_obj)
+
+
+def _export_stl_with_mesh_guard(obj, filepath, viewlayer, reporter=None):
+    if _should_guard_stl_mesh(obj):
+        return _export_guarded_stl_object(obj, filepath, viewlayer, reporter)
+
+    try:
+        _ensure_object_mode()
+        bpy.ops.object.select_all(action='DESELECT')
+        if not _set_active_object(obj, viewlayer):
+            _report_stl_guard(reporter, 'ERROR', f"Object '{obj.name}' khong nam trong ViewLayer hien tai")
+            return False
+        _select_object(obj, True, viewlayer)
+        _export_selected_stl(filepath)
+        _select_object(obj, False, viewlayer)
+        return True
+    except Exception as err:
+        _report_stl_guard(reporter, 'ERROR', f"Khong the export {obj.name}: {err}")
+        return False
+    finally:
+        if obj is not None and _is_in_view_layer(obj, viewlayer):
+            _select_object(obj, False, viewlayer)
 
 
 class IBAR_OT_CheckAddonUpdate(bpy.types.Operator):
@@ -254,7 +526,19 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
     bl_idname = "object.pnfunction2"
     bl_label = "STLs"
 
+    password: bpy.props.StringProperty(name="Password", subtype='PASSWORD', default="")
+
+    def invoke(self, context, event):
+        self.password = ""
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "password", text="Mật khẩu")
+
     def execute(self, context):
+        if self.password != STL_EXPORT_PASSWORD:
+            self.report({'ERROR'}, "Sai mật khẩu, không thể xuất STL")
+            return {'CANCELLED'}
         if not hw_read_key():
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
@@ -265,13 +549,9 @@ class buttonOperator_SaveSTL(bpy.types.Operator):
 
         path = bpy.path.abspath("//")
         for ob in obs:
-            if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
+            if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar" or ob.name == "Opaque_Layer") and _set_active_object(ob, viewlayer):
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         return {'FINISHED'}
 
 class buttonOperator_SaveSTLORG(bpy.types.Operator):
@@ -337,12 +617,8 @@ class buttonOperator_SaveSTLORG(bpy.types.Operator):
         
         for ob in obs:
             if (ob.name == "Hybrid_Shell" or ob.name == "iBar" or ob.name == "Closed_Bar") and _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         bpy.ops.object.select_all(action='DESELECT')
         objectArrows = bpy.data.objects['fileORG']
         _select_object(objectArrows, True, viewlayer)
@@ -784,7 +1060,19 @@ class buttonOperator_SaveAllSTL(bpy.types.Operator):
     bl_idname = "object.pnfunction16"
     bl_label = "STLs"
 
+    password: bpy.props.StringProperty(name="Password", subtype='PASSWORD', default="")
+
+    def invoke(self, context, event):
+        self.password = ""
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "password", text="Mật khẩu")
+
     def execute(self, context):
+        if self.password != STL_EXPORT_PASSWORD:
+            self.report({'ERROR'}, "Sai mật khẩu, không thể xuất STL")
+            return {'CANCELLED'}
         if not hw_read_key():
             self.report({'ERROR'},"Vui lòng đăng ký key để kích hoạt sử dụng")
             return {'FINISHED'}
@@ -796,12 +1084,8 @@ class buttonOperator_SaveAllSTL(bpy.types.Operator):
         path = bpy.path.abspath("//")
         for ob in obs:
             if _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
         return {'FINISHED'}
         
 class buttonOperator_CreateTubes(bpy.types.Operator):
@@ -1767,6 +2051,8 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
                 _select_object(ob, True, viewlayer)
             if ob.name == "iBar":
                 _select_object(ob, True, viewlayer)
+            if ob.name == "Opaque_Layer":
+                _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_set(type='OBJECT')
         file_pathORG = path + "before.txt"
         try:
@@ -1794,15 +2080,17 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
         patient_suffix = ""
         if patient_first_name:
             patient_suffix += "_" + patient_first_name
+        export_time_prefix = datetime.now().strftime("%y%m%d-%H%M") + "_"
         part_suffix = "_" + self.part_name + patient_suffix
 
         def _make_name(prefix, suffix, max_len=63):
-            full = prefix + suffix
+            full = export_time_prefix + prefix + suffix
             return full[:max_len] if len(full) > max_len else full
 
         hybrid_obj = bpy.data.objects.get("Hybrid_Shell")
         ibar_obj = bpy.data.objects.get("iBar")
         closedbar_obj = bpy.data.objects.get("Closed_Bar")
+        opaque_obj = bpy.data.objects.get("Opaque_Layer")
         ibar_new_name = _make_name("iBar", part_suffix)
         if hybrid_obj:
             hybrid_obj.name = _make_name("Hybrid_Shell", part_suffix)
@@ -1854,15 +2142,11 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
                 self.report({'WARNING'}, f"Không thể tạo constructionInfo mới: {e}")
 
         # === Phần 5: Xuất STL cho các object đã đổi tên (giống dòng 284-302 SaveSTLORG) ===
-        objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj] if o is not None]
+        objects_to_save = [o for o in [hybrid_obj, ibar_obj, closedbar_obj, opaque_obj] if o is not None]
         for ob in objects_to_save:
             if _set_active_object(ob, viewlayer):
-                _select_object(ob, True, viewlayer)
                 stl_path = path + f"{ob.name}.stl"
-                bpy.ops.export_mesh.stl(
-                    filepath=str(stl_path),
-                    use_selection=True)
-                _select_object(ob, False, viewlayer)
+                _export_stl_with_mesh_guard(ob, stl_path, viewlayer, self)
 
         # === Phần 6: Clear parent và xóa fileORG ===
         bpy.ops.object.select_all(action='DESELECT')
@@ -1875,6 +2159,77 @@ class buttonOperator_SaveSTLByPart(bpy.types.Operator):
             bpy.data.objects.remove(objectArrows)
 
         self.report({'INFO'}, f"Đã lưu STL cho phần: {self.part_name}")
+        return {'FINISHED'}
+
+class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
+    """Create Opaque Layer (intersect i_Bar) + Offset Opaque (carve i_Bar)"""
+    bl_idname = "object.pnfunction46"
+    bl_label = "Create Opaque Layer"
+
+    def execute(self, context):
+        _ensure_object_mode()
+        viewlayer = context.view_layer
+        x = context.scene.opaque_layer_thickness
+        y = context.scene.opaque_layer_gap
+        if y <= x:
+            self.report({'ERROR'}, "Opaque Gap (Y) phải lớn hơn Thickness (X)")
+            return {'CANCELLED'}
+
+        source = bpy.data.objects.get("Spacer_in_Process")
+        if source is None:
+            self.report({'ERROR'}, "Không tìm thấy object 'Spacer_in_Process' — hủy Create Opaque Layer")
+            return {'CANCELLED'}
+        bar = bpy.data.objects.get("i_Bar")
+        if bar is None:
+            self.report({'ERROR'}, "Không tìm thấy object 'i_Bar' — hủy Create Opaque Layer")
+            return {'CANCELLED'}
+
+        for name in ("Opaque_Layer", "Offset Opaque"):
+            old = bpy.data.objects.get(name)
+            if old is not None:
+                bpy.data.objects.remove(old, do_unlink=True)
+
+        coll = bpy.data.collections.get("Opaque Layer Collection")
+        if coll is None:
+            coll = bpy.data.collections.new("Opaque Layer Collection")
+            context.scene.collection.children.link(coll)
+
+        new_obj = source.copy()
+        new_obj.data = source.data.copy()
+        new_obj.name = "Opaque_Layer"
+        new_obj.data.name = "Opaque_Layer"
+        for c in list(new_obj.users_collection):
+            c.objects.unlink(new_obj)
+        coll.objects.link(new_obj)
+        for m in new_obj.modifiers:
+            if m.type == 'SOLIDIFY':
+                m.thickness = x
+
+        offset_obj = new_obj.copy()
+        offset_obj.data = new_obj.data.copy()
+        offset_obj.name = "Offset Opaque"
+        offset_obj.data.name = "Offset Opaque"
+        for c in list(offset_obj.users_collection):
+            c.objects.unlink(offset_obj)
+        coll.objects.link(offset_obj)
+        for m in offset_obj.modifiers:
+            if m.type == 'SOLIDIFY':
+                m.thickness = y
+
+        if not _apply_all_modifiers(new_obj, viewlayer):
+            self.report({'ERROR'}, "Object 'Opaque_Layer' không nằm trong ViewLayer hiện tại")
+            return {'CANCELLED'}
+        if not _apply_all_modifiers(offset_obj, viewlayer):
+            self.report({'ERROR'}, "Object 'Offset Opaque' không nằm trong ViewLayer hiện tại")
+            return {'CANCELLED'}
+
+        _apply_boolean(new_obj, bar, 'INTERSECT', viewlayer)
+        _apply_boolean(bar, offset_obj, 'DIFFERENCE', viewlayer)
+
+        new_obj.color = (1.0, 1.0, 0.0, 1.0)
+        offset_obj.hide_set(True)
+
+        self.report({'INFO'}, "Đã tạo Opaque_Layer + Offset Opaque")
         return {'FINISHED'}
 
 class IbarPrepPanel(bpy.types.Panel):
@@ -2011,6 +2366,20 @@ class IbarRetentionPanel(bpy.types.Panel):
         row2.operator(buttonOperator_ApplyRetentionCutter.bl_idname, text = "Cut on Cutter", icon = 'CHECKBOX_HLT')
         row2.operator(buttonOperator_ApplyRetention.bl_idname, text = "Cut on Bar", icon = 'CHECKBOX_HLT')
         
+class AddOpaqueLayerPanel(bpy.types.Panel):
+    bl_label = "Add Opaque Layer"
+    bl_idname = "OBJECT_PT_AddOpaqueLayer"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IBAR Prep"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(context.scene, "opaque_layer_thickness", slider=True)
+        layout.prop(context.scene, "opaque_layer_gap", slider=True)
+        layout.operator(buttonOperator_CreateOpaqueLayer.bl_idname,
+                        text="Create Opaque Layer", icon='MOD_SOLIDIFY')
+
 class SaveSTLIPSPanel(bpy.types.Panel):
     bl_label = "IBar Save STL"
     bl_idname = "OBJECT_PT_SaveSTL"
@@ -2045,6 +2414,7 @@ buttonOperator_SetORG,
 buttonFramework_Thickness,
 buttonOperator_RemoveHybrid,
 buttonOperator_FixJumpToCutter,
+buttonOperator_CreateOpaqueLayer,
 buttonDeleteOther,
 buttonSnapToScrews,
 buttonSetAsGingiva,
@@ -2091,6 +2461,7 @@ OcclusalAlignment,
 IbarAddCustomPanel,
 IbarMeshControlPanel,
 IbarRetentionPanel,
+AddOpaqueLayerPanel,
 SaveSTLIPSPanel]
 
 def register():
@@ -2102,6 +2473,24 @@ def register():
         description="Offset be mat framework theo phap tuyen (duong = ra ngoai, am = vao trong). 0 = giu nguyen",
         default=1.5, min=-50.0, max=50.0, soft_min=-5.0, soft_max=5.0,
         step=10.0, precision=3)
+    bpy.types.Scene.opaque_layer_thickness = bpy.props.FloatProperty(
+        name="Thickness",
+        description="Độ dày của Opaque Layer (mm)",
+        default=0.2,
+        min=0.0,
+        max=2.0,
+        step=1,
+        precision=2,
+    )
+    bpy.types.Scene.opaque_layer_gap = bpy.props.FloatProperty(
+        name="Opaque Gap",
+        description="Khe hở của Opaque Layer (mm), phải lớn hơn Thickness",
+        default=0.3,
+        min=0.0,
+        max=2.0,
+        step=1,
+        precision=2,
+    )
     bpy.app.timers.register(_schedule_auto_update, first_interval=5.0)
 
 def unregister():
@@ -2109,6 +2498,8 @@ def unregister():
         bpy.app.timers.unregister(_schedule_auto_update)
     del bpy.types.Scene.construction_files
     del bpy.types.Scene.framework_fill_thickness
+    del bpy.types.Scene.opaque_layer_thickness
+    del bpy.types.Scene.opaque_layer_gap
     for cls in _classes:
         unregister_class(cls)
 

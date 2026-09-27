@@ -104,6 +104,11 @@ Blender addon dành cho thiết kế khung xương hàm giả (iBar) trong nha k
 | **Save All STL** | Export tất cả mesh trong scene |
 | **Save STL by Part** | Export từng phần theo ConstructionInfo, tự động đặt tên với PartName và PatientName |
 
+**Mesh size guard:**
+- Tự động kiểm tra STL của `Hybrid`, `Hybrid_Shell*`, `iBar`, `iBar_*` khi export.
+- Nếu file vượt 30 MB, addon tạo mesh tạm, giảm tam giác bằng Decimate và chỉ thay file đích khi STL mới <= 30 MB.
+- Mesh gốc trong scene không bị thay đổi.
+
 **Save STL by Part:**
 - Transform về ORG trước khi xuất
 - Đổi tên object theo format: `{PartName}_{PatientFirstName}`
@@ -199,6 +204,7 @@ Dưới đây là lịch sử các thay đổi dựa trên Git commit history:
 
 | Commit | Ngày | Mô tả thay đổi |
 |---|---|---|
+| `pending` | 24/06/2026 | Add mesh size guard for Hybrid/iBar STL export over 30 MB |
 | `3328b14` | 03/06/2026 | Fix ViewLayer object activation safety - Sửa lỗi kích hoạt object trong ViewLayer |
 | `d0a2ede` | 02/06/2026 | Add empty 4Implants vertex group - Thêm vertex group rỗng cho 4 implants |
 | `14b2c22` | 26/05/2026 | Gộp LoadConstructionInfo vào CreateTubes và thêm auto-update khi khởi động |
