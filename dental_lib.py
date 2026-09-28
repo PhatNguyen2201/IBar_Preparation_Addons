@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 1),
+    "version": (0, 1, 2),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -50,6 +50,37 @@ INDEX_NAME = "library.json"
 MESH_EXTS = (".stl", ".ply")
 
 _INDEX_CACHE = {"path": None, "mtime": None, "data": None}
+
+_ICON_NAMES = None
+_ICON_WARNED = set()
+
+
+def _ic(name):
+    """Tra ve ten icon hop le dung cho UILayout.
+
+    Blender abort TOAN BO draw() callback neu gap icon khong ton tai
+    (TypeError: enum "..." not found) -> moi widget phia sau bi mat hang
+    loat. Ham nay kiem tra enum that va thay bang 'NONE' cho an toan.
+    """
+    global _ICON_NAMES
+    if _ICON_NAMES is None:
+        items = set()
+        try:
+            for func in bpy.types.UILayout.bl_rna.functions.values():
+                for pname, prop in func.parameters.items():
+                    if pname == "icon" and hasattr(prop, "enum_items"):
+                        items.update(i.identifier for i in prop.enum_items)
+        except Exception as exc:
+            print(f"[Dental-Lib] Khong doc duoc danh sach icon: {exc}")
+        _ICON_NAMES = items
+    if not name:
+        return "NONE"
+    if not _ICON_NAMES or name in _ICON_NAMES:
+        return name
+    if name not in _ICON_WARNED:
+        _ICON_WARNED.add(name)
+        print(f"[Dental-Lib] Icon khong ton tai: {name} -> dung NONE")
+    return "NONE"
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +315,8 @@ ATTACHMENT_SLOT_LABELS = [
 
 class DLIB_PG_ConnectionEntry(PropertyGroup):
     entry_name: StringProperty(name="Library Name", default="New Connection")
+    open: BoolProperty(name="Mo rong", default=True,
+                       description="Thu/mo danh sach slot file cua entry nay")
     slot_base: StringProperty(name="Base", subtype='FILE_PATH', default="")
     slot_analog: StringProperty(name="Implant-Analog", subtype='FILE_PATH', default="")
     slot_screw: StringProperty(name="Screw", subtype='FILE_PATH', default="")
@@ -292,6 +325,8 @@ class DLIB_PG_ConnectionEntry(PropertyGroup):
 
 class DLIB_PG_AttachmentEntry(PropertyGroup):
     entry_name: StringProperty(name="Attachment Name", default="New Attachment")
+    open: BoolProperty(name="Mo rong", default=True,
+                       description="Thu/mo danh sach slot file cua entry nay")
     on_bar: BoolProperty(name="Add/Remove on Bar", default=True)
     part_bar: StringProperty(name="Apply Part Bar", subtype='FILE_PATH', default="")
     on_sleeve: BoolProperty(name="Add/Remove on Sleeve", default=False)
@@ -379,11 +414,26 @@ def _save_all(context):
     return {"FINISHED"}
 
 
+def ensure_loaded(context):
+    """Nap thu vien tu dia neu buffer rong trong khi library.json da co data.
+
+    Ne cham ham nay truoc khi sua thi mot file .blend moi (chua sync) se bi
+    _save_all() ghi de len library.json va xoa mem toan bo thu vien cu.
+    """
+    group = _lib_group(context)
+    if len(group.connections) or len(group.attachments):
+        return group
+    data = read_index()
+    if data["connections"] or data["attachments"]:
+        scene_from_index(context, data)
+    return group
+
+
 class DLIB_OT_load_library(Operator):
     """Nap lai thu vien tu file library.json tren dia"""
     bl_idname = "dental_lib.load_library"
     bl_label = "Nap thu vien"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     def execute(self, context):
         ensure_library_dir()
@@ -399,7 +449,7 @@ class DLIB_OT_save_library(Operator):
     """Luu toan bo thu vien vao file library.json"""
     bl_idname = "dental_lib.save_library"
     bl_label = "Luu thu vien"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     def execute(self, context):
         try:
@@ -439,26 +489,32 @@ class DLIB_OT_open_folder(Operator):
 # ---------------------------------------------------------------------------
 # Operator: them / xoa entry
 # ---------------------------------------------------------------------------
-def _unique_entry_name(entries, prefix):
-    """Ten 'Prefix N' dau tien chua ton tai (len() khong con dung sau khi xoa)."""
-    used = {entry.entry_name for entry in entries}
+def _unique_name(entries, prefix, attr="entry_name"):
+    """Ten '<prefix> N' dau tien chua ton tai (dung len() sau khi xoa la sai)."""
+    used = {getattr(entry, attr) for entry in entries}
     index = 1
     while ("%s %d" % (prefix, index)) in used:
         index += 1
     return "%s %d" % (prefix, index)
 
 
+def _unique_entry_name(entries, prefix):
+    return _unique_name(entries, prefix, "entry_name")
+
+
 class DLIB_OT_add_connection(Operator):
     """Them mot Implant Connection moi vao thu vien"""
     bl_idname = "dental_lib.add_connection"
     bl_label = "Add Connection Base"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     def execute(self, context):
-        group = _lib_group(context)
+        group = ensure_loaded(context)
         entry = group.connections.add()
         entry.entry_name = _unique_entry_name(group.connections, "Connection")
         _save_all(context)
+        self.report({'INFO'}, "Da tao '%s' - chon file cho tung slot ben duoi"
+                    % entry.entry_name)
         return {'FINISHED'}
 
 
@@ -466,16 +522,17 @@ class DLIB_OT_remove_connection(Operator):
     """Xoa Connection khoi thu vien (giu lai file asset)"""
     bl_idname = "dental_lib.remove_connection"
     bl_label = "Remove Connection"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     index: IntProperty(default=-1)
 
     def execute(self, context):
-        group = _lib_group(context)
+        group = ensure_loaded(context)
         if 0 <= self.index < len(group.connections):
+            name = group.connections[self.index].entry_name
             group.connections.remove(self.index)
             _save_all(context)
-            self.report({'INFO'}, "Da xoa Connection")
+            self.report({'INFO'}, "Da xoa '%s'" % name)
             return {'FINISHED'}
         return {'CANCELLED'}
 
@@ -484,13 +541,14 @@ class DLIB_OT_add_attachment(Operator):
     """Them mot Attachment moi vao thu vien"""
     bl_idname = "dental_lib.add_attachment"
     bl_label = "Add Attachment"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     def execute(self, context):
-        group = _lib_group(context)
+        group = ensure_loaded(context)
         entry = group.attachments.add()
         entry.entry_name = _unique_entry_name(group.attachments, "Attachment")
         _save_all(context)
+        self.report({'INFO'}, "Da tao '%s'" % entry.entry_name)
         return {'FINISHED'}
 
 
@@ -498,16 +556,17 @@ class DLIB_OT_remove_attachment(Operator):
     """Xoa Attachment khoi thu vien (giu lai file asset)"""
     bl_idname = "dental_lib.remove_attachment"
     bl_label = "Remove Attachment"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     index: IntProperty(default=-1)
 
     def execute(self, context):
-        group = _lib_group(context)
+        group = ensure_loaded(context)
         if 0 <= self.index < len(group.attachments):
+            name = group.attachments[self.index].entry_name
             group.attachments.remove(self.index)
             _save_all(context)
-            self.report({'INFO'}, "Da xoa Attachment")
+            self.report({'INFO'}, "Da xoa '%s'" % name)
             return {'FINISHED'}
         return {'CANCELLED'}
 
@@ -539,6 +598,7 @@ class DLIB_OT_import_asset(Operator, ImportHelper):
     slot: StringProperty(default="base")
 
     def execute(self, context):
+        ensure_loaded(context)
         entry = _entry_by_index(context, self.kind, self.index)
         if entry is None:
             self.report({'ERROR'}, "Khong tim thay entry trong thu vien")
@@ -567,13 +627,14 @@ class DLIB_OT_clear_asset(Operator):
     """Xoa lien ket file cua slot (khong xoa file trong thu vien)"""
     bl_idname = "dental_lib.clear_asset"
     bl_label = "Clear"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     kind: StringProperty(default="connection")
     index: IntProperty(default=-1)
     slot: StringProperty(default="base")
 
     def execute(self, context):
+        ensure_loaded(context)
         entry = _entry_by_index(context, self.kind, self.index)
         if entry is None:
             return {'CANCELLED'}
@@ -592,16 +653,17 @@ class DLIB_OT_add_visual(Operator):
     """Them mot Visual Object vao Attachment"""
     bl_idname = "dental_lib.add_visual"
     bl_label = "Add Visual Object"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     index: IntProperty(default=-1)
 
     def execute(self, context):
+        ensure_loaded(context)
         entry = _entry_by_index(context, "attachment", self.index)
         if entry is None:
             return {'CANCELLED'}
         row = entry.visuals.add()
-        row.label = "Visual %d" % (len(entry.visuals))
+        row.label = _unique_name(entry.visuals, "Visual", "label")
         _save_all(context)
         return {'FINISHED'}
 
@@ -610,12 +672,13 @@ class DLIB_OT_remove_visual(Operator):
     """Xoa Visual Object khoi Attachment"""
     bl_idname = "dental_lib.remove_visual"
     bl_label = "Remove Visual"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = set()
 
     index: IntProperty(default=-1)
     visual_index: IntProperty(default=-1)
 
     def execute(self, context):
+        ensure_loaded(context)
         entry = _entry_by_index(context, "attachment", self.index)
         if entry is None:
             return {'CANCELLED'}
@@ -638,6 +701,7 @@ class DLIB_OT_import_visual(Operator, ImportHelper):
     visual_index: IntProperty(default=-1)
 
     def execute(self, context):
+        ensure_loaded(context)
         entry = _entry_by_index(context, "attachment", self.index)
         if entry is None or not (0 <= self.visual_index < len(entry.visuals)):
             self.report({'ERROR'}, "Khong tim thay Visual Object")
@@ -712,7 +776,7 @@ class DLIB_OT_insert_connection(Operator):
     index: IntProperty(default=-1)
 
     def execute(self, context):
-        group = _lib_group(context)
+        group = ensure_loaded(context)
         if not (0 <= self.index < len(group.connections)):
             return {'CANCELLED'}
         entry = group.connections[self.index]
@@ -740,7 +804,7 @@ class DLIB_OT_insert_attachment(Operator):
     index: IntProperty(default=-1)
 
     def execute(self, context):
-        group = _lib_group(context)
+        group = ensure_loaded(context)
         if not (0 <= self.index < len(group.attachments)):
             return {'CANCELLED'}
         entry = group.attachments[self.index]
@@ -772,21 +836,30 @@ class DLIB_OT_insert_attachment(Operator):
 # ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
+def _short(path, width=26):
+    """Tinh gon ten file hien thi trong sidebar hep."""
+    name = os.path.basename(path) if path else ""
+    if len(name) > width:
+        name = name[:width - 3] + "..."
+    return name
+
+
 def _draw_slot(layout, kind, index, slot, label, icon, value):
     row = layout.row(align=True)
-    row.label(text=label, icon=icon)
+    row.label(text=label, icon=_ic(icon))
     if value:
-        ok = os.path.exists(resolve_asset(value))
-        row.label(text=os.path.basename(resolve_asset(value)),
-                  icon='CHECKMARK' if ok else 'ERROR')
+        path = resolve_asset(value)
+        row.label(text=_short(path),
+                  icon=_ic('CHECKMARK' if os.path.exists(path) else 'ERROR'))
     else:
-        row.label(text="(chua co file)", icon='BLANK1')
-    op = row.operator(DLIB_OT_import_asset.bl_idname, text="", icon='FILE_IMPORT')
+        row.label(text="(chua co file)", icon=_ic('BLANK1'))
+    op = row.operator(DLIB_OT_import_asset.bl_idname, text="Gan file",
+                      icon=_ic('FILEBROWSER'))
     op.kind = kind
     op.index = index
     op.slot = slot
     if value:
-        op = row.operator(DLIB_OT_clear_asset.bl_idname, text="", icon='X')
+        op = row.operator(DLIB_OT_clear_asset.bl_idname, text="", icon=_ic('X'))
         op.kind = kind
         op.index = index
         op.slot = slot
@@ -801,44 +874,60 @@ class DLIB_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        group = context.scene.dental_lib
+        group = ensure_loaded(context)
 
         row = layout.row(align=True)
         row.operator(DLIB_OT_load_library.bl_idname, text="Nap thu vien",
-                     icon='FILE_REFRESH')
+                     icon=_ic('FILE_REFRESH'))
         row.operator(DLIB_OT_save_library.bl_idname, text="Luu thu vien",
-                     icon='FILE_TICK')
-        layout.operator(DLIB_OT_open_folder.bl_idname, text="Thu muc: %s"
-                        % library_dir(), icon='FILE_FOLDER')
+                     icon=_ic('FILE_TICK'))
+        col = layout.column(align=True)
+        col.operator(DLIB_OT_open_folder.bl_idname, text="Mo thu muc thu vien",
+                     icon=_ic('FILE_FOLDER'))
+        col.label(text=_short(library_dir(), 46))
 
         # ---- 1. Implant Connection -------------------------------------
         box = layout.box()
-        box.label(text="1. Implant Connection", icon='MESH_CYLINDER')
+        head = box.row(align=True)
+        head.label(text="1. Implant Connection", icon=_ic('MESH_CYLINDER'))
+        head.label(text=str(len(group.connections)))
+        box.operator(DLIB_OT_add_connection.bl_idname,
+                     text="+ Add Connection Base", icon=_ic('ADD'))
         for i, entry in enumerate(group.connections):
             sub = box.box()
-            head = sub.row(align=True)
-            head.prop(entry, "entry_name", text="", icon='DOT')
-            op = head.operator(DLIB_OT_remove_connection.bl_idname,
-                               text="", icon='TRASH')
+            row = sub.row(align=True)
+            row.prop(entry, "open", text="",
+                     icon=_ic('TRIA_DOWN' if entry.open else 'TRIA_RIGHT'))
+            row.prop(entry, "entry_name", text="")
+            op = row.operator(DLIB_OT_remove_connection.bl_idname,
+                              text="", icon=_ic('TRASH'))
             op.index = i
+            if not entry.open:
+                continue
             for slot, label, icon in CONNECTION_SLOT_LABELS:
                 _draw_slot(sub, "connection", i, slot, label, icon,
                            getattr(entry, CONNECTION_SLOT_FIELD[slot]))
             sub.operator(DLIB_OT_insert_connection.bl_idname,
-                         text="Insert vao scene", icon='IMPORT').index = i
-        box.operator(DLIB_OT_add_connection.bl_idname,
-                     text="+ Add Connection Base", icon='ADD')
+                         text="Insert vao scene", icon=_ic('IMPORT')).index = i
 
         # ---- 2. Attachment ---------------------------------------------
         box = layout.box()
-        box.label(text="2. Attachment", icon='MESH_CUBE')
+        head = box.row(align=True)
+        head.label(text="2. Attachment", icon=_ic('MESH_CUBE'))
+        head.label(text=str(len(group.attachments)))
+        box.operator(DLIB_OT_add_attachment.bl_idname,
+                     text="+ Add Attachment", icon=_ic('ADD'))
         for i, entry in enumerate(group.attachments):
             sub = box.box()
-            head = sub.row(align=True)
-            head.prop(entry, "entry_name", text="", icon='DOT')
-            op = head.operator(DLIB_OT_remove_attachment.bl_idname,
-                               text="", icon='TRASH')
+            row = sub.row(align=True)
+            row.prop(entry, "open", text="",
+                     icon=_ic('TRIA_DOWN' if entry.open else 'TRIA_RIGHT'))
+            row.prop(entry, "entry_name", text="")
+            op = row.operator(DLIB_OT_remove_attachment.bl_idname,
+                              text="", icon=_ic('TRASH'))
             op.index = i
+            if not entry.open:
+                continue
             sub.prop(entry, "on_bar")
             _draw_slot(sub, "attachment", i, "part_bar", "Apply Part Bar",
                        'MESH_CUBE', entry.part_bar)
@@ -846,27 +935,33 @@ class DLIB_PT_panel(Panel):
             _draw_slot(sub, "attachment", i, "part_sleeve", "Apply Part Sleeve",
                        'MESH_TORUS', entry.part_sleeve)
             sub.label(text="Visual Objects (khong gioi han so luong):",
-                      icon='OUTLINER_OB_MESH')
+                      icon=_ic('OUTLINER_OB_MESH'))
             for j, visual in enumerate(entry.visuals):
                 vrow = sub.row(align=True)
-                vrow.prop(visual, "label", text="", icon='MESH_DATA')
+                vrow.prop(visual, "label", text="", icon=_ic('MESH_DATA'))
                 path = resolve_asset(visual.asset)
-                vrow.label(text=os.path.basename(path) if path else "(chua co file)",
-                           icon='CHECKMARK' if path and os.path.exists(path) else 'ERROR')
+                if not visual.asset:
+                    state_icon = _ic('BLANK1')
+                    state_text = "(chua co file)"
+                else:
+                    state_text = _short(path)
+                    state_icon = _ic('CHECKMARK' if os.path.exists(path)
+                                     else 'ERROR')
+                vrow.label(text=state_text, icon=state_icon)
                 op = vrow.operator(DLIB_OT_import_visual.bl_idname,
-                                   text="", icon='FILE_IMPORT')
+                                   text="Gan file", icon=_ic('FILEBROWSER'))
                 op.index = i
                 op.visual_index = j
                 op = vrow.operator(DLIB_OT_remove_visual.bl_idname,
-                                   text="", icon='TRASH')
+                                   text="", icon=_ic('TRASH'))
                 op.index = i
                 op.visual_index = j
-            sub.operator(DLIB_OT_add_visual.bl_idname, text="+ Add Visual Object",
-                         icon='ADD').index = i
+            sub.operator(DLIB_OT_add_visual.bl_idname,
+                         text="+ Add Visual Object",
+                         icon=_ic('ADD')).index = i
             sub.operator(DLIB_OT_insert_attachment.bl_idname,
-                         text="Insert vao scene", icon='IMPORT').index = i
-        box.operator(DLIB_OT_add_attachment.bl_idname,
-                     text="+ Add Attachment", icon='ADD')
+                         text="Insert vao scene",
+                         icon=_ic('IMPORT')).index = i
 
 
 # ---------------------------------------------------------------------------
@@ -912,11 +1007,18 @@ _classes = (
 )
 
 
+@bpy.app.handlers.persistent
 def _load_handler(dummy):
+    """library.json la source of truth -> nap lai buffer moi lan mo file.
+
+    Bat buoc dung decorator persistent: Blender xoa toan bo load_post khi mo
+    file moi, neu khong thi handler tu register() bi mat sau lan load dau tien
+    va thu vien khong bao gio duoc nap lai (dan den ghi de mat du lieu).
+    """
     try:
-        scene = bpy.context.scene
-        if scene is not None and "dental_lib" in scene.keys():
-            sync_scene(bpy.context)
+        if bpy.context.scene is None:
+            return
+        sync_scene(bpy.context)
     except Exception as exc:
         print(f"[Dental-Lib] Auto-load that bai: {exc}")
 
