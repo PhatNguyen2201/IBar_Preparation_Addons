@@ -4,16 +4,66 @@ Blender addon dành cho thiết kế khung xương hàm giả (iBar) trong nha k
 
 ## 📋 Yêu cầu hệ thống
 
-- **Blender**: 4.5.3 trở lên
-- **Hệ điều hành**: Windows (do sử dụng Windows API cho Hardware ID)
-- **Python**: Tích hợp trong Blender
+- **Blender**: 4.5.3 trở lên (đã kiểm chứng trên Blender 5.2 LTS)
+- **Hệ điều hành**: Windows, **Ubuntu/Linux** và macOS cho phần cài đặt; riêng Hardware ID của iBar vẫn dùng cơ chế Windows API và có dự phòng theo MAC/hostname trên Linux/macOS
+- **Python**: 3.8+ (để chạy script cài đặt; bản thân add-on dùng Python tích hợp trong Blender)
 
 ## 🚀 Cài đặt
 
-1. Tải file `Final_addon_Ibar_to_ORG.py` từ repository
-2. Mở Blender → Edit → Preferences → Add-ons
-3. Nhấn "Install..." và chọn file `.py`
-4. Tick checkbox để kích hoạt addon
+### Cách 1 — Script cài tự động (khuyên dùng)
+
+Script `install_addons.py` cài **4 add-on**: `Final_addon_Ibar_to_ORG.py`,
+`Gingiva_Teeth_Splitter.py`, `dental_lib.py`, `rmvb_bar.py`
+(thứ tự bật *Dental-Lib trước Rmvb-Bar* vì Rmvb-Bar import Dental-Lib).
+
+Script sẽ: dò mọi profile Blender đã từng chạy → copy file vào
+`scripts/addons` của bản được chọn → gọi `blender --background` để bật add-on
+và lưu preferences → in trạng thái từng module.
+
+| Hệ điều hành | Lệnh |
+|---|---|
+| Windows | double-click `install_addons.bat` hoặc `python install_addons.py` |
+| Ubuntu / Linux | `./install_addons.sh` (hoặc `python3 install_addons.py`) |
+| macOS | `python3 install_addons.py` |
+
+Tuỳ chọn (dùng được trên cả 3 hệ điều hành):
+
+```text
+--list                 liệt kê profile + đường dẫn blender tìm thấy
+--all                  cài cho mọi phiên bản, không hỏi
+--versions 5.2 5.1     chỉ cài các phiên bản liệt kê
+--no-enable            chỉ copy file, không tự bật add-on
+--skip-license         không sinh file ~/addon_ibar.key
+--no-pause             không chờ nhấn Enter (dùng cho .sh / CI)
+```
+
+Ví dụ trên Ubuntu:
+
+```bash
+cd IBar_Preparation_Addons
+./install_addons.sh --list          # xem máy đang có bản Blender nào
+./install_addons.sh --all           # cài cho tất cả
+./install_addons.sh --versions 5.2  # chỉ cài 5.2
+```
+
+Blender được dò từ `PATH`, `/snap/bin/blender` (bản snap), `/usr/bin/blender`,
+`/opt/blender*/blender`, Steam và `flatpak run org.blender.Blender`.
+Vị trí profile:
+
+| HĐH | Thư mục add-on |
+|---|---|
+| Windows | `%APPDATA%\Blender Foundation\Blender\<version>\scripts\addons` |
+| Ubuntu/Linux | `~/.config/blender/<version>/scripts/addons` |
+| macOS | `~/Library/Application Support/Blender/<version>/scripts/addons` |
+
+Nếu script không tự bật được add-on, mở Blender → Edit → Preferences → Add-ons
+→ tìm **Dental-Lib** / **Rmvb-Bar** rồi tick thủ công.
+
+### Cách 2 — Cài thủ công
+
+1. Mở Blender → Edit → Preferences → Add-ons
+2. Nhấn **Install...** và chọn từng file `.py` (bật `dental_lib.py` trước `rmvb_bar.py`)
+3. Tick checkbox để kích hoạt
 
 ## 📖 Chức năng chính
 
@@ -204,6 +254,7 @@ Dưới đây là lịch sử các thay đổi dựa trên Git commit history:
 
 | Commit | Ngày | Mô tả thay đổi |
 |---|---|---|
+| `pending` | 28/09/2026 | Thêm 2 add-on mới Dental-Lib + Rmvb-Bar (thiết kế bar implant) và script cài đặt đa nền tảng (Ubuntu/macOS) |
 | `pending` | 24/06/2026 | Add mesh size guard for Hybrid/iBar STL export over 30 MB |
 | `3328b14` | 03/06/2026 | Fix ViewLayer object activation safety - Sửa lỗi kích hoạt object trong ViewLayer |
 | `d0a2ede` | 02/06/2026 | Add empty 4Implants vertex group - Thêm vertex group rỗng cho 4 implants |
@@ -216,6 +267,58 @@ Dưới đây là lịch sử các thay đổi dựa trên Git commit history:
 | `35b8cd9` | 14/03/2026 | Fix bug Cut Retention |
 | `d7b1190` | 13/03/2026 | Improve updater với GitHub API discovery và branch fallback |
 | `0017646` | 13/03/2026 | Add Blender addon auto-update từ GitHub |
+
+## 🦷 Add-on mới: Dental-Lib & Rmvb-Bar (Bar Design)
+
+Hai add-on độc lập với iBar panel, phục vụ quy trình thiết kế khung bar implant.
+
+### `dental_lib.py` — Dental-Lib (thư viện dùng chung)
+
+Tab **Dental-Lib** trong Sidebar (N). Dữ liệu lưu bền trong
+`<thư mục thư viện>/library.json`, mesh được copy vào
+`connections/<Tên>/` và `attachments/<Tên>/` nên thư viện mang sang máy khác được.
+
+| Mục | Trường |
+|---|---|
+| **Implant Connection** | Library Name, Base (STL/PLY), Implant-Analog, Screw, Scanbody |
+| **Attachment** | Attachment Name, toggle *Add/Remove on Bar* + Apply Part Bar, toggle *Add/Remove on Sleeve* + Apply Part Sleeve, Visual Objects (không giới hạn số lượng, đặt tên từng object) |
+
+API cho add-on khác: `dental_lib.connection_names()`, `get_connection(name)`,
+`connection_asset(name, slot)`, `attachment_names()`, `get_attachment(name)`,
+`attachment_asset(name, slot)`, `attachment_visuals(name)`.
+
+### `rmvb_bar.py` — Rmvb-Bar
+
+Tab **Rmvb-Bar** trong Sidebar. Quy trình: Import → Connection → Bar Pillar →
+Bar Segment → Top Bar → Attachment → Sleeve → Save.
+
+| Nhóm | Nút | Hành vi |
+|---|---|---|
+| Import | Import Gingiva / Denture-reference / Antagonist | Đọc STL/PLY (chọn nhiều file), gộp về 1 object theo vai trò, tô màu riêng |
+| Connection | Select Connection Base (combobox) | Danh sách lấy từ Dental-Lib |
+| Connection | Place Connection (XML constructionInfo) | Chọn file `.constructionInfo`/`.xml`, đặt Base theo `MatrixImplantGeometry` của từng răng có `ImplantType != None` |
+| Bar Pillar | Create Bar Pillar | Detect 2 boundary loop của Base → extrude cả hai lên theo local Z (vùng 2 đúng `pillar_lift`, mặc định 7 li = 7 mm; vùng 1 về cùng cao độ) → **nối 2 miệng extrude thành solid kín** (manifold, không còn shell hở). Vertex group `Screw` = điểm extrude của lỗ ốc, `Outside` = điểm extrude của vùng 2 |
+| Bar Pillar | Edit / Select Screws / Select Outside / Exit | Edit Mode + Transform Orientation **Local**, chọn vertex theo vertex group |
+| Bar Segment | Draw Line Bar | Vẽ line snap trên bề mặt Gingiva (E/click thêm điểm, Backspace xoá, F nối vòng) |
+| Bar Segment | Create / Edit / Exit | Sweep tiết diện chữ nhật (rộng × cao) theo line — **đáy bar nằm đúng trên line** (kiểm chứng: sai số 0.0000 mm) |
+| Top Bar | Create Top Bar Plane | Mặt phẳng hiển thị + khối cắt (ẩn) parent theo mặt phẳng |
+| Top Bar | Cut Top Bar | 3 bước: (1) **Bar Segment − cột Connection** (mỗi Connection được extrude 2 vùng hở ra 2 hướng **ngược nhau** ~10 mm rồi nap 2 đầu → lăng trụ kin cắt xuyen hoan toan) → (2) **union Pillar + Segment** → (3) cắt bằng khối ẩn (DIFFERENCE). Sau đó union/difference các Attachment theo toggle. Khoảng chỗi chỉnh bằng *Chỗi Connection (mm)* |
+| Attachment | Select / Add | Apply Part Bar được đặt tại **3D Cursor** (vị trí + hướng), bấm Add nhiều lần để đặt nhiều cái |
+| Attachment | Group Axis Attachment | Gom các Attachment dưới một Empty trục chung |
+| Attachment | Group Axis với Top Bar | Attachment **xoay theo Plane** và **tâm luôn nằm trên Plane** (chỉ khoá translate dọc Z của Plane; X/Y tự do) |
+| Sleeve | Offset / Thickness / Apply attachment / Create | Vo = bar nới `offset` rồi đổ dày `thickness` |
+| Save | Save Bar Design / Save Sleeve Design | Xuất STL (`Rmvb_Bar_<yyMMdd-HHmm>.stl`) + **Visual Objects xuất kèm** (không tham gia boolean) + ghi `.constructionInfo` mới với `<Filename>` đổi sang tên STL (như add-on iBar) |
+
+Toggle **Add/Remove on Bar** và **Add/Remove on Sleeve** trong Dental-Lib được hiểu là
+**UNION (true) / DIFFERENCE (false)** khi gộp Attachment vào Bar hoặc Sleeve.
+
+Vận hành đã kiểm chứng (Blender 5.2 LTS, headless): import → place 6 implant từ
+`Ex/*.constructionInfo` → 6 Bar Pillar **solid kín** (boundary=0, non-manifold=0,
+80.91 mm³/cái) → Bar Segment (đáy đúng trên line, cao 3.00 mm) → Cut Top Bar
+(bar manifold ~1.77e3 mm³, **giao với cột Connection = 0.00 mm³**, bấm 2 lần
+cho cùng kết quả và không sinh object rác) → Attachment tại cursor + Visual
+Object, tâm bám Plane khi xoay/kéo → Sleeve manifold → xuất STL
++ `.constructionInfo` hợp lệ.
 
 ## 📄 License
 
