@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Bar Pillar / Bar Segment / Top Bar / Attachment / Sleeve",
@@ -201,6 +201,7 @@ def timestamp():
 # Mesh cache: doc STL/PLY thanh bpy.data.meshes (khong de lai object roi)
 # ---------------------------------------------------------------------------
 _MESH_CACHE = {}
+_DEFERRED_MESHES = []      # mesh boolean sinh ra, duoc don o cuoi operator
 
 
 def mesh_from_file(filepath, scale=1.0):
@@ -355,14 +356,17 @@ def cleanup_mesh(obj, dist=1e-6, dissolve=False):
     return obj
 
 
-def union_all(objs, name, coll):
+def union_all(objs, name, coll, solvers=None):
     """Union tuan tu cac solid thanh 1 the manifold (khong trung lap shell)."""
     objs = [o for o in objs if o is not None and o.name in bpy.data.objects]
     if not objs:
         return None
     base = objs[0]
     for other in objs[1:]:
-        boolean_objects(base, [other], 'UNION')
+        if solvers is None:
+            boolean_objects(base, [other], 'UNION')
+        else:
+            boolean_objects(base, [other], 'UNION', solvers=solvers)
         remove_object(other)
     if base.name != name:
         base.name = name
@@ -460,7 +464,7 @@ def apply_modifiers_in_place(obj):
     return obj
 
 
-def boolean_objects(target, operands, operation, solvers=('MANIFOLD', 'EXACT')):
+def boolean_objects(target, operands, operation, solvers=None):
     """target = target <operation> cac operand; thu lan luot cac solver.
 
     Solver MANIFOLD cho ket qua kin dao nhat; EXACT (va EXACT + use_self) duoc
@@ -469,9 +473,13 @@ def boolean_objects(target, operands, operation, solvers=('MANIFOLD', 'EXACT')):
     operands = [o for o in operands if o is not None]
     if not operands:
         return target
-    original = target.data.copy()
+    if solvers is None:
+        solvers = ('MANIFOLD', 'EXACT')
+    source = target.data
+    original = source.copy()
     original.name = target.name + ".src"
     best = None
+    candidates = []            # ban copy chua tung gan vao object -> don duoc
     for index, solver in enumerate(solvers):
         for flag in ((False, True) if solver == 'EXACT' else (False,)):
             target.data = original.copy()
@@ -492,6 +500,7 @@ def boolean_objects(target, operands, operation, solvers=('MANIFOLD', 'EXACT')):
             score = bnd * 1000 + nonmani
             if best is None or score < best[0]:
                 best = (score, target.data.copy(), solver, flag)
+                candidates.append(best[1])
             if bnd == 0:
                 break
         if best and best[0] == 0:
@@ -502,9 +511,68 @@ def boolean_objects(target, operands, operation, solvers=('MANIFOLD', 'EXACT')):
         target.data.name = old.name
         if old.users == 0:
             bpy.data.meshes.remove(old)
+        else:
+            _defer_mesh(old)
     if original.users == 0:
         bpy.data.meshes.remove(original)
+    else:
+        _defer_mesh(original)
+    for mesh in candidates:
+        try:
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+            else:
+                _defer_mesh(mesh)
+        except ReferenceError:
+            pass
+    _defer_mesh(source)
     return target
+
+
+def solvers_for(obj):
+    """Solver cho object co dau ruan de: tranh Manifold crash native."""
+    try:
+        if obj is not None and obj.get("rmvb_degenerate"):
+            return ('EXACT',)
+    except Exception:
+        pass
+    return None
+
+
+def _defer_mesh(mesh):
+    """Ghi nho mesh do boolean sinh ra de don o lan purge gan nhat."""
+    try:
+        if mesh is not None and mesh.name in bpy.data.meshes:
+            _DEFERRED_MESHES.append(mesh)
+            if len(_DEFERRED_MESHES) > 4096:
+                del _DEFERRED_MESHES[:2048]
+    except ReferenceError:
+        pass
+
+
+def purge_unused_meshes():
+    """Xoa mesh cua Rmvb-Bar khong con object nao dung (goi cuoi operator).
+
+    Chi cham vao danh sach mesh do chinh boolean sinh ra; bo qua mesh co
+    use_fake_user (thu vien STL trong _MESH_CACHE) va mesh con duoc dung.
+    """
+    context = bpy.context
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    left = []
+    for mesh in _DEFERRED_MESHES:
+        try:
+            if mesh.users > 0 or mesh.use_fake_user:
+                left.append(mesh)
+                continue
+            bpy.data.meshes.remove(mesh)
+        except ReferenceError:
+            pass
+        except Exception:
+            pass
+    _DEFERRED_MESHES[:] = left
 
 
 def join_objects(objs, name, coll):
@@ -1099,6 +1167,41 @@ def bridge_extruded_rims(bm, new_verts):
     return not [e for e in bm.edges if e.is_boundary]
 
 
+def _co_key(co, digits=3):
+    """Key toa do (lam tron 1e-3 mm) dung de dinh danh vert sau khi weld."""
+    return (round(co[0], digits), round(co[1], digits), round(co[2], digits))
+
+
+def _vert_snapshot(verts, digits=3):
+    """Key toa do cua mot nhom vert.
+
+    Dung key so voi giu handle BMVert: remove_doubles/bridge co the lam mat
+    wrapper (ReferenceError) va dao so lai index toan bo bmesh.
+    """
+    try:
+        return [_co_key(v.co, digits) for v in verts]
+    except (ValueError, ReferenceError):
+        return []
+
+
+def _verts_by_snapshot(bm, keys, digits=3):
+    """Index cac vert trong bm co toa do trung voi mot trong cac key da snapshot."""
+    wanted = set(keys)
+    if not wanted:
+        return []
+    bm.verts.ensure_lookup_table()
+    return [v.index for v in bm.verts if _co_key(v.co, digits) in wanted]
+
+
+def _same_xy_footprint(loop_a, loop_b, digits=3):
+    """Hai vong bien co cung mat cat bang (x, y) -> extrude ca hai se trung nhau."""
+    key_a = {_co_key(v.co, digits)[:2] for v in loop_a["verts"]}
+    key_b = {_co_key(v.co, digits)[:2] for v in loop_b["verts"]}
+    if not key_a or not key_b:
+        return False
+    return len(key_a & key_b) >= 0.8 * min(len(key_a), len(key_b))
+
+
 def build_pillar_mesh(base_obj, lift, equalize):
     """Tao mesh Bar Pillar tu mesh Connection Base - KIN (solid manifold).
 
@@ -1124,19 +1227,32 @@ def build_pillar_mesh(base_obj, lift, equalize):
         info["skipped"].append(round(extra["z"], 3))
 
     top_z = lower["z"] + lift
+    same_ring = upper is not None and _same_xy_footprint(lower, upper)
+    if same_ring:
+        # Hai vung ho nam tren cung mot truc va trung mat cat XY: extrude ca hai
+        # se tao hai thanh vo trung khit nhau -> "pinched verts" gay crash natve
+        # cua solver Manifold tren Blender 4.5. Chi extrude mot mieng.
+        top_z = max(top_z, upper["z"] + lift)
+        info["degenerate"] = True
     new_out, _faces_out, rim_out = extrude_loop_to(bm, lower, top_z)
     info["outside_top"] = top_z
     screw_verts = []
     new_all = list(new_out)
-    if upper is not None:
+    if upper is not None and not same_ring:
         target = top_z if equalize else upper["z"] + lift
         new_sc, _faces_sc, rim_sc = extrude_loop_to(bm, upper, target)
         screw_verts = new_sc + rim_sc
         new_all += new_sc
         info["screw_top"] = target
+    elif same_ring:
+        info["screw_top"] = top_z
+        screw_verts = list(new_out)
     else:
         info["screw_top"] = None
 
+    pillar_verts = new_out + rim_out
+    pillar_snap = _vert_snapshot(pillar_verts)
+    screw_snap = _vert_snapshot(screw_verts)
     info["closed"] = bridge_extruded_rims(bm, new_all)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-7)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
@@ -1149,15 +1265,12 @@ def build_pillar_mesh(base_obj, lift, equalize):
     except Exception:
         pass
     info["closed"] = info["closed"] and not any(e.is_boundary for e in bm.edges)
-    pillar_verts = new_out + rim_out
-    screw_index = [v.index for v in screw_verts]
-    try:
-        pillar_index = [v.index for v in pillar_verts]
-    except ValueError:                       # vert bi gop khi remove_doubles
-        bm.verts.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+    pillar_index = _verts_by_snapshot(bm, pillar_snap)
+    screw_index = _verts_by_snapshot(bm, screw_snap)
+    if not pillar_index and not screw_index:   # bo de cu theo chieu cao
         pillar_index = [v.index for v in bm.verts
                         if v.co.z > top_z - 1e-6 or abs(v.co.z - lower["z"]) < 1e-6]
-        screw_index = []
     bm.to_mesh(mesh)
     bm.free()
 
@@ -1209,6 +1322,8 @@ class RMVB_OT_create_bar_pillar(Operator):
             set_color(obj, (0.85, 0.65, 0.25, 1.0))
             obj["rmvb_role"] = "PILLAR"
             obj["rmvb_tooth"] = item.tooth
+            if info.get("degenerate"):
+                obj["rmvb_degenerate"] = True
             ref = props.pillars.add()
             ref.object = obj
             ref.tooth = item.tooth
@@ -1216,6 +1331,9 @@ class RMVB_OT_create_bar_pillar(Operator):
             if not info.get("closed"):
                 all_closed = False
                 notes.append("rang %s pillar khong kin" % item.tooth)
+            if info.get("degenerate"):
+                notes.append("rang %s 2 vung ho trung nhau (chi extrude 1 mieng)"
+                             % item.tooth)
             if info.get("loops", 0) != 2:
                 notes.append("rang %s co %d vung ho" % (item.tooth, info["loops"]))
         if not made:
@@ -1766,6 +1884,7 @@ class RMVB_OT_create_bar_segment(Operator):
         obj["rmvb_role"] = "SEGMENT"
         props.bar_segment = obj
         activate(context, obj)
+        purge_unused_meshes()
         self.report({'INFO'}, "Da tao Bar Segment (%d miet tiet dien %g x %g mm)"
                     % (len(points), props.bar_width, props.bar_height))
         return {'FINISHED'}
@@ -2084,13 +2203,24 @@ class RMVB_OT_cut_top_bar(Operator):
                         temp, False)
                     note = " (khoi Connection giu normal goc)"
             # Buoc 2: union toan bo Bar Pillar + Segment da cat
+            solvers = None
             for pillar in pillars:
-                work.append(world_copy(pillar, pillar.name + ".union", temp))
+                copy = world_copy(pillar, pillar.name + ".union", temp)
+                copy["rmvb_degenerate"] = bool(pillar.get("rmvb_degenerate"))
+                if copy["rmvb_degenerate"]:
+                    # Pillar co thanh vo trung khit: Manifold crash native
+                    # (SplitPinchedVerts) tren Blender 4.5 -> dung EXACT
+                    solvers = ('EXACT',)
+                work.append(copy)
             if segment_cut is not None:
                 work.append(segment_cut)
             if not work:
                 raise RuntimeError("Khong co thanh phan de union")
-            bar = union_all(work, OBJ_BAR, coll)
+            bar = union_all(work, OBJ_BAR, coll, solvers=solvers)
+            if bar is None:
+                raise RuntimeError("Khong hop nhat duoc Bar tu cac thanh phan")
+            if solvers:
+                bar["rmvb_degenerate"] = True
             purge_collection(temp)
 
             # Buoc 3: cat theo khoi an gan voi Top Bar Plane
@@ -2100,7 +2230,7 @@ class RMVB_OT_cut_top_bar(Operator):
                 if was_hidden:
                     cutter.hide_set(False)
                 context.view_layer.update()
-                boolean_objects(bar, [cutter], props.cut_mode)
+                boolean_objects(bar, [cutter], props.cut_mode, solvers=solvers)
                 if was_hidden:
                     cutter.hide_set(True)
 
@@ -2112,7 +2242,8 @@ class RMVB_OT_cut_top_bar(Operator):
                         continue
                     copy = world_copy(ref.object, ref.object.name + ".bar", temp)
                     boolean_objects(bar, [copy],
-                                    'UNION' if ref.on_bar else 'DIFFERENCE')
+                                    'UNION' if ref.on_bar else 'DIFFERENCE',
+                                    solvers=solvers)
                     remove_object(copy)
         except Exception as exc:
             purge_collection(temp)
@@ -2128,6 +2259,7 @@ class RMVB_OT_cut_top_bar(Operator):
         bar["rmvb_role"] = "BAR"
         set_color(bar, (0.85, 0.55, 0.15, 1.0))
         activate(context, bar)
+        purge_unused_meshes()
         message = "Da Cut Top Bar (%s)%s" % (props.cut_mode, note)
         self.report({'INFO'}, message)
         return {'FINISHED'}
@@ -2368,7 +2500,7 @@ def dilate_solid(source, distance, name, coll):
     if distance > 1e-6:
         shell = world_copy(source, name + ".shell", coll)
         _solidify(shell, distance * 2.0, 0.0)
-        boolean_objects(base, [shell], 'UNION')
+        boolean_objects(base, [shell], 'UNION', solvers=solvers_for(source))
         remove_object(shell)
     return base
 
@@ -2389,8 +2521,18 @@ def bar_source(context):
     if not objs:
         return None
     coll = ensure_collection(COL_SEGMENT)
-    copies = [world_copy(o, o.name + ".src", coll) for o in objs]
-    return join_objects(copies, OBJ_BAR + ".src", coll)
+    copies = []
+    deg = False
+    for o in objs:
+        copy = world_copy(o, o.name + ".src", coll)
+        if o.get("rmvb_degenerate"):
+            copy["rmvb_degenerate"] = True
+            deg = True
+        copies.append(copy)
+    joined = join_objects(copies, OBJ_BAR + ".src", coll)
+    if joined is not None and deg:
+        joined["rmvb_degenerate"] = True
+    return joined
 
 
 class RMVB_OT_create_sleeve_design(Operator):
@@ -2418,6 +2560,8 @@ class RMVB_OT_create_sleeve_design(Operator):
             sleeve = sleeve_shell(source, inner_gap, wall, "Sleeve", work)
             sleeve.name = OBJ_SLEEVE
             sleeve.data.name = OBJ_SLEEVE
+            if source is not None and source.get("rmvb_degenerate"):
+                sleeve["rmvb_degenerate"] = True
             for user in list(sleeve.users_collection):
                 if user != coll:
                     user.objects.unlink(sleeve)
@@ -2431,7 +2575,8 @@ class RMVB_OT_create_sleeve_design(Operator):
                         continue
                     copy = world_copy(ref.object, ref.object.name + ".sleeve", work)
                     boolean_objects(sleeve, [copy],
-                                    'UNION' if ref.on_sleeve else 'DIFFERENCE')
+                                    'UNION' if ref.on_sleeve else 'DIFFERENCE',
+                                    solvers=solvers_for(sleeve))
                     remove_object(copy)
         except Exception as exc:
             purge_collection(work)
@@ -2448,6 +2593,7 @@ class RMVB_OT_create_sleeve_design(Operator):
         sleeve["rmvb_role"] = "SLEEVE"
         props.sleeve_object = sleeve
         activate(context, sleeve)
+        purge_unused_meshes()
         self.report({'INFO'}, "Da tao Sleeve (offset %g mm, day %g mm)"
                     % (inner_gap, wall))
         return {'FINISHED'}

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -33,6 +33,7 @@ import os
 import json
 import re
 import shutil
+import hashlib
 
 from bpy.props import (
     StringProperty,
@@ -143,13 +144,45 @@ def slugify(text):
     return text or "entry"
 
 
+def _file_digest(path):
+    """SHA1 cua noi dung file (rong neu khong doc duoc)."""
+    try:
+        digest = hashlib.sha1()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _asset_rel(kind, name, slot, ext, source):
+    """Duong dan relative trong lib.
+
+    Slug sinh tu ten entry; neu trung slug voi asset khac (khac noi dung) thi
+    them hau to so de tranh ghi de. Cung noi dung -> tai dung (dedup).
+    """
+    base = slugify(name)
+    for index in range(1, 1000):
+        slug = base if index == 1 else "%s_%d" % (base, index)
+        rel = "/".join((kind, slug, slot + ext))
+        dest = os.path.join(library_dir(), *rel.split("/"))
+        if not os.path.exists(dest):
+            return rel
+        src_sum, dst_sum = _file_digest(source), _file_digest(dest)
+        if src_sum and dst_sum and src_sum == dst_sum:
+            return rel
+    digest = hashlib.sha1(os.path.abspath(source).encode("utf-8")).hexdigest()[:6]
+    return "/".join((kind, "%s_%s" % (base, digest), slot + ext))
+
+
 def store_asset(source, kind, name, slot):
     """Copy file mesh vao thu vien, tra ve duong dan tuong doi (relative)."""
     ensure_library_dir()
     ext = os.path.splitext(source)[1].lower()
     if ext not in MESH_EXTS:
         ext = ".stl"
-    rel = "/".join((kind, slugify(name), slot + ext))
+    rel = _asset_rel(kind, name, slot, ext, source)
     dest = os.path.join(library_dir(), *rel.split("/"))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copy2(source, dest)
@@ -406,6 +439,15 @@ class DLIB_OT_open_folder(Operator):
 # ---------------------------------------------------------------------------
 # Operator: them / xoa entry
 # ---------------------------------------------------------------------------
+def _unique_entry_name(entries, prefix):
+    """Ten 'Prefix N' dau tien chua ton tai (len() khong con dung sau khi xoa)."""
+    used = {entry.entry_name for entry in entries}
+    index = 1
+    while ("%s %d" % (prefix, index)) in used:
+        index += 1
+    return "%s %d" % (prefix, index)
+
+
 class DLIB_OT_add_connection(Operator):
     """Them mot Implant Connection moi vao thu vien"""
     bl_idname = "dental_lib.add_connection"
@@ -415,7 +457,7 @@ class DLIB_OT_add_connection(Operator):
     def execute(self, context):
         group = _lib_group(context)
         entry = group.connections.add()
-        entry.entry_name = "Connection %d" % (len(group.connections))
+        entry.entry_name = _unique_entry_name(group.connections, "Connection")
         _save_all(context)
         return {'FINISHED'}
 
@@ -447,7 +489,7 @@ class DLIB_OT_add_attachment(Operator):
     def execute(self, context):
         group = _lib_group(context)
         entry = group.attachments.add()
-        entry.entry_name = "Attachment %d" % (len(group.attachments))
+        entry.entry_name = _unique_entry_name(group.attachments, "Attachment")
         _save_all(context)
         return {'FINISHED'}
 
