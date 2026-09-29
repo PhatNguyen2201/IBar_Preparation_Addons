@@ -111,6 +111,13 @@ Nếu script không tự bật được add-on, mở Blender → Edit → Prefer
 - Áp dụng skin và subdivision surface để tạo ống 3D
 - Tự động căn chỉnh theo vị trí và hướng implant
 
+**Lỗ ốc nghiêng (Screw Angle):**
+- exocad không ghi góc nghiêng vào constructionInfo (`AxisScrew` trùng `AxisImplant`). Vì vậy add-on đo hướng lỗ ốc trực tiếp trên STL thiết kế đang có trong scene.
+- Cách đo: cắt lưới liên tiếp phía trên `ScrewChannelStart`, bám theo tâm lỗ tới miệng lỗ, rồi fit trục.
+- Lỗ nghiêng trên 2°: bẻ tube tại điểm bắt đầu kênh nghiêng, đầu **Start** đi theo hướng lỗ. Phần trên được phóng to để bao trọn tiết diện lỗ, kể cả lỗ oval, với khe hở 0.3 mm.
+- Giữ nguyên cạnh End→Middle và bán kính End/Middle, để Cone và Selector của iBar không đổi. Chỉ thêm 1 đỉnh giữa Middle và Start.
+- Không tìm thấy STL có lỗ ốc: tube giữ thẳng như cũ và có cảnh báo. Nếu constructionInfo có ghi `AxisScrew` nghiêng thì dùng hướng đó.
+
 ### 4. Object Control (Điều khiển đối tượng)
 
 | Nhóm | Nút Set | Nút Show | Nút Hide |
@@ -254,6 +261,7 @@ Dưới đây là lịch sử các thay đổi dựa trên Git commit history:
 
 | Commit | Ngày | Mô tả thay đổi |
 |---|---|---|
+| `pending` | 29/09/2026 | Create Tubes: tube đi theo lỗ ốc nghiêng đo từ STL, phóng to đầu top bao trọn lỗ ốc (v2.9.1) |
 | `pending` | 28/09/2026 | Thêm 2 add-on mới Dental-Lib + Rmvb-Bar (thiết kế bar implant) và script cài đặt đa nền tảng (Ubuntu/macOS) |
 | `pending` | 24/06/2026 | Add mesh size guard for Hybrid/iBar STL export over 30 MB |
 | `3328b14` | 03/06/2026 | Fix ViewLayer object activation safety - Sửa lỗi kích hoạt object trong ViewLayer |

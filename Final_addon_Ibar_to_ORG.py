@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Custom Ibar Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 8, 0),
+    "version": (2, 9, 1),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -23,6 +23,7 @@ import threading
 import urllib.error
 import urllib.request
 import mathutils
+import numpy as np
 from bpy.props import StringProperty, CollectionProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper
@@ -45,6 +46,14 @@ STL_EXPORT_PASSWORD = "password123"
 STL_GUARD_BASE_NAMES = ("Hybrid_Shell", "Hybrid", "iBar", "Closed_Bar", "Opaque_Layer")
 STL_GUARD_TIME_PREFIX_RE = re.compile(r"^\d{6}-\d{4}_")
 STL_GUARD_DUP_SUFFIX_RE = re.compile(r"\.\d{3}$")
+
+# Tubes: skin radius mac dinh 0.25 x 7.1 (Middle/Start), End them x 2.5
+TUBE_SKIN_RADIUS = 1.775
+TUBE_SUBSURF_SHRINK = 0.917       # Skin + Subsurf lam ong co lai ~0.917 x skin radius
+TUBE_CHANNEL_CLEARANCE = 0.3      # khe ho (mm) giua ong va thanh lo oc nghieng
+TUBE_BEND_OFFSET = 0.5            # dinh phu tren Middle (mm) de phong to ngay tu cho be
+TUBE_TOP_LENGTH = 20.5            # Middle -> Start (25 - 4.5)
+TUBE_MIN_ANGLE_DEG = 2.0          # nho hon goc nay coi la lo oc thang
 
 
 def _version_to_str(version_tuple):
@@ -414,6 +423,284 @@ def _export_stl_with_mesh_guard(obj, filepath, viewlayer, reporter=None):
     finally:
         if obj is not None and _is_in_view_layer(obj, viewlayer):
             _select_object(obj, False, viewlayer)
+
+
+def _xml_vec3(parent, tag):
+    node = parent.find(tag)
+    if node is None:
+        return None
+    try:
+        return Vector((float(node.findtext("x")), float(node.findtext("y")), float(node.findtext("z"))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _xml_float(parent, tag):
+    try:
+        return float(parent.findtext(tag))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mesh_world_arrays(obj):
+    """Dinh (toa do world) va tam giac cua mesh duoi dang numpy."""
+    mesh = obj.data
+    mesh.calc_loop_triangles()
+    co = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", co)
+    tris = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", tris)
+    mw = np.array(obj.matrix_world, dtype=np.float64)
+    verts = co.reshape(-1, 3).astype(np.float64) @ mw[:3, :3].T + mw[:3, 3]
+    return verts, tris.reshape(-1, 3).astype(np.int64)
+
+
+def _section_loop_near(verts, tris, origin, normal, center):
+    """Cat luoi bang mat phang (origin, normal), tra ve vong cat KIN di qua diem cat gan center nhat.
+
+    Tra ve None neu vong do ho (vd. lat cat da toi mieng lo)."""
+    s = (verts - origin) @ normal
+    s[np.abs(s) < 1e-7] = 1e-7
+    fs = s[tris]
+    crossing = (fs.min(axis=1) < 0.0) & (fs.max(axis=1) > 0.0)
+    if not crossing.any():
+        return None
+    ct = tris[crossing]
+    cs = fs[crossing]
+    # Moi tam giac cat qua mat phang co dung 2 canh doi dau; khoa canh = cap index dinh
+    keys = np.empty((len(ct), 3), dtype=np.int64)
+    pts = np.empty((len(ct), 3, 3))
+    mask = np.empty((len(ct), 3), dtype=bool)
+    for e, (a, b) in enumerate(((0, 1), (1, 2), (2, 0))):
+        va, vb = ct[:, a], ct[:, b]
+        sa, sb = cs[:, a], cs[:, b]
+        mask[:, e] = (sa * sb) < 0.0
+        keys[:, e] = np.minimum(va, vb) * len(verts) + np.maximum(va, vb)
+        u = sa / np.where(mask[:, e], sa - sb, 1.0)
+        pts[:, e] = verts[va] + (verts[vb] - verts[va]) * u[:, None]
+    seg_keys = keys[mask].reshape(-1, 2)
+    seg_pts = pts[mask].reshape(-1, 3)
+
+    node_keys, inverse = np.unique(seg_keys.ravel(), return_inverse=True)
+    segs = inverse.reshape(-1, 2)
+    node_pts = np.empty((len(node_keys), 3))
+    node_pts[inverse] = seg_pts
+
+    # Moi diem cat noi voi dung 2 diem khac thi nam tren vong kin
+    src = np.concatenate((segs[:, 0], segs[:, 1]))
+    dst = np.concatenate((segs[:, 1], segs[:, 0]))
+    order = np.argsort(src, kind='stable')
+    src, dst = src[order], dst[order]
+    count = np.bincount(src, minlength=len(node_keys))
+    first = np.concatenate(([0], np.cumsum(count)[:-1]))
+    nbr = np.full((len(node_keys), 2), -1, dtype=np.int64)
+    ok = count == 2
+    nbr[ok, 0] = dst[first[ok]]
+    nbr[ok, 1] = dst[first[ok] + 1]
+
+    start = int(np.argmin(np.linalg.norm(node_pts - center, axis=1)))
+    loop = [start]
+    prev, cur = -1, start
+    while True:
+        a, b = nbr[cur]
+        nxt = a if a != prev else b
+        if nxt < 0:
+            return None
+        if nxt == start:
+            break
+        loop.append(nxt)
+        if len(loop) > len(node_keys):
+            return None
+        prev, cur = cur, nxt
+    return node_pts[loop]
+
+
+def _loop_center(loop):
+    """Tam vong cat, lay trong so theo do dai canh (khong lech khi luoi chia khong deu)."""
+    nxt = np.roll(loop, -1, axis=0)
+    seg_len = np.linalg.norm(nxt - loop, axis=1)
+    total = seg_len.sum()
+    if total <= 0.0:
+        return loop.mean(axis=0)
+    return ((loop + nxt) * 0.5).T @ seg_len / total
+
+
+def _trace_screw_channel(verts, tris, base, direction, t_start, step=0.3, t_max=18.0):
+    """Cat lien tiep vuong goc voi direction, bam theo tam lo oc cho toi mieng lo."""
+    centers, loops = [], []
+    predicted = base + direction * t_start
+    t = t_start
+    while t < t_max:
+        origin = base + direction * t
+        predicted = predicted + direction * ((origin - predicted) @ direction)
+        loop = _section_loop_near(verts, tris, origin, direction, predicted)
+        if loop is None:
+            break
+        center = _loop_center(loop)
+        if np.linalg.norm(center - predicted) > 1.0 or np.linalg.norm(loop - center, axis=1).max() > 3.5:
+            break
+        centers.append(center)
+        loops.append(loop)
+        predicted = center
+        t += step
+    return centers, loops
+
+
+def _detect_screw_channel(verts, tris, hs, screw_r):
+    """Do truc lo oc tren STL trong he LOCAL cua tube (truc implant = +Z, hs = z cua ScrewChannelStart).
+
+    Doan duoi hs la khoang dau oc (thang theo implant); phia tren co the nghieng (angulated screw channel).
+    Tra ve None neu mesh khong co lo oc cua implant nay, nguoc lai dict:
+    angle (do), direction (huong kenh), z_m (cao do diem be tren truc Z), r_req (ban kinh lon nhat cua kenh
+    tinh tu truc ong, bao ca tiet dien oval), slices (so lat cat hop le)."""
+    z_axis = np.array((0.0, 0.0, 1.0))
+    near = (np.hypot(verts[:, 0], verts[:, 1]) < 8.0) & (verts[:, 2] > hs - 1.0) & (verts[:, 2] < hs + 20.0)
+    tris = tris[near[tris].any(axis=1)]
+    if len(tris) == 0:
+        return None
+    used, inverse = np.unique(tris, return_inverse=True)
+    verts = verts[used]
+    tris = inverse.reshape(-1, 3)
+
+    # Chu ky: ngay tren ScrewChannelStart phai co vong lo oc bao quanh truc implant
+    probe = np.array((0.0, 0.0, hs + 0.3))
+    loop = _section_loop_near(verts, tris, probe, z_axis, probe)
+    if loop is None:
+        return None
+    center = _loop_center(loop)
+    mean_r = np.linalg.norm(loop - center, axis=1).mean()
+    if np.hypot(center[0], center[1]) > 0.6 or not (0.6 * screw_r <= mean_r <= 1.8 * screw_r):
+        return None
+
+    straight = {"angle": 0.0, "direction": z_axis, "z_m": hs, "r_req": screw_r, "slices": 0}
+    direction = z_axis
+    base = np.array((0.0, 0.0, hs))
+    centers, loops = _trace_screw_channel(verts, tris, base, direction, 0.3)
+    straight["slices"] = len(centers)
+    if len(centers) < 6:
+        # Kenh qua ngan de fit huong tin cay -> coi la thang
+        return straight
+
+    for _ in range(4):
+        pts = np.asarray(centers)
+        c0 = pts.mean(axis=0)
+        new_dir = np.linalg.svd(pts - c0)[2][0]
+        if new_dir @ z_axis < 0.0:
+            new_dir = -new_dir
+        # Diem tren duong fit gan truc Z nhat -> cao do diem be (Middle)
+        b = new_dir[2]
+        den = 1.0 - b * b
+        z_pivot = c0[2] + (b * c0[2] - c0 @ new_dir) / den * b if den > 1e-6 else hs
+        z_m = min(max(z_pivot, hs), hs + 1.5)
+        change = math.degrees(math.acos(min(1.0, float(new_dir @ direction))))
+        direction = new_dir
+        base = np.array((0.0, 0.0, z_m))
+        refined = _trace_screw_channel(verts, tris, base, direction, TUBE_BEND_OFFSET)
+        if len(refined[0]) >= 3:
+            centers, loops = refined
+        if change < 0.1:
+            break
+
+    angle = math.degrees(math.acos(min(1.0, float(direction @ z_axis))))
+    if angle < TUBE_MIN_ANGLE_DEG:
+        straight["slices"] = len(centers)
+        return straight
+    rel = np.vstack(loops) - base
+    r_req = np.linalg.norm(rel - np.outer(rel @ direction, direction), axis=1).max()
+    return {"angle": angle, "direction": direction, "z_m": z_m, "r_req": float(r_req), "slices": len(centers)}
+
+
+def _screw_channel_candidates(scene):
+    """Cac mesh co the la STL thiet ke chua lo oc (bo qua Tubes/Cone cua iBar)."""
+    candidates = []
+    for obj in scene.objects:
+        if obj.type != 'MESH' or 'Tubes' in obj.name or obj.name.startswith("Cone"):
+            continue
+        if obj.vertex_groups.get("4Implants") or len(obj.data.polygons) == 0:
+            continue
+        verts, tris = _mesh_world_arrays(obj)
+        candidates.append((verts, tris, verts.min(axis=0), verts.max(axis=0)))
+    return candidates
+
+
+def _screw_channel_for_tube(tube, hs, screw_r, candidates):
+    to_local = np.array(tube.matrix_world.inverted(), dtype=np.float64)
+    probe_world = np.array(tube.matrix_world @ Vector((0.0, 0.0, hs)))
+    best = None
+    for verts, tris, bb_min, bb_max in candidates:
+        if np.any(probe_world < bb_min - 5.0) or np.any(probe_world > bb_max + 5.0):
+            continue
+        found = _detect_screw_channel(verts @ to_local[:3, :3].T + to_local[:3, 3], tris, hs, screw_r)
+        if found is not None and (best is None or found["slices"] > best["slices"]):
+            best = found
+    return best
+
+
+def _bend_tube_mesh(tube, z_middle, direction):
+    """Be polyline End-Middle-Start thanh End -> Middle -> Bend -> Start, phan tren theo huong lo oc.
+
+    Sua tai cho bang bmesh (ten vertex group nam tren mesh, thay mesh moi se mat group 4Implants).
+    Giu canh End-Middle noi truc tiep va vi tri End: Cone cua iBar = End + dinh ke cua no."""
+    mesh = tube.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    middle, start = bm.verts[1], bm.verts[2]  # thu tu diem luc tao tube: End, Middle, Start
+    middle.co = Vector((0.0, 0.0, z_middle))
+    start.co = middle.co + direction * TUBE_TOP_LENGTH
+    edge = next(e for e in middle.link_edges if start in e.verts)
+    bend = bmesh.utils.edge_split(edge, middle, TUBE_BEND_OFFSET / TUBE_TOP_LENGTH)[1]
+    bend.co = middle.co + direction * TUBE_BEND_OFFSET
+    deform = bm.verts.layers.deform.active
+    if deform is not None:
+        bend[deform].clear()  # dinh be khong thuoc Middle/Start
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+def _bend_tubes_to_screw_channels(screw_tubes, scene):
+    """Be dau Start cua tube theo lo oc nghieng do tren STL trong scene.
+
+    Tra ve (danh sach rang nghieng de report, danh sach rang khong tim thay lo oc tren STL)."""
+    angled, not_found = [], []
+    if not screw_tubes:
+        return angled, not_found
+    candidates = _screw_channel_candidates(scene)
+    z_axis = Vector((0.0, 0.0, 1.0))
+    for info in screw_tubes:
+        tube = info["tube"]
+        channel = _screw_channel_for_tube(tube, info["hs"], info["screw_r"], candidates)
+        if channel is None:
+            # Khong co STL: dung AxisScrew neu constructionInfo co ghi goc nghieng
+            axis_screw = info["axis_screw"]
+            if axis_screw is None or math.degrees(axis_screw.angle(z_axis)) < TUBE_MIN_ANGLE_DEG:
+                not_found.append(str(info["number"]))
+                continue
+            channel = {
+                "angle": math.degrees(axis_screw.angle(z_axis)),
+                "direction": axis_screw,
+                "z_m": info["hs"],
+                "r_req": info["screw_r"],
+            }
+        if channel["angle"] < TUBE_MIN_ANGLE_DEG:
+            continue
+        direction = Vector(tuple(float(c) for c in channel["direction"])).normalized()
+        top_radius = max(TUBE_SKIN_RADIUS, (channel["r_req"] + TUBE_CHANNEL_CLEARANCE) / TUBE_SUBSURF_SHRINK)
+        _bend_tube_mesh(tube, channel["z_m"], direction)
+        tube["ibar_top_radius"] = top_radius
+        tube["ibar_screw_angle"] = channel["angle"]
+        angled.append(f"{info['number']} ({channel['angle']:.1f}°, r {top_radius:.2f})")
+    return angled, not_found
+
+
+def _apply_tube_top_radius(tube, radius):
+    """Phong to skin radius cac dinh phia tren Middle; End/Middle giu nguyen cho Cone/Selector cua iBar."""
+    fixed = {tube.vertex_groups[name].index for name in ("End", "Middle") if name in tube.vertex_groups}
+    skin = tube.data.skin_vertices[0].data
+    for vert in tube.data.vertices:
+        if not any(g.group in fixed for g in vert.groups):
+            skin[vert.index].radius = (radius, radius)
 
 
 class IBAR_OT_CheckAddonUpdate(bpy.types.Operator):
@@ -1191,6 +1478,9 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
                             "MatrixImplantGeometry": MatrixForUse,
                             "RotateX": rotateXaxis,
                             "RotateY": rotateYaxis,
+                            "ScrewChannelStart": _xml_vec3(tooth, "ScrewChannelStart"),
+                            "AxisScrew": _xml_vec3(tooth, "AxisScrew"),
+                            "ScrewDiameter": _xml_float(tooth, "ScrewDiameter"),
                         })
                 return valid_implants
         
@@ -1300,6 +1590,7 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
            self.report({'ERROR'},"Vui lòng lưu project vào thư mục chứa stl đã chuẩn bị. Có thể sử dụng tổ hợp phím Ctrl-Shift-S sau đó chọn vị trí lưu")
         dir_list = os.listdir(path)
         fullFileName = ''
+        screw_tubes = []  # tube co du lieu lo oc (constructionInfo) -> do lo nghieng tren STL sau khi transform
         for item in dir_list:
             if item.endswith('.constructionInfo'):
                 fullFileName = path + "//" + item
@@ -1377,6 +1668,20 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
                 object.matrix_world = tubesMatrix
                 object.rotation_euler.x -= valid_implants[i]["RotateX"]
                 object.rotation_euler.y -= valid_implants[i]["RotateY"]
+
+                # Luu vi tri lo oc trong he local cua tube (he nay khong doi khi transform sang thiet ke hien tai)
+                channel_start = valid_implants[i].get("ScrewChannelStart")
+                if channel_start is not None:
+                    context.view_layer.update()
+                    to_local = object.matrix_world.inverted()
+                    axis_screw = valid_implants[i].get("AxisScrew")
+                    screw_tubes.append({
+                        "tube": object,
+                        "number": valid_implants[i]["Number"],
+                        "hs": (to_local @ channel_start).z,
+                        "screw_r": (valid_implants[i].get("ScrewDiameter") or 2.7) / 2.0,
+                        "axis_screw": (to_local.to_3x3() @ axis_screw).normalized() if axis_screw is not None else None,
+                    })
             break
             
         if (fullFileName == ''):
@@ -1437,7 +1742,11 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
                 _select_object(ob, True, viewlayer)
         bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
         bpy.data.objects.remove(objectArrows)
-        
+
+        # Lo oc nghieng: be dau Start theo huong lo tren STL va phong to de bao tron lo oc
+        viewlayer.update()
+        angled_teeth, missing_teeth = _bend_tubes_to_screw_channels(screw_tubes, scene)
+
         bpy.ops.object.select_all(action='DESELECT')
         for ob in obs:
             if ob.name.find('Tubes') > -1 and _set_active_object(ob, viewlayer):
@@ -1463,10 +1772,17 @@ class buttonOperator_CreateTubes(bpy.types.Operator):
                 bpy.ops.object.mode_set(mode='EDIT')
                 bpy.ops.transform.skin_resize(value=(2.5, 2.5, 2.5), orient_type='LOCAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='LOCAL', mirror=True, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'FACE'}, use_snap_project=False, snap_target='CENTER', use_snap_self=False, use_snap_edit=False, use_snap_nonedit=False, use_snap_selectable=False)
                 bpy.ops.object.mode_set(mode='OBJECT')
+                top_radius = ob.get("ibar_top_radius")
+                if top_radius:
+                    _apply_tube_top_radius(ob, top_radius)
                 _select_object(ob, False, viewlayer)
         for ob in obs:
             if ob.name.find('Tubes') > -1:
                 _select_object(ob, True, viewlayer)
+        if angled_teeth:
+            self.report({'INFO'}, "Tubes theo lỗ ốc nghiêng: " + ", ".join(angled_teeth))
+        if missing_teeth:
+            self.report({'WARNING'}, "Không tìm thấy lỗ ốc trên STL cho răng " + ", ".join(missing_teeth) + " - tube giữ thẳng theo implant")
         return {'FINISHED'}
 class buttonOperator_SetAntagonist(bpy.types.Operator):
     """Set selected as Antagonist"""
