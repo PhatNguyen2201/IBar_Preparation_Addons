@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -16,9 +16,16 @@ Quan ly thu vien dung chung cho cac add-on nha khoa:
 
 1. Implant Connection (Connection Base): Library Name, Base, Implant-Analog,
    Screw, Scanbody (moi slot 1 file STL/PLY).
-2. Attachment: Attachment Name, toggle Add/Remove on Bar + Apply Part Bar,
-   toggle Add/Remove on Sleeve + Apply Part Sleeve, Visual Object (khong gioi
-   han so luong, dat ten tung object).
+2. Attachment: Attachment Name, Apply Part Bar (hang tren) + toggle
+   Add/Remove on Bar cung hang voi nut 'Gan file', tuong tu cho Apply Part
+   Sleeve, Visual Object (khong gioi han so luong, dat ten va CHON MAU tung
+   object).
+   Mac dinh khi dat vao scene:
+     - Apply Part Bar   : do, alpha 0.5
+     - Apply Part Sleeve: hong, alpha 0.5
+     - Visual Object    : mau chon trong panel (mac dinh xam nhat)
+   Color cua Part Bar/Sleeve duoc luu trong library.json (khong hien o chon
+   mau tren panel), color cua Visual Object luu theo tung object.
 
 Du luu ben vung trong <lib_dir>/library.json; asset duoc copy vao
 <lib_dir>/connections/<Name>/ va <lib_dir>/attachments/<Name>/ de thu vien
@@ -39,6 +46,7 @@ from bpy.props import (
     StringProperty,
     BoolProperty,
     IntProperty,
+    FloatVectorProperty,
     CollectionProperty,
     PointerProperty,
 )
@@ -48,6 +56,23 @@ from bpy_extras.io_utils import ImportHelper
 LIB_DIR_DEFAULT = os.path.join(os.path.expanduser("~"), "Documents", "Dental-Lib")
 INDEX_NAME = "library.json"
 MESH_EXTS = (".stl", ".ply")
+
+# ---------------------------------------------------------------------------
+# Mau mac dinh (RGBA 0..1) - luu ben vung trong library.json
+# ---------------------------------------------------------------------------
+DEFAULT_VISUAL_COLOR = (0.75, 0.75, 0.80, 1.00)      # xam nhat (nhu cu)
+DEFAULT_PART_BAR_COLOR = (1.00, 0.00, 0.00, 0.50)    # do, alpha 0.5
+DEFAULT_PART_SLEEVE_COLOR = (1.00, 0.45, 0.72, 0.50)  # hong, alpha 0.5
+
+SLOT_DEFAULT_COLOR = {
+    "part_bar": DEFAULT_PART_BAR_COLOR,
+    "part_sleeve": DEFAULT_PART_SLEEVE_COLOR,
+}
+# Ten truong mau cua AttachmentEntry theo tung slot
+SLOT_COLOR_FIELD = {
+    "part_bar": "part_bar_color",
+    "part_sleeve": "part_sleeve_color",
+}
 
 _INDEX_CACHE = {"path": None, "mtime": None, "data": None}
 
@@ -156,13 +181,18 @@ def read_index(use_cache=True):
 
 
 def write_index(data):
-    """Ghi dict ra <lib_dir>/library.json (atomic) va lam moi cache."""
+    """Ghi dict ra <lib_dir>/library.json (atomic + giu 1 ban .bak) va lam moi cache."""
     root = library_dir()
     os.makedirs(root, exist_ok=True)
     path = index_path()
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, ensure_ascii=False)
+    try:
+        if os.path.exists(path):
+            shutil.copy2(path, path + ".bak")
+    except OSError as exc:
+        print(f"[Dental-Lib] Khong tao duoc backup library.json.bak: {exc}")
     os.replace(tmp, path)
     _INDEX_CACHE.update(path=path, mtime=os.path.getmtime(path), data=data)
     return data
@@ -284,6 +314,50 @@ def attachment_visuals(name):
     return out
 
 
+def attachment_visuals_rgba(name):
+    """[(label, abspath, (r, g, b, a)), ...] - Visual Object kem mau cua no."""
+    entry = get_attachment(name)
+    if not entry:
+        return []
+    out = []
+    for visual in entry.get("visuals", []):
+        out.append((visual.get("label") or "Visual",
+                    resolve_asset(visual.get("asset", "")),
+                    read_color(visual.get("color"), DEFAULT_VISUAL_COLOR)))
+    return out
+
+
+def attachment_slot_color(name, slot):
+    """RGBA mac dinh/da luu cua Apply Part Bar | Apply Part Sleeve."""
+    fallback = SLOT_DEFAULT_COLOR.get(slot, DEFAULT_VISUAL_COLOR)
+    entry = get_attachment(name)
+    if not entry:
+        return tuple(fallback)
+    return read_color(entry.get(SLOT_COLOR_FIELD.get(slot, ""), None), fallback)
+
+
+def read_color(value, fallback=DEFAULT_VISUAL_COLOR):
+    """Chuyen gia tri mau (list/tuple trong JSON, Vector/Color cua property)
+    ve tuple RGBA (clip 0..1); tra ve fallback neu khong doc duoc 3 hoac 4 kenh.
+    """
+    if isinstance(value, str) or value is None:
+        return tuple(fallback)
+    try:
+        comps = [float(c) for c in value]
+    except (TypeError, ValueError):
+        return tuple(fallback)
+    if len(comps) == 3:
+        comps.append(1.0)
+    if len(comps) != 4:
+        return tuple(fallback)
+    return tuple(min(1.0, max(0.0, c)) for c in comps)
+
+
+def write_color(value):
+    """Chuyen property RGBA (Vector/Color/list) ve list 4 so nguyen mau JSON."""
+    return [round(c, 4) for c in read_color(value)]
+
+
 def mesh_slots_connection():
     return ("base", "analog", "screw", "scanbody")
 
@@ -295,9 +369,40 @@ def mesh_slots_attachment():
 # ---------------------------------------------------------------------------
 # PropertyGroup (buffer chinh sua noi bo - source of truth la library.json)
 # ---------------------------------------------------------------------------
+_SUPPRESS_AUTOSAVE = [False]
+
+
+def _autosave(context):
+    """Ghi library.json ngay khi gia tri property doi tren UI (o chon mau).
+
+    Cac operator khac van goi _save_all(); rieng color picker khong qua
+    operator nao nen can update callback de khong mat mau khi dong Blender.
+    """
+    if _SUPPRESS_AUTOSAVE[0]:
+        return
+    try:
+        ctx = context if getattr(context, "scene", None) is not None else bpy.context
+        if getattr(ctx, "scene", None) is None:
+            return
+        write_index(index_from_scene(ctx))
+    except Exception as exc:
+        print(f"[Dental-Lib] Khong luu duoc mau vao library.json: {exc}")
+
+
+def _update_color(self, context):
+    _autosave(context)
+
+
 class DLIB_PG_VisualObject(PropertyGroup):
     label: StringProperty(name="Ten", default="Visual")
     asset: StringProperty(name="File", subtype='FILE_PATH', default="")
+    color: FloatVectorProperty(
+        name="Mau",
+        description="Mau hien thi cua Visual Object khi dat vao scene "
+                    "(kenh A dieu chinh do trong suot)",
+        subtype='COLOR', size=4, min=0.0, max=1.0,
+        default=DEFAULT_VISUAL_COLOR,
+        update=_update_color)
 
 
 CONNECTION_SLOT_LABELS = [
@@ -329,8 +434,20 @@ class DLIB_PG_AttachmentEntry(PropertyGroup):
                        description="Thu/mo danh sach slot file cua entry nay")
     on_bar: BoolProperty(name="Add/Remove on Bar", default=True)
     part_bar: StringProperty(name="Apply Part Bar", subtype='FILE_PATH', default="")
+    part_bar_color: FloatVectorProperty(
+        name="Mau Apply Part Bar",
+        description="Mau mac dinh cua Apply Part Bar khi dat vao scene "
+                    "(do, alpha 0.5 - luu trong library.json, khong hien tren panel)",
+        subtype='COLOR', size=4, min=0.0, max=1.0,
+        default=DEFAULT_PART_BAR_COLOR)
     on_sleeve: BoolProperty(name="Add/Remove on Sleeve", default=False)
     part_sleeve: StringProperty(name="Apply Part Sleeve", subtype='FILE_PATH', default="")
+    part_sleeve_color: FloatVectorProperty(
+        name="Mau Apply Part Sleeve",
+        description="Mau mac dinh cua Apply Part Sleeve khi dat vao scene "
+                    "(hong, alpha 0.5 - luu trong library.json, khong hien tren panel)",
+        subtype='COLOR', size=4, min=0.0, max=1.0,
+        default=DEFAULT_PART_SLEEVE_COLOR)
     visuals: CollectionProperty(type=DLIB_PG_VisualObject)
 
 
@@ -369,17 +486,29 @@ def index_from_scene(context):
             "name": entry.entry_name,
             "on_bar": bool(entry.on_bar),
             "part_bar": entry.part_bar,
+            "part_bar_color": write_color(entry.part_bar_color),
             "on_sleeve": bool(entry.on_sleeve),
             "part_sleeve": entry.part_sleeve,
-            "visuals": [{"label": v.label, "asset": v.asset} for v in entry.visuals],
+            "part_sleeve_color": write_color(entry.part_sleeve_color),
+            "visuals": [{"label": v.label, "asset": v.asset,
+                         "color": write_color(v.color)} for v in entry.visuals],
         }
         data["attachments"].append(item)
     return data
 
 
 def scene_from_index(context, data):
-    """Nap dict JSON vao buffer tren scene."""
+    """Nap dict JSON vao buffer tren scene (khong tu luu lai)."""
     group = _lib_group(context)
+    _SUPPRESS_AUTOSAVE[0] = True
+    try:
+        _fill_group(group, data)
+    finally:
+        _SUPPRESS_AUTOSAVE[0] = False
+    return group
+
+
+def _fill_group(group, data):
     group.connections.clear()
     group.attachments.clear()
     for item in data.get("connections", []):
@@ -392,12 +521,17 @@ def scene_from_index(context, data):
         entry.entry_name = item.get("name", "Attachment")
         entry.on_bar = bool(item.get("on_bar", True))
         entry.part_bar = item.get("part_bar", "")
+        entry.part_bar_color = read_color(item.get("part_bar_color"),
+                                          DEFAULT_PART_BAR_COLOR)
         entry.on_sleeve = bool(item.get("on_sleeve", False))
         entry.part_sleeve = item.get("part_sleeve", "")
+        entry.part_sleeve_color = read_color(item.get("part_sleeve_color"),
+                                             DEFAULT_PART_SLEEVE_COLOR)
         for visual in item.get("visuals", []):
             row = entry.visuals.add()
             row.label = visual.get("label", "Visual")
             row.asset = visual.get("asset", "")
+            row.color = read_color(visual.get("color"), DEFAULT_VISUAL_COLOR)
     return group
 
 
@@ -767,6 +901,77 @@ def ensure_collection(name, parent=None):
     return coll
 
 
+def color_material(rgba):
+    """Material toi (Principled) dung chung cho mot mau RGBA.
+
+    Alpha < 1 duoc bat trong suot (BLEND / BLENDED) de xem truoc trong viewport
+    giong cach Gingiva_Teeth_Splitter dat mau hien thi.
+    """
+    r, g, b, a = read_color(rgba)
+    name = "DLIB_Color_%g_%g_%g_%g" % (r, g, b, a)
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    mat.diffuse_color = (r, g, b, a)
+    bsdf = None
+    for nd in getattr(mat.node_tree, "nodes", []):
+        if nd.type == 'BSDF_PRINCIPLED':
+            bsdf = nd
+            break
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = a
+    if a < 1.0:
+        if hasattr(mat, "blend_method"):
+            try:
+                mat.blend_method = 'BLEND'
+            except Exception:
+                pass
+        if hasattr(mat, "surface_render_method"):
+            try:
+                mat.surface_render_method = 'BLENDED'
+            except Exception:
+                pass
+        if hasattr(mat, "show_transparent_back"):
+            mat.show_transparent_back = False
+    elif hasattr(mat, "blend_method"):
+        try:
+            mat.blend_method = 'OPAQUE'
+        except Exception:
+            pass
+    return mat
+
+
+def apply_display_color(obj, rgba):
+    """Dat mau hien thi cho object: obj.color + material co ho tro alpha."""
+    if obj is None:
+        return obj
+    r, g, b, a = read_color(rgba)
+    try:
+        obj.color = (r, g, b, a)
+        obj.display_color = 'OBJECT'
+    except Exception:
+        pass
+    if obj.type == 'MESH':
+        try:
+            mat = color_material((r, g, b, a))
+            mesh = obj.data
+            if mesh is not None and not mesh.materials and not obj.material_slots:
+                mesh.materials.append(mat)
+            if obj.material_slots:
+                slot = obj.material_slots[-1]
+                try:
+                    slot.link = 'OBJECT'   # de mesh dung chung khong bi doi mau
+                except Exception:
+                    pass
+                slot.material = mat
+        except Exception as exc:
+            print(f"[Dental-Lib] Khong gan duoc material mau: {exc}")
+    return obj
+
+
 class DLIB_OT_insert_connection(Operator):
     """Dat toan bo mesh cua Connection vao scene (kiem tra thu vien)"""
     bl_idname = "dental_lib.insert_connection"
@@ -815,7 +1020,8 @@ class DLIB_OT_insert_attachment(Operator):
             if not path or not os.path.exists(path):
                 continue
             try:
-                import_mesh_file(path, "%s_%s" % (entry.entry_name, slot.capitalize()), coll)
+                obj = import_mesh_file(path, "%s_%s" % (entry.entry_name, slot.capitalize()), coll)
+                apply_display_color(obj, getattr(entry, SLOT_COLOR_FIELD[slot]))
                 count += 1
             except Exception as exc:
                 self.report({'WARNING'}, "%s: %s" % (label, exc))
@@ -824,7 +1030,8 @@ class DLIB_OT_insert_attachment(Operator):
             if not path or not os.path.exists(path):
                 continue
             try:
-                import_mesh_file(path, "%s_%s" % (entry.entry_name, row.label), coll)
+                obj = import_mesh_file(path, "%s_%s" % (entry.entry_name, row.label), coll)
+                apply_display_color(obj, row.color)
                 count += 1
             except Exception as exc:
                 self.report({'WARNING'}, "%s: %s" % (row.label, exc))
@@ -844,15 +1051,16 @@ def _short(path, width=26):
     return name
 
 
-def _draw_slot(layout, kind, index, slot, label, icon, value):
-    row = layout.row(align=True)
-    row.label(text=label, icon=_ic(icon))
-    if value:
-        path = resolve_asset(value)
-        row.label(text=_short(path),
-                  icon=_ic('CHECKMARK' if os.path.exists(path) else 'ERROR'))
-    else:
-        row.label(text="(chua co file)", icon=_ic('BLANK1'))
+def _slot_state(value):
+    """(text, icon) trang thai file cua mot slot."""
+    if not value:
+        return "(chua co file)", _ic('BLANK1')
+    path = resolve_asset(value)
+    return _short(path), _ic('CHECKMARK' if os.path.exists(path) else 'ERROR')
+
+
+def _slot_buttons(row, kind, index, slot, value):
+    """Nut 'Gan file' (+ nut xoa lien ket) cho mot slot."""
     op = row.operator(DLIB_OT_import_asset.bl_idname, text="Gan file",
                       icon=_ic('FILEBROWSER'))
     op.kind = kind
@@ -863,6 +1071,29 @@ def _draw_slot(layout, kind, index, slot, label, icon, value):
         op.kind = kind
         op.index = index
         op.slot = slot
+
+
+def _draw_slot(layout, kind, index, slot, label, icon, value, toggle=None):
+    """Ve mot slot file.
+
+    toggle = (obj, ten_prop): Apply Part nam o hang tren, con tick Add/Remove
+    nam cung hang voi nut 'Gan file' o hang duoi. Neu khong co toggle thi
+    ve giong cu (label + trang thai + nut tren cung mot hang).
+    """
+    if toggle is None:
+        row = layout.row(align=True)
+        row.label(text=label, icon=_ic(icon))
+        text, state_icon = _slot_state(value)
+        row.label(text=text, icon=state_icon)
+        _slot_buttons(row, kind, index, slot, value)
+        return
+    head = layout.row(align=True)
+    head.label(text=label, icon=_ic(icon))
+    text, state_icon = _slot_state(value)
+    head.label(text=text, icon=state_icon)
+    act = layout.row(align=True)
+    act.prop(toggle[0], toggle[1])
+    _slot_buttons(act, kind, index, slot, value)
 
 
 class DLIB_PT_panel(Panel):
@@ -928,25 +1159,18 @@ class DLIB_PT_panel(Panel):
             op.index = i
             if not entry.open:
                 continue
-            sub.prop(entry, "on_bar")
             _draw_slot(sub, "attachment", i, "part_bar", "Apply Part Bar",
-                       'MESH_CUBE', entry.part_bar)
-            sub.prop(entry, "on_sleeve")
+                       'MESH_CUBE', entry.part_bar, toggle=(entry, "on_bar"))
             _draw_slot(sub, "attachment", i, "part_sleeve", "Apply Part Sleeve",
-                       'MESH_TORUS', entry.part_sleeve)
+                       'MESH_TORUS', entry.part_sleeve,
+                       toggle=(entry, "on_sleeve"))
             sub.label(text="Visual Objects (khong gioi han so luong):",
                       icon=_ic('OUTLINER_OB_MESH'))
             for j, visual in enumerate(entry.visuals):
                 vrow = sub.row(align=True)
                 vrow.prop(visual, "label", text="", icon=_ic('MESH_DATA'))
-                path = resolve_asset(visual.asset)
-                if not visual.asset:
-                    state_icon = _ic('BLANK1')
-                    state_text = "(chua co file)"
-                else:
-                    state_text = _short(path)
-                    state_icon = _ic('CHECKMARK' if os.path.exists(path)
-                                     else 'ERROR')
+                vrow.prop(visual, "color", text="")
+                state_text, state_icon = _slot_state(visual.asset)
                 vrow.label(text=state_text, icon=state_icon)
                 op = vrow.operator(DLIB_OT_import_visual.bl_idname,
                                    text="Gan file", icon=_ic('FILEBROWSER'))
