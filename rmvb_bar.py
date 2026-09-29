@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 1, 1),
+    "version": (0, 1, 4),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Bar Pillar / Bar Segment / Top Bar / Attachment / Sleeve",
@@ -23,6 +23,11 @@ Dental-Lib. Quy trinh:
       -> Save (STL)
 
 Chuan do luong: 1 Blender unit = 1 mm (dung chung cach lam voi add-on iBar).
+
+Mau hien thi lay tu thu vien Dental-Lib:
+    Apply Part Bar   -> do, alpha 0.5 (mac dinh trong library.json)
+    Apply Part Sleeve-> hong, alpha 0.5
+    Visual Object    -> mau chon theo tung object tren panel Dental-Lib
 """
 
 import bpy
@@ -70,7 +75,15 @@ OBJ_ATTACH_AXIS = "Rmvb_AttachmentAxis"
 VG_SCREW = "Screw"
 VG_OUTSIDE = "Outside"
 
+# Ngung dung (mm) khi xac dinh cac dinh nam cung mot cao do dinh mui extrude.
+TOP_EPS = 1e-4
+
 CST_ON_PLANE = "RMVB_on_plane"
+
+# Mau dung khi thu vien khong khai bao (trung voi mac dinh cua Dental-Lib)
+FALLBACK_PART_BAR_COLOR = (1.0, 0.0, 0.0, 0.5)       # do, alpha 0.5
+FALLBACK_PART_SLEEVE_COLOR = (1.0, 0.45, 0.72, 0.5)  # hong, alpha 0.5
+FALLBACK_VISUAL_COLOR = (0.75, 0.75, 0.80, 1.0)      # xam nhat
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +132,28 @@ def lib_attachment(name):
 
 
 def lib_visuals(name):
+    """[(label, abspath, rgba), ...] Visual Object kem mau cua tung object."""
     lib = dlib()
-    return lib.attachment_visuals(name) if lib else []
+    if lib is None:
+        return []
+    if hasattr(lib, "attachment_visuals_rgba"):
+        return lib.attachment_visuals_rgba(name)
+    gray = getattr(lib, "DEFAULT_VISUAL_COLOR", (0.75, 0.75, 0.80, 1.0))
+    return [(label, path, tuple(gray))
+            for label, path in lib.attachment_visuals(name)]
+
+
+def lib_slot_color(name, slot):
+    """Mau mac dinh cua Apply Part Bar / Apply Part Sleeve tu thu vien."""
+    fallbacks = {"part_bar": FALLBACK_PART_BAR_COLOR,
+                 "part_sleeve": FALLBACK_PART_SLEEVE_COLOR}
+    lib = dlib()
+    if lib is not None and hasattr(lib, "attachment_slot_color"):
+        try:
+            return lib.attachment_slot_color(name, slot)
+        except Exception:
+            pass
+    return fallbacks.get(slot, FALLBACK_VISUAL_COLOR)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +209,22 @@ def set_color(obj, rgba):
         obj.display_color = 'OBJECT'
     except Exception:
         pass
+
+
+def set_display_color(obj, rgba):
+    """Dat mau co ho tro alpha (trong suot) cho object.
+
+    Dung helper cua Dental-Lib neu co (gan them material trung voi obj.color);
+    neu khong thi roi xuong set_color() de tuong thich ban cu.
+    """
+    lib = dlib()
+    if lib is not None and hasattr(lib, "apply_display_color"):
+        try:
+            return lib.apply_display_color(obj, rgba)
+        except Exception:
+            pass
+    set_color(obj, rgba)
+    return obj
 
 
 def activate(context, obj, select=True):
@@ -1208,6 +1257,10 @@ def build_pillar_mesh(base_obj, lift, equalize):
     Vung ho duoi (ket noi) extrude len `lift` mm, vung ho tren (lo oc) extrude
     len toi cung do cao (neu equalize) hoac cung `lift` mm; hai mieng extrude
     sau do duoc NOI lai thanh mot solid kin.
+
+    Vertex group `Outside`/`Screw` CHI chua cac dinh nam o dinh mui extrude
+    (khong gom vong mieng lo ban dau) -> Select Outside / Select Screws chon
+    dung pham vi can sua.
     """
     mesh = base_obj.data.copy()
     mesh.name = base_obj.name + ".pillar"
@@ -1234,14 +1287,14 @@ def build_pillar_mesh(base_obj, lift, equalize):
         # cua solver Manifold tren Blender 4.5. Chi extrude mot mieng.
         top_z = max(top_z, upper["z"] + lift)
         info["degenerate"] = True
-    new_out, _faces_out, rim_out = extrude_loop_to(bm, lower, top_z)
+    new_out, _faces_out, _rim_out = extrude_loop_to(bm, lower, top_z)
     info["outside_top"] = top_z
     screw_verts = []
     new_all = list(new_out)
     if upper is not None and not same_ring:
         target = top_z if equalize else upper["z"] + lift
-        new_sc, _faces_sc, rim_sc = extrude_loop_to(bm, upper, target)
-        screw_verts = new_sc + rim_sc
+        new_sc, _faces_sc, _rim_sc = extrude_loop_to(bm, upper, target)
+        screw_verts = list(new_sc)      # chi dinh o DINH mui extrude, bo mieng lo
         new_all += new_sc
         info["screw_top"] = target
     elif same_ring:
@@ -1250,7 +1303,7 @@ def build_pillar_mesh(base_obj, lift, equalize):
     else:
         info["screw_top"] = None
 
-    pillar_verts = new_out + rim_out
+    pillar_verts = list(new_out)        # chi dinh o DINH mui extrude, bo mieng lo
     pillar_snap = _vert_snapshot(pillar_verts)
     screw_snap = _vert_snapshot(screw_verts)
     info["closed"] = bridge_extruded_rims(bm, new_all)
@@ -1269,8 +1322,7 @@ def build_pillar_mesh(base_obj, lift, equalize):
     pillar_index = _verts_by_snapshot(bm, pillar_snap)
     screw_index = _verts_by_snapshot(bm, screw_snap)
     if not pillar_index and not screw_index:   # bo de cu theo chieu cao
-        pillar_index = [v.index for v in bm.verts
-                        if v.co.z > top_z - 1e-6 or abs(v.co.z - lower["z"]) < 1e-6]
+        pillar_index = [v.index for v in bm.verts if v.co.z >= top_z - TOP_EPS]
     bm.to_mesh(mesh)
     bm.free()
 
@@ -1319,6 +1371,10 @@ class RMVB_OT_create_bar_pillar(Operator):
                 indices = info.get(group) or []
                 if indices:
                     obj.vertex_groups[group].add(indices, 1.0, 'REPLACE')
+            for group, key in ((VG_OUTSIDE, "outside_top"), (VG_SCREW, "screw_top")):
+                top_z = info.get(key)
+                if top_z is not None:
+                    obj["rmvb_top_" + group] = float(top_z)
             set_color(obj, (0.85, 0.65, 0.25, 1.0))
             obj["rmvb_role"] = "PILLAR"
             obj["rmvb_tooth"] = item.tooth
@@ -1351,8 +1407,38 @@ class RMVB_OT_create_bar_pillar(Operator):
         return {'FINISHED'}
 
 
-def select_vertex_group(context, group_name):
-    """Chon dinh thuoc vertex group (Edit Mode hoac Object Mode)."""
+def _filter_top_verts(obj, group_name, verts, eps=TOP_EPS):
+    """Loc cac dinh nam o DINH mui extrude cua vertex group.
+
+    Thu tu uu tien:
+      1. Group chi co 1 muc z (pillar tao bang ban moi) -> giu nguyen va ghi
+         lai cao do dinh vao `obj["rmvb_top_<group>"]` de lan sau dung.
+      2. Co cao do dinh da luu tren object -> loc theo cao do do (dung ca khi
+         group cua pillar cu van con ghi ca vong mieng lo).
+      3. Pillar cu khong co metadata va group nhieu muc z -> giu toan bo de
+         tranh chon sai (tao lai Bar Pillar se dung hoan toan).
+    """
+    if len(verts) < 2:
+        return list(verts)
+    zs = [v.co.z for v in verts]
+    key = "rmvb_top_" + group_name
+    if max(zs) - min(zs) <= eps:
+        obj[key] = sum(zs) / len(zs)
+        return list(verts)
+    top_z = obj.get(key)
+    if isinstance(top_z, (int, float)):
+        keep = [v for v, z in zip(verts, zs) if abs(z - top_z) <= eps]
+        if keep:
+            return keep
+    return list(verts)
+
+
+def select_vertex_group(context, group_name, top_only=True):
+    """Chon dinh thuoc vertex group (Edit Mode hoac Object Mode).
+
+    top_only=True -> chi chon cac dinh o dinh mui extrude (xem
+    _filter_top_verts), khong chon theo ca vong mieng lo ban dau.
+    """
     targets = [ob for ob in context.selected_objects
                if ob.type == 'MESH' and ob.vertex_groups.get(group_name)]
     if not targets:
@@ -1372,8 +1458,12 @@ def select_vertex_group(context, group_name):
             except Exception:
                 continue
             deform = bm.verts.layers.deform.verify()
+            members = [v for v in bm.verts
+                       if v[deform].get(group.index, 0.0) > 0.5]
+            keep = set(_filter_top_verts(obj, group_name, members)
+                       if top_only else members)
             for vert in bm.verts:
-                state = vert[deform].get(group.index, 0.0) > 0.5
+                state = vert in keep
                 if vert.select != state:
                     vert.select_set(state)
                 if state:
@@ -1382,13 +1472,18 @@ def select_vertex_group(context, group_name):
     else:
         for obj in targets:
             group = obj.vertex_groups.get(group_name)
+            if group is None:
+                continue
             bpy.ops.object.select_all(action='DESELECT')
             activate(context, obj)
+            members = [v for v in obj.data.vertices
+                       if any(g.group == group.index and g.weight > 0.5
+                              for g in v.groups)]
+            keep = {v.index for v in (_filter_top_verts(obj, group_name, members)
+                                      if top_only else members)}
             for vert in obj.data.vertices:
-                state = any(g.group == group.index and g.weight > 0.5
-                            for g in vert.groups)
-                vert.select = state
-                if state:
+                vert.select = vert.index in keep
+                if vert.select:
                     count += 1
             obj.data.update()
     return count
@@ -1419,24 +1514,37 @@ class RMVB_OT_edit_bar_pillar(Operator):
 
 
 class RMVB_OT_select_pillar_region(Operator):
-    """Chon vung ho tren (Screw) hoac vung ho duoi (Outside) cua Bar Pillar"""
+    """Chon DINH DA EXTRUDE cua vung ho tren (Screw) hoac ho duoi (Outside)"""
     bl_idname = "rmvb.select_pillar_region"
     bl_label = "Select Pillar Region"
 
     region: EnumProperty(
         name="Region",
-        items=[('SCREWS', "Select Screws", "Vung ho tren - lo oc"),
-               ('OUTSIDE', "Select Outside", "Vung ho duoi - ket noi")],
+        items=[('SCREWS', "Select Screws",
+                "Chi cac dinh da extrude cua lo oc (dinh mui tren)"),
+               ('OUTSIDE', "Select Outside",
+                "Chi cac dinh da extrude cua ho ket noi (dinh mui duoi)")],
         default='SCREWS')
+
+    all_levels: BoolProperty(
+        name="All Levels",
+        description="Chon ca vong mieng lo ban dau, khong loc rieng dinh extrude",
+        default=False)
 
     def execute(self, context):
         group = VG_SCREW if self.region == 'SCREWS' else VG_OUTSIDE
-        found = select_vertex_group(context, group)
+        found = select_vertex_group(context, group, top_only=not self.all_levels)
         if found < 0:
             self.report({'ERROR'},
                         "Khong tim thay vung '%s'. Vao Edit Bar Pillar truoc." % group)
             return {'CANCELLED'}
-        self.report({'INFO'}, "Da chon %d dinh thuoc vung %s" % (found, group))
+        if not found:
+            self.report({'WARNING'},
+                        "Vung '%s' khong con dinh nao o dinh extrude "
+                        "(bam All Levels de chon ca mieng lo)" % group)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Da chon %d dinh da extrude thuoc vung %s" % (
+            found, group))
         return {'FINISHED'}
 
 
@@ -1490,9 +1598,29 @@ def polyline_from_object(obj):
     return points, closed
 
 
+def rebuild_polyline(obj, points, closed=False):
+    """Ghi lai toan bo duong line tu danh sach diem world (kieu ve polyline
+    nhu GingivaWaxupDetection: khong giu con tro bmesh, dung list diem).
+
+    closed=False (mac dinh) -> line MO, khong noi diem dau voi diem cuoi.
+    """
+    mesh = obj.data
+    mesh.clear_geometry()
+    inverse = obj.matrix_world.inverted()
+    verts = [tuple(inverse @ Vector(p)) for p in points]
+    edges = [(i, i + 1) for i in range(len(verts) - 1)]
+    if closed and len(verts) >= 3:
+        edges.append((len(verts) - 1, 0))
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+
+
 def sweep_polyline(points, width, height, closed=False, up=None):
     """Tao mesh dang thanh co tiet dien nhat (width x height) di theo points."""
     bm = bmesh.new()
+    if closed and len(points) > 2 \
+            and (Vector(points[-1]) - Vector(points[0])).length < 1e-6:
+        points = list(points[:-1])      # vong kin: bo diem lap o cuoi
     if len(points) < 2:
         bm.free()
         return None
@@ -1596,8 +1724,8 @@ class RMVB_OT_create_bar_line(Operator):
 
 
 class RMVB_OT_draw_bar_line(Operator):
-    """Ve duong bar theo con tro: E/click trai = them diem NAM TREN be mat
-    Gingiva, Backspace = xoa diem cuoi, F = noi vong, Enter/Esc = xong"""
+    """Ve duong bar MO theo con tro: E/click trai = them diem NAM TREN be mat
+    Gingiva, Backspace/Ctrl+Z = xoa diem cuoi, Enter = xong, Esc = huy"""
     bl_idname = "rmvb.draw_bar_line"
     bl_label = "Ve duong bar (snap Gingiva)"
 
@@ -1621,69 +1749,62 @@ class RMVB_OT_draw_bar_line(Operator):
             return None
         direction = view3d_utils.region_2d_to_vector_3d(self.region, self.rv3d, coord)
         origin = view3d_utils.region_2d_to_origin_3d(self.region, self.rv3d, coord)
+        target = self.target
+        inverse = target.matrix_world.inverted()
+        # Ray rieng vao object Gingiva (Object.ray_cast) -> khong vo tinh cham
+        # vao rung/răng/pillar nam che tren be mat.
+        try:
+            done, local, _n, _i = target.ray_cast(
+                inverse @ origin, (inverse.to_3x3() @ direction).normalized())
+        except Exception:
+            done = False
+        if done:
+            return target.matrix_world @ local
         depsgraph = context.evaluated_depsgraph_get()
-        result, location, _n, _f, _o, _m = context.scene.ray_cast(
+        result, location, _n, _f, hit_obj, _m = context.scene.ray_cast(
             depsgraph, origin, direction)
         if not result:
             return None
-        target = self.target
-        hit, local, _n2, _i = target.closest_point_on_mesh(
-            target.matrix_world.inverted() @ location)
+        if hit_obj is not None and hit_obj != target \
+                and getattr(hit_obj, "original", None) != target:
+            return None                      # chi ve tren dung be mat Gingiva
+        hit, local, _n2, _i = target.closest_point_on_mesh(inverse @ location)
         return (target.matrix_world @ local) if hit else location
 
-    def _write(self):
-        self.bm.to_mesh(self.line.data)
-        self.bm.free()
-        self.line.data.update()
-        self.bm = bmesh.new()
-        self.bm.from_mesh(self.line.data)
-        self.bm.verts.ensure_lookup_table()
+    def _redraw(self):
+        if self.area:
+            self.area.tag_redraw()
+
+    def _push_point(self, world):
+        """Them mot diem vao cuoi duong line va ve lai toan bo polyline
+        (danh sach diem la source of truth -> khong bao gio lost ket noi)."""
+        self.points.append(Vector(world))
+        rebuild_polyline(self.line, self.points, self.closed)
+        self._redraw()
 
     def _add_point(self, context, event):
         world = self._raycast(context, event.mouse_x, event.mouse_y)
         if world is None:
-            return
-        local = self.line.matrix_world.inverted() @ world
-        vert = self.bm.verts.new(local)
-        if self.tip is not None and self.tip.is_valid:
-            try:
-                self.bm.edges.new((self.tip, vert))
-            except ValueError:
-                pass
-        self.tip = vert
-        self._write()
-        if self.area:
-            self.area.tag_redraw()
+            return False
+        self._push_point(world)
+        return True
 
     def _remove_last(self, context):
-        if self.tip is None or not self.tip.is_valid or len(self.bm.verts) <= 1:
+        if len(self.points) <= 1:
             return
-        previous = None
-        for edge in self.tip.link_edges:
-            previous = edge.other_vert(self.tip)
-            break
-        try:
-            self.bm.verts.remove(self.tip)
-        except Exception:
-            return
-        self.bm.verts.ensure_lookup_table()
-        if previous is not None and previous.is_valid:
-            self.tip = previous
-        else:
-            self.tip = self.bm.verts[-1] if self.bm.verts else None
-        self._write()
-        if self.area:
-            self.area.tag_redraw()
+        self.points.pop()
+        rebuild_polyline(self.line, self.points, self.closed)
+        self._redraw()
 
     def _draw_cb(self):
-        if self.hit_world is None or self.tip is None or not self.tip.is_valid:
+        if self.hit_world is None or not self.points:
             return
         try:
             import gpu
             from gpu_extras.batch import batch_for_shader
         except Exception:
             return
-        tip_world = self.line.matrix_world @ self.tip.co
+        tip_world = self.points[-1]
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('NONE')
@@ -1694,7 +1815,8 @@ class RMVB_OT_draw_bar_line(Operator):
                                      {"pos": [tip_world, self.hit_world]})
             shader.uniform_float("color", (1.0, 0.8, 0.1, 0.9))
             batch.draw(shader)
-            point = batch_for_shader(shader, 'POINTS', {"pos": [self.hit_world]})
+            point = batch_for_shader(
+                shader, 'POINTS', {"pos": list(self.points) + [self.hit_world]})
             shader.uniform_float("color", (1.0, 0.3, 0.1, 1.0))
             point.draw(shader)
         except Exception:
@@ -1723,12 +1845,16 @@ class RMVB_OT_draw_bar_line(Operator):
         if self.region is None or self.rv3d is None:
             self.report({'ERROR'}, "Khong tim thay vung 3D View")
             return {'CANCELLED'}
-        self.bm = bmesh.new()
-        self.bm.from_mesh(line.data)
-        self.bm.verts.ensure_lookup_table()
-        ends = [v for v in self.bm.verts if len(v.link_edges) <= 1]
-        self.tip = ends[-1] if ends else (
-            self.bm.verts[-1] if self.bm.verts else None)
+        # Danh sach diem world = source of truth (kieu GingivaWaxupDetection).
+        # Diem dau tien co the da co san (nut 3D Cursor luc tao line).
+        self.points, self.closed = polyline_from_object(line)
+        if self.closed and len(self.points) > 1 \
+                and (self.points[-1] - self.points[0]).length < 1e-6:
+            self.points.pop()          # polyline_from_object lap lai diem dau
+        self.restore = list(self.points)
+        if not self.points:
+            self.points = [line.matrix_world @ Vector((0.0, 0.0, 0.0))]
+            self.restore = list(self.points)
         try:
             self.handle = bpy.types.SpaceView3D.draw_handler_add(
                 self._draw_cb, (), 'WINDOW', 'POST_VIEW')
@@ -1742,8 +1868,8 @@ class RMVB_OT_draw_bar_line(Operator):
         try:
             if on:
                 context.workspace.status_text_set(
-                    "Ve duong bar | E/Click trai: them diem tren Gingiva | "
-                    "Backspace: xoa diem cuoi | F: noi vong | Enter/Esc: xong")
+                    "Ve duong bar MO | E/Click trai: them diem tren Gingiva | "
+                    "Backspace/Ctrl+Z: xoa diem cuoi | Enter: xong | Esc: huy")
             else:
                 context.workspace.status_text_set(None)
         except Exception:
@@ -1757,30 +1883,33 @@ class RMVB_OT_draw_bar_line(Operator):
             except Exception:
                 pass
             self.handle = None
-        try:
-            self.bm.free()
-        except Exception:
-            pass
         if self.area:
             self.area.tag_redraw()
 
     def modal(self, context, event):
         if event.value == 'PRESS' and (
-                event.type == 'E' or (event.type == 'LEFTMOUSE' and not event.alt)):
-            self._add_point(context, event)
+                event.type == 'E'
+                or (event.type == 'LEFTMOUSE' and not event.alt
+                    and not event.ctrl and not event.shift)):
+            if not self._add_point(context, event):
+                self.report({'WARNING'}, "Khong cham vao be mat Gingiva")
             return {'RUNNING_MODAL'}
-        if event.value == 'PRESS' and event.type in {'BACK_SPACE', 'DEL'}:
+        if event.value == 'PRESS' and (
+                event.type in {'BACK_SPACE', 'DEL'}
+                or (event.type == 'Z' and event.ctrl)):
             self._remove_last(context)
             return {'RUNNING_MODAL'}
-        if event.value == 'PRESS' and event.type == 'F':
-            bpy.ops.rmvb.close_bar_line()
-            return {'RUNNING_MODAL'}
-        if event.value == 'PRESS' and event.type in {'RET', 'NUMPAD_ENTER', 'SPACE',
-                                                     'ESC', 'RIGHTMOUSE'}:
+        if event.value == 'PRESS' and event.type in {'RET', 'NUMPAD_ENTER',
+                                                     'SPACE', 'RIGHTMOUSE'}:
             self._finish(context)
-            self.report({'INFO'}, "Line bar co %d diem - bam Create Bar Segment"
-                        % len(self.line.data.vertices))
+            self.report({'INFO'}, "Line bar mo co %d diem - bam Create Bar Segment"
+                        % len(self.points))
             return {'FINISHED'}
+        if event.value == 'PRESS' and event.type == 'ESC':
+            self._finish(context)
+            rebuild_polyline(self.line, self.restore, self.closed)
+            self.report({'INFO'}, "Da huy ve line bar (giu line nhu luc dau)")
+            return {'CANCELLED'}
         if event.type == 'MOUSEMOVE':
             self.hit_world = self._raycast(context, event.mouse_x, event.mouse_y)
             if self.area:
@@ -2323,7 +2452,8 @@ class RMVB_OT_add_attachment(Operator):
         index = len(props.attachments)
         obj = object_from_mesh("Attachment_%s_%d" % (slugify(name), index),
                                mesh, coll, matrix)
-        set_color(obj, (0.30, 0.85, 0.40, 1.0))
+        # Diem: mau Apply Part Bar lay tu thu vien (mac dinh do, alpha 0.5)
+        set_display_color(obj, lib_slot_color(name, "part_bar"))
         obj["rmvb_role"] = "ATTACHMENT"
         obj["rmvb_attachment"] = name
 
@@ -2336,7 +2466,7 @@ class RMVB_OT_add_attachment(Operator):
         # Diem 9: Visual Object chi xuat hien kem, khong tham gia boolean
         made_visuals = 0
         if lib:
-            for slot, path in lib_visuals(name):
+            for slot, path, rgba in lib_visuals(name):
                 if not path or not os.path.exists(path):
                     continue
                 try:
@@ -2350,7 +2480,8 @@ class RMVB_OT_add_attachment(Operator):
                                         vmesh, coll, matrix)
                 vobj["rmvb_role"] = "VISUAL"
                 vobj["rmvb_attachment"] = name
-                set_color(vobj, (0.75, 0.75, 0.80, 1.0))
+                # Diem: mau Visual Object chon trong thu vien Dental-Lib
+                set_display_color(vobj, rgba)
                 vref = ref.visuals.add()
                 vref.object = vobj
                 vref.tooth = slot
@@ -2589,7 +2720,10 @@ class RMVB_OT_create_sleeve_design(Operator):
         except Exception:
             pass
 
-        set_color(sleeve, (0.95, 0.55, 0.85, 1.0))
+        # Diem: mau Sleeve = mau Apply Part Sleeve trong thu vien
+        # (mac dinh hong, alpha 0.5 de nhin xuyen qua bar ben trong)
+        set_display_color(sleeve, lib_slot_color(
+            current_attachment_name(props) or "", "part_sleeve"))
         sleeve["rmvb_role"] = "SLEEVE"
         props.sleeve_object = sleeve
         activate(context, sleeve)
@@ -2765,7 +2899,7 @@ class RMVB_PT_panel(Panel):
         col.operator(RMVB_OT_create_bar_line.bl_idname,
                      text="Draw Line Bar (snap Gingiva)", icon='GREASEPENCIL')
         col.operator(RMVB_OT_close_bar_line.bl_idname,
-                     text="Noi diem dau-cuoi (F)", icon='MESH_CIRCLE')
+                     text="Noi diem dau-cuoi (tuy chon)", icon='MESH_CIRCLE')
         col.prop(props, "bar_width")
         col.prop(props, "bar_height")
         col.prop(props, "bar_clearance")
