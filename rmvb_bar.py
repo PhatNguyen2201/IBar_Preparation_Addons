@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 1, 4),
+    "version": (0, 3, 2),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
-    "description": "Thiet ke bar implant: Bar Pillar / Bar Segment / Top Bar / Attachment / Sleeve",
+    "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
     "warning": "",
     "doc_url": "",
     "category": "3D View",
@@ -15,12 +15,13 @@ bl_info = {
 Panel thiet ke khung bar implant. Lay Connection Base va Attachment tu add-on
 Dental-Lib. Quy trinh:
 
-    Import (Gingiva / Denture-reference / Antagonist)
+    Set Gingiva / Denture / Antagonist (chon object san co trong scene)
       -> Select Connection Base + Place Connection (doc .constructionInfo)
-      -> Bar Design: Bar Pillar -> Bar Segment -> Top Bar Plane -> Cut Top Bar
-      -> Attachment
+      -> Bar Pillar -> Create Top Bar Plane -> Draw Line Bar (snap Plane) -> Bar Segment
+         tu cap nhat -> Cut Top Bar (chi them modifier)
+      -> Attachment (moi lan Add = 1 group)
       -> Sleeve Design
-      -> Save (STL)
+      -> Apply / Delete Bar Design -> Save Bar & Sleeve Design (STL)
 
 Chuan do luong: 1 Blender unit = 1 mm (dung chung cach lam voi add-on iBar).
 
@@ -47,7 +48,8 @@ from bpy.props import (
     CollectionProperty,
     PointerProperty,
 )
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.types import Menu, Operator, Panel, PropertyGroup, UIList
+from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ImportHelper
 from bpy_extras import view3d_utils
 import xml.etree.ElementTree as ET
@@ -57,28 +59,41 @@ MM_TO_BU = 1.0
 
 COL_IMPORT = "Rmvb Import"
 COL_CONNECTION = "Rmvb Connections"
-COL_PILLAR = "Rmvb Bar Pillar"
-COL_SEGMENT = "Rmvb Bar Segment"
-COL_TOPBAR = "Rmvb Top Bar"
+COL_BARDESIGN = "BarDesign"          # Bar Pillar + Bar Segment (+ line, mui ten)
+COL_PILLAR = COL_BARDESIGN
+COL_SEGMENT = COL_BARDESIGN
+COL_CUTPLANE = "CutPlane"            # PlaneVisual + PlaneCubeCut
 COL_ATTACHMENT = "Rmvb Attachment"
 COL_SLEEVE = "Rmvb Sleeve"
 COL_PREVIEW = "Rmvb Preview"
 
-OBJ_BAR = "Rmvb_Bar"
-OBJ_SEGMENT = "Rmvb_BarSegment"
+OBJ_SEGMENT = "BarSegment"
+OBJ_BACKUP = "BarSegmentBackup"
 OBJ_LINE = "Rmvb_BarLine"
-OBJ_PLANE = "Rmvb_TopBarPlane"
-OBJ_CUTTER = "Rmvb_TopBarCutter"
+OBJ_ARROW = "InsertionArrow"
+OBJ_PLANE = "PlaneVisual"
+OBJ_CUTTER = "PlaneCubeCut"
 OBJ_SLEEVE = "Rmvb_Sleeve"
-OBJ_ATTACH_AXIS = "Rmvb_AttachmentAxis"
 
-VG_SCREW = "Screw"
-VG_OUTSIDE = "Outside"
+# Tien to ten modifier do add-on tao (rebuild xoa theo tien to nay)
+MOD_PREFIX = "RMVB_"
 
 # Ngung dung (mm) khi xac dinh cac dinh nam cung mot cao do dinh mui extrude.
 TOP_EPS = 1e-4
 
 CST_ON_PLANE = "RMVB_on_plane"
+CST_ROT_PLANE = "RMVB_lock_rot_topbar"
+CST_ROT_LIMIT = "RMVB_lock_rot_xy"
+CST_COPY_LOC = "RMVB_lock_location"
+CST_COPY_ROT = "RMVB_lock_rotation"
+
+# Thong so chuan bi mesh (mm, truc local cua mesh)
+GINGIVA_BASE_DEPTH = 10.0       # Gingiva: extrude day xuong 10 mm roi fill
+CONN_BOTTOM_EXTRUDE = 2.0       # Base ho day: extrude 2 mm
+CONN_BOTTOM_SCALE = 2.0         # ... roi scale local x2
+CONN_TOP_EXTRUDE = 30.0         # Base ho dinh (Screw): extrude 30 mm
+PLANE_SIZE = 100.0              # PlaneVisual / PlaneCubeCut: 100 x 100 mm
+PLANE_CUBE_HEIGHT = 100.0       # PlaneCubeCut: extrude +z local 100 mm (hop lap phuong)
 
 # Mau dung khi thu vien khong khai bao (trung voi mac dinh cua Dental-Lib)
 FALLBACK_PART_BAR_COLOR = (1.0, 0.0, 0.0, 0.5)       # do, alpha 0.5
@@ -237,9 +252,10 @@ def activate(context, obj, select=True):
     return obj
 
 
-def project_dir():
-    path = bpy.path.abspath("//")
-    return path if path else os.path.expanduser("~")
+def blend_dir():
+    """Thu muc chua file .blend hien tai ("" neu chua luu)."""
+    path = bpy.data.filepath
+    return os.path.dirname(path) if path else ""
 
 
 def timestamp():
@@ -249,8 +265,24 @@ def timestamp():
 # ---------------------------------------------------------------------------
 # Mesh cache: doc STL/PLY thanh bpy.data.meshes (khong de lai object roi)
 # ---------------------------------------------------------------------------
-_MESH_CACHE = {}
+_MESH_CACHE = {}           # key -> ten mesh (KHONG giu tham chieu Python)
 _DEFERRED_MESHES = []      # mesh boolean sinh ra, duoc don o cuoi operator
+
+
+def _cached_mesh(key):
+    """Mesh da cache theo key, hoac None neu da bi xoa (undo / purge / file moi).
+
+    Chi luu TEN mesh: giu tham chieu Python toi mesh da bi xoa se gay loi
+    "StructRNA of type Mesh has been removed" khi truy cap.
+    """
+    name = _MESH_CACHE.get(key)
+    if not name:
+        return None
+    mesh = bpy.data.meshes.get(name)
+    if mesh is None or mesh.get("rmvb_cache_key") != repr(key):
+        _MESH_CACHE.pop(key, None)
+        return None
+    return mesh
 
 
 def mesh_from_file(filepath, scale=1.0):
@@ -258,8 +290,8 @@ def mesh_from_file(filepath, scale=1.0):
     if not filepath or not os.path.exists(filepath):
         raise FileNotFoundError("Khong tim thay file mesh: %s" % filepath)
     key = (os.path.abspath(filepath), os.path.getmtime(filepath), round(scale, 6))
-    cached = _MESH_CACHE.get(key)
-    if cached is not None and cached.name in bpy.data.meshes:
+    cached = _cached_mesh(key)
+    if cached is not None:
         return cached
 
     ext = os.path.splitext(filepath)[1].lower()
@@ -293,9 +325,9 @@ def mesh_from_file(filepath, scale=1.0):
     for ob in created:
         if ob.name in bpy.data.objects:
             bpy.data.objects.remove(ob, do_unlink=True)
-    if mesh.users == 0:
-        mesh.use_fake_user = True
-    _MESH_CACHE[key] = mesh
+    mesh.use_fake_user = True          # thu vien STL khong bi purge khi khong con object
+    mesh["rmvb_cache_key"] = repr(key)
+    _MESH_CACHE[key] = mesh.name
     return mesh
 
 
@@ -316,6 +348,8 @@ def boundary_loops(bm):
     Tra ve list[dict]: {"edges": [BMEdge...], "verts": [BMVert theo thu tu vong],
     "z": gia tri Z trung binh trong toa do local}
     """
+    bm.verts.index_update()
+    bm.edges.index_update()
     bm.edges.ensure_lookup_table()
     seen = set()
     loops = []
@@ -373,61 +407,6 @@ def ordered_loop_verts(loop):
 # ---------------------------------------------------------------------------
 # Boolean / modifier khong dung ops (an toan trong background va modal)
 # ---------------------------------------------------------------------------
-def cleanup_mesh(obj, dist=1e-6, dissolve=False):
-    """Doi chieu sau boolean: lap kin lo mo con lai (va tuy chon xoa mat thoai).
-
-    Khong weld dinh (remove_doubles) vi boolean da chinh xac, weld lam mo them
-    cac canh non-manifold.
-    """
-    bm = bmesh.new()
-    bm.from_mesh(obj.data)
-    if dissolve:
-        try:
-            bmesh.ops.dissolve_degenerate(bm, edges=bm.edges, dist=dist)
-        except Exception:
-            pass
-    left = [e for e in bm.edges if e.is_boundary]
-    if left:
-        try:
-            bmesh.ops.holes_fill(bm, edges=left, sides=0)
-        except Exception:
-            pass
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    try:
-        if bm.calc_volume(signed=True) < 0:
-            bmesh.ops.reverse_faces(bm, faces=bm.faces)
-    except Exception:
-        pass
-    bm.to_mesh(obj.data)
-    bm.free()
-    obj.data.validate()
-    obj.data.update()
-    return obj
-
-
-def union_all(objs, name, coll, solvers=None):
-    """Union tuan tu cac solid thanh 1 the manifold (khong trung lap shell)."""
-    objs = [o for o in objs if o is not None and o.name in bpy.data.objects]
-    if not objs:
-        return None
-    base = objs[0]
-    for other in objs[1:]:
-        if solvers is None:
-            boolean_objects(base, [other], 'UNION')
-        else:
-            boolean_objects(base, [other], 'UNION', solvers=solvers)
-        remove_object(other)
-    if base.name != name:
-        base.name = name
-    # Ket qua luu vao collection chinh (khong de nam trong temp bi purge)
-    for user in list(base.users_collection):
-        if user != coll:
-            user.objects.unlink(base)
-    if base.name not in coll.objects:
-        coll.objects.link(base)
-    return base
-
-
 def evaluated_mesh_object(obj, name=None, coll=None):
     """Copy da apply toan bo modifier (mesh tinh theo toa do local cua obj)."""
     context = bpy.context
@@ -485,19 +464,6 @@ def _mesh_quality(obj):
     return polys, bnd, nonmani
 
 
-def solid_volume(obj):
-    """The tich (mm^3) cua khoi mesh dang o toa do world."""
-    try:
-        bm = bmesh.new()
-        bm.from_mesh(obj.data)
-        bm.transform(obj.matrix_world)
-        volume = abs(bm.calc_volume(signed=True))
-        bm.free()
-        return volume
-    except Exception:
-        return 0.0
-
-
 def apply_modifiers_in_place(obj):
     """Apply kieu khong ops: lay mesh evaluated roi thay vao data cu."""
     context = bpy.context
@@ -528,6 +494,7 @@ def boolean_objects(target, operands, operation, solvers=None):
     original = source.copy()
     original.name = target.name + ".src"
     best = None
+    closed = False
     candidates = []            # ban copy chua tung gan vao object -> don duoc
     for index, solver in enumerate(solvers):
         for flag in ((False, True) if solver == 'EXACT' else (False,)):
@@ -551,8 +518,9 @@ def boolean_objects(target, operands, operation, solvers=None):
                 best = (score, target.data.copy(), solver, flag)
                 candidates.append(best[1])
             if bnd == 0:
+                closed = True          # khong con canh ho: du dung, khong thu solver cham hon
                 break
-        if best and best[0] == 0:
+        if closed:
             break
     if best is not None:
         old = target.data
@@ -622,38 +590,6 @@ def purge_unused_meshes():
         except Exception:
             pass
     _DEFERRED_MESHES[:] = left
-
-
-def join_objects(objs, name, coll):
-    """Hop nhat thanh 1 object (ket qua nam trong toa do world)."""
-    objs = [o for o in objs if o is not None and o.name in bpy.data.objects]
-    if not objs:
-        return None
-    if len(objs) == 1:
-        objs[0].name = name
-        return objs[0]
-    base = bpy.data.meshes.new(name)
-    holder = bpy.data.objects.new(name, base)
-    coll.objects.link(holder)
-    bm = bmesh.new()
-    for obj in objs:
-        temp = bmesh.new()
-        temp.from_mesh(obj.data)
-        temp.transform(obj.matrix_world)
-        merge = {}
-        for vert in temp.verts:
-            merge[vert.index] = bm.verts.new(vert.co)
-        for face in temp.faces:
-            try:
-                bm.faces.new([merge[v.index] for v in face.verts])
-            except ValueError:
-                pass
-        temp.free()
-    bm.to_mesh(base)
-    bm.free()
-    for obj in objs:
-        remove_object(obj)
-    return holder
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +717,9 @@ def parse_construction_info(filepath):
 
 # ---------------------------------------------------------------------------
 # Combobox lay danh sach tu thu vien Dental-Lib
+#   Dung Menu (ve lai moi lan mo) + operator gan gia tri thang, KHONG dung
+#   EnumProperty dong: callback items tra ve chuoi tao moi nen Blender co the
+#   doc chuoi da bi giai phong -> chon muc trong dropdown khong an.
 # ---------------------------------------------------------------------------
 def get_connection_items():
     return lib_connection_names()
@@ -790,66 +729,122 @@ def get_attachment_items():
     return lib_attachment_names()
 
 
-def _index_enum(names, icon='MESH_CYLINDER'):
-    """Enum dung index lam identifier (an toan voi ten co dau/khoang trang)."""
+def _clamp_index(value, count):
+    return max(0, min(int(value), max(0, count - 1)))
+
+
+class RMVB_OT_pick_library_item(Operator):
+    """Chon Connection Base / Attachment trong thu vien Dental-Lib"""
+    bl_idname = "rmvb.pick_library_item"
+    bl_label = "Chon muc thu vien"
+    bl_options = {'INTERNAL'}
+
+    kind: EnumProperty(
+        name="Kind",
+        items=[('CONNECTION', "Connection", ""), ('ATTACHMENT', "Attachment", "")],
+        default='CONNECTION')
+    index: IntProperty(name="Index", default=0, min=0)
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        if self.kind == 'CONNECTION':
+            names = get_connection_items()
+            props.connection_index = _clamp_index(self.index, len(names))
+            props.connection_name = names[props.connection_index] if names else ""
+        else:
+            names = get_attachment_items()
+            props.attachment_index = _clamp_index(self.index, len(names))
+            props.active_attachment = names[props.attachment_index] if names else ""
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {'FINISHED'}
+
+
+def _draw_library_menu(layout, kind, names, icon):
     if not names:
-        return [("0", "(Trống)", "Chưa có mục nào trong thư viện Dental-Lib",
-                 'ERROR', 0)]
-    return [(str(i), name, name, icon, i) for i, name in enumerate(names)]
-
-
-def enum_connection_base(self, context):
-    return _index_enum(get_connection_items())
-
-
-def enum_attachment(self, context):
-    return _index_enum(get_attachment_items(), 'MESH_CUBE')
-
-
-def _safe_index(value, count):
-    """Index an toan cho combobox (khong bao gio vuot khoi danh sach)."""
-    try:
-        index = int(value)
-    except (TypeError, ValueError):
-        index = 0
-    return max(0, min(index, max(0, count - 1)))
-
-
-def _connection_get(self):
-    try:
-        names = get_connection_items()
-        if not names:
-            return "0"
-        return str(_safe_index(self.connection_index, len(names)))
-    except Exception:
-        return "0"
-
-
-def _connection_set(self, value):
-    if not str(value).isdigit():
+        layout.label(text="(Trống - thêm mục trong Dental-Lib)", icon='ERROR')
         return
-    index = int(value)
-    names = get_connection_items()
-    self.connection_index = _safe_index(index, len(names))
-    self.connection_name = (names[self.connection_index] if names else "")
+    for index, name in enumerate(names):
+        op = layout.operator(RMVB_OT_pick_library_item.bl_idname, text=name, icon=icon)
+        op.kind = kind
+        op.index = index
 
 
-def _attachment_get(self):
+class RMVB_MT_pick_connection(Menu):
+    bl_label = "Select Connection Base"
+
+    def draw(self, context):
+        _draw_library_menu(self.layout, 'CONNECTION', get_connection_items(),
+                           'MESH_CYLINDER')
+
+
+class RMVB_MT_pick_attachment(Menu):
+    bl_label = "Select Attachment"
+
+    def draw(self, context):
+        _draw_library_menu(self.layout, 'ATTACHMENT', get_attachment_items(),
+                           'MESH_CUBE')
+
+
+def _save_dir_get(self):
+    """Thu muc luu: gia tri nguoi dung chon, neu trong thi lay thu muc file .blend."""
+    stored = self.get("save_dir_value", "")
+    return stored if stored else blend_dir()
+
+
+def _save_dir_set(self, value):
+    self["save_dir_value"] = value
+
+
+# ---------------------------------------------------------------------------
+# Property group
+# ---------------------------------------------------------------------------
+def _group_name_update(self, context):
+    """Doi ten group: doi ten Empty cua group va cap nhat Lock dang tro toi ten cu."""
+    props = context.scene.rmvb
+    old = self.get("prev_name", "")
+    self["prev_name"] = self.name
+    if old and old != self.name:
+        for other in props.groups:
+            if other.lock_target == old:
+                other.lock_target = self.name
+    if self.empty is not None:
+        try:
+            self.empty.name = "Att_" + self.name
+        except Exception:
+            pass
+
+
+def _group_lock_update(self, context):
+    apply_group_locks(self, context.scene.rmvb)
+
+
+def _bar_param_update(self, context):
+    """Doi Be rong / Chieu cao bar: Bar Segment cap nhat ngay."""
     try:
-        names = get_attachment_items()
-        if not names:
-            return "0"
-        return str(_safe_index(self.attachment_index, len(names)))
-    except Exception:
-        return "0"
+        sync_bar_segment(context.scene, force=True)
+    except Exception as exc:
+        print("[Rmvb-Bar] Khong cap nhat duoc Bar Segment: %s" % exc)
 
 
-def _attachment_set(self, value):
-    if not str(value).isdigit():
+_GROUP_SELECT_LOCK = [False]    # True: group_index doi do code, khong tu chon Empty
+
+
+def _group_index_update(self, context):
+    """Bam vao muc trong danh sach Attachment: chon Plain Axes cua group + cong cu Move."""
+    if _GROUP_SELECT_LOCK[0]:
         return
-    names = get_attachment_items()
-    self.attachment_index = _safe_index(int(value), len(names))
-    self.active_attachment = (names[self.attachment_index] if names else "")
+    if 0 <= self.group_index < len(self.groups):
+        select_group_for_move(context, self.groups[self.group_index])
+
+
+def set_group_index(props, index):
+    """Dat group_index bang code ma KHONG kich hoat chon Empty."""
+    _GROUP_SELECT_LOCK[0] = True
+    try:
+        props.group_index = max(0, index)
+    finally:
+        _GROUP_SELECT_LOCK[0] = False
 
 
 class RMVB_PG_PlacedConnection(PropertyGroup):
@@ -866,26 +861,53 @@ class RMVB_PG_PartRef(PropertyGroup):
     tooth: StringProperty(name="Tooth", default="")
 
 
-class RMVB_PG_AttachmentRef(PropertyGroup):
-    att_name: StringProperty(name="Attachment", default="")
-    object: PointerProperty(name="Object", type=bpy.types.Object)
-    on_bar: BoolProperty(name="On Bar", default=True)
-    on_sleeve: BoolProperty(name="On Sleeve", default=False)
+class RMVB_PG_AttachmentGroup(PropertyGroup):
+    """Mot lan Add Attachment = mot group: Empty cha + Part Bar + Part Sleeve + Visual."""
+    name: StringProperty(
+        name="Tên Attachment",
+        description="Ten group Attachment (mac dinh lay theo ten Attachment trong "
+                    "thu vien). Doi ten se doi ten Empty cua group",
+        default="", update=_group_name_update)
+    lib_name: StringProperty(name="Library", default="")
+    empty: PointerProperty(name="Group", type=bpy.types.Object)
+    part_bar: PointerProperty(name="Part Bar", type=bpy.types.Object)
+    part_sleeve: PointerProperty(name="Part Sleeve", type=bpy.types.Object)
     visuals: CollectionProperty(type=RMVB_PG_PartRef)
+    on_bar: BoolProperty(
+        name="Add/Remove on Bar", default=True,
+        description="Lay tu Dental-Lib: True = Union len Bar, False = Difference")
+    on_sleeve: BoolProperty(
+        name="Add/Remove on Sleeve", default=False,
+        description="Lay tu Dental-Lib: True = Union len Sleeve, False = Difference")
+    lock_topbar: BoolProperty(
+        name="Lock Z với Top Bar",
+        description="Tam group luon nam tren mat phang PlaneVisual (chi khoa Z local "
+                    "cua Plane, X/Y tu do). Khong anh huong huong xoay",
+        default=False, update=_group_lock_update)
+    lock_rot_topbar: BoolProperty(
+        name="Lock Rotation với Top Bar",
+        description="Khoa xoay X va Y theo PlaneVisual: truc Z cua group luon vuong goc "
+                    "Plane (nghieng Plane thi group nghieng theo). KHONG khoa xoay Z: van "
+                    "xoay duoc quanh phap tuyen Plane. Khong anh huong vi tri",
+        default=False, update=_group_lock_update)
+    lock_attachment: BoolProperty(
+        name="Lock Location & Rotation với Attachment",
+        description="Group luon cung vi tri va huong xoay voi mot group Attachment khac",
+        default=False, update=_group_lock_update)
+    lock_target: StringProperty(
+        name="Attachment", description="Group Attachment dung lam goc",
+        default="", update=_group_lock_update)
 
 
 class RMVB_PG_props(PropertyGroup):
-    # 1-3: doi tuong import
+    # Set: doi tuong da co trong scene
     gingiva_object: PointerProperty(name="Gingiva", type=bpy.types.Object)
-    denture_object: PointerProperty(name="Denture-reference", type=bpy.types.Object)
+    denture_object: PointerProperty(name="Denture", type=bpy.types.Object)
     antagonist_object: PointerProperty(name="Antagonist", type=bpy.types.Object)
 
-    # 4-5: Connection Base + constructionInfo
+    # Connection Base + constructionInfo
     connection_index: IntProperty(name="Connection Index", default=0, min=0)
     connection_name: StringProperty(name="Connection Name", default="")
-    connection_base: EnumProperty(name="Select Connection Base",
-                                  items=enum_connection_base,
-                                  get=_connection_get, set=_connection_set)
     construction_file: StringProperty(name="constructionInfo",
                                       subtype='FILE_PATH', default="")
     placed: CollectionProperty(type=RMVB_PG_PlacedConnection)
@@ -895,101 +917,168 @@ class RMVB_PG_props(PropertyGroup):
                     "vi tri implant",
         default=False)
 
-    # 6.1 Bar Pillar
+    # Bar Pillar
     pillars: CollectionProperty(type=RMVB_PG_PartRef)
     pillar_lift: FloatProperty(
-        name="Vùng 2 cao lên (mm)",
-        description="Extrude vung ho ket noi thang len theo local Z (mac dinh 7 li)",
-        default=7.0, min=0.0, unit='LENGTH')
-    pillar_equalize: BoolProperty(
-        name="Vùng 1 cao bằng Vùng 2 (local)",
-        description="Extrude vung lo oc len den cung do cao Z local nhu vung "
-                    "ket noi",
-        default=True)
+        name="Extrude lên (mm)",
+        description="Extrude vung ho ket noi (day Base) thang len theo local Z "
+                    "(mac dinh 7 li)",
+        default=7.0, min=0.1, unit='LENGTH')
 
-    # 6.2 Bar Segment
+    # Bar Segment + Top Bar
     bar_line: PointerProperty(name="Bar Line", type=bpy.types.Object)
+    bar_arrow: PointerProperty(name="Mũi tên hướng lắp", type=bpy.types.Object)
     bar_segment: PointerProperty(name="Bar Segment", type=bpy.types.Object)
+    bar_backup: PointerProperty(name="Bar Segment Backup", type=bpy.types.Object)
     bar_width: FloatProperty(name="Bề rộng bar (mm)", default=4.0, min=0.1,
-                             unit='LENGTH')
+                             unit='LENGTH', update=_bar_param_update)
     bar_height: FloatProperty(name="Chiều cao bar (mm)", default=3.0, min=0.1,
-                              unit='LENGTH')
-    bar_clearance: FloatProperty(name="Khe hở với Gingiva (mm)", default=0.0,
-                                 unit='LENGTH')
+                              unit='LENGTH', update=_bar_param_update)
+    top_plane: PointerProperty(name="PlaneVisual", type=bpy.types.Object)
+    top_cutter: PointerProperty(name="PlaneCubeCut", type=bpy.types.Object)
 
-    # 6.3 Top Bar Plane
-    top_plane: PointerProperty(name="Top Bar Plane", type=bpy.types.Object)
-    top_cutter: PointerProperty(name="Top Bar Block", type=bpy.types.Object)
-    cutter_height: FloatProperty(name="Chiều cao khối cắt (mm)", default=20.0,
-                                 min=0.1, unit='LENGTH')
-    cutter_size: FloatProperty(name="Kích thước khối cắt (mm)", default=120.0,
-                               min=1.0, unit='LENGTH')
-    cut_mode: EnumProperty(
-        name="Kiểu cắt",
-        description="DIFFERENCE: phan bar nam trong khoi bi cat bo. "
-                    "INTERSECT: giu lai phan nam trong khoi",
-        items=[('DIFFERENCE', "Cut bỏ phần trong khối", ""),
-               ('INTERSECT', "Giữ phần trong khối", "")],
-        default='DIFFERENCE')
-    connection_cut_extend: FloatProperty(
-        name="Chỗi Connection (mm)",
-        description="Extrude 2 vung ho cua Connection ra 2 huong nguoc nhau "
-                    "mot khoang nay roi nap kin 2 dau, tao lang tru dao mat de "
-                    "cat xuyen hoan toan Bar Segment",
-        default=10.0, min=0.1, unit='LENGTH')
-
-    # 6.4 Attachment
+    # Attachment
     attachment_index: IntProperty(name="Attachment Index", default=0, min=0)
     active_attachment: StringProperty(name="Attachment", default="")
-    attachment_name: EnumProperty(name="Select Attachment",
-                                  items=enum_attachment,
-                                  get=_attachment_get, set=_attachment_set)
-    attachments: CollectionProperty(type=RMVB_PG_AttachmentRef)
-    group_axis: BoolProperty(
-        name="Group Axis Attachment",
-        description="Gom cac Attachment da dat duoi mot Empty truc chung de "
-                    "di chuyen / xoay cung luc",
-        default=False)
-    group_axis_topbar: BoolProperty(
-        name="Group Axis với Top Bar",
-        description="Attachment xoay theo Top Bar Plane va tam cua no luon "
-                    "nam tren mat phang (chi khoa translate doc theo Z cua "
-                    "Plane, X/Y tu do)",
-        default=False)
-    apply_attachment_bar: BoolProperty(
-        name="Apply attachment on Bar",
-        description="Ket hop cac Attachment da dat vao khoi Bar khi Cut Top "
-                    "Bar: toggle Add/Remove on Bar = UNION (them) hoac "
-                    "DIFFERENCE (khoet lo)",
-        default=True)
+    groups: CollectionProperty(type=RMVB_PG_AttachmentGroup)
+    group_index: IntProperty(name="Group Index", default=0, min=0,
+                             update=_group_index_update)
 
-    # 7 Sleeve Design
+    # Sleeve Design
     sleeve_offset: FloatProperty(name="Offset bar (mm)", default=0.1, min=0.0,
                                  unit='LENGTH')
     sleeve_thickness: FloatProperty(name="Sleeve thickness (mm)", default=0.5,
                                     min=0.01, unit='LENGTH')
     apply_attachment_sleeve: BoolProperty(
         name="Apply attachment on Sleeve",
-        description="Cong don cac Attachment (toggle Add/Remove on Sleeve) vao "
-                    "khoi Sleeve",
+        description="Cong don cac Attachment (toggle Add/Remove on Sleeve cua "
+                    "Dental-Lib: Add = Union, Remove = Difference) vao khoi Sleeve",
         default=True)
     sleeve_object: PointerProperty(name="Sleeve", type=bpy.types.Object)
 
-    # 8 Save
-    save_dir: StringProperty(name="Thư mục lưu", subtype='DIR_PATH', default="")
+    # Save
+    save_dir: StringProperty(
+        name="Thư mục lưu", subtype='DIR_PATH', default="",
+        description="De trong = thu muc chua file .blend hien tai",
+        get=_save_dir_get, set=_save_dir_set)
 
 
 # ---------------------------------------------------------------------------
-# 1-3. Import Gingiva / Denture-reference / Antagonist (STL, PLY)
+# Chuan bi mesh: loop bien, fill, extrude
 # ---------------------------------------------------------------------------
+def unique_loop_verts(loop):
+    """Dinh cua vong bien theo thu tu, khong lap diem dau o cuoi."""
+    verts = list(loop["verts"])
+    if len(verts) > 1 and verts[0] is verts[-1]:
+        verts = verts[:-1]
+    return verts
+
+
+def loop_perimeter(loop):
+    return sum(edge.calc_length() for edge in loop["edges"])
+
+
+def cap_loop(bm, loop):
+    """Nap kin mot vong bien bang mat n-gon (fallback: holes_fill / triangle_fill)."""
+    verts = unique_loop_verts(loop)
+    if len(verts) >= 3:
+        try:
+            bm.faces.new(verts)
+            return True
+        except ValueError:
+            pass
+    edges = [e for e in loop["edges"] if e.is_valid and e.is_boundary]
+    if not edges:
+        return True
+    try:
+        bmesh.ops.holes_fill(bm, edges=edges, sides=len(edges) + 2)
+    except Exception:
+        pass
+    edges = [e for e in edges if e.is_valid and e.is_boundary]
+    if edges:
+        try:
+            bmesh.ops.triangle_fill(bm, use_beauty=True, edges=edges)
+        except Exception:
+            pass
+    return not any(e.is_valid and e.is_boundary for e in loop["edges"])
+
+
+def _extrude_loop(bm, loop):
+    """Extrude vong bien ra them 1 vong dinh moi, tra ve list BMVert moi."""
+    result = bmesh.ops.extrude_edge_only(bm, edges=loop["edges"])
+    return [g for g in result['geom'] if isinstance(g, bmesh.types.BMVert)]
+
+
+def _loops_within(bm, verts):
+    """Cac vong bien nam hoan toan tren tap dinh `verts`."""
+    keep = set(verts)
+    return [lp for lp in boundary_loops(bm)
+            if all(v in keep for v in lp["verts"])]
+
+
+def outward_solid(bm):
+    """Normal huong ra ngoai; neu the tich am thi dao lai. Tra ve the tich."""
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    volume = 0.0
+    try:
+        volume = bm.calc_volume(signed=True)
+        if volume < 0:
+            bmesh.ops.reverse_faces(bm, faces=bm.faces)
+            volume = -volume
+    except Exception:
+        pass
+    return volume
+
+
+def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
+    """Bien mesh Gingiva thanh KHOI kin:
+
+    1. Cac vung ho nho (mat tren): fill de khong bi lung.
+    2. Vong ho lon nhat (mat duoi): extrude `depth` mm theo local Z ra phia mo,
+       roi fill de tao de -> toan bo Gingiva thanh khoi.
+    """
+    info = {"loops": 0, "filled": 0, "extruded": False, "closed": False,
+            "direction": 0}
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    loops = boundary_loops(bm)
+    info["loops"] = len(loops)
+    if loops:
+        base = max(loops, key=loop_perimeter)
+        for loop in loops:
+            if loop is base:
+                continue
+            if cap_loop(bm, loop):
+                info["filled"] += 1
+        rim_verts = unique_loop_verts(base)
+        rim_center = sum((v.co for v in rim_verts), Vector()) / max(1, len(rim_verts))
+        body = sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts))
+        # Than mesh nam phia tren vanh -> mat mo quay xuong -> extrude -Z local
+        sign = -1.0 if body.z >= rim_center.z else 1.0
+        scale_z = (obj.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))).length or 1.0
+        new_verts = _extrude_loop(bm, base)
+        for vert in new_verts:
+            vert.co.z += sign * depth / scale_z
+        for loop in _loops_within(bm, new_verts):
+            cap_loop(bm, loop)
+        info["extruded"] = True
+        info["direction"] = int(sign)
+        outward_solid(bm)
+        bm.to_mesh(obj.data)
+        obj.data.update()
+    info["closed"] = not any(e.is_boundary for e in bm.edges)
+    bm.free()
+    return info
+
+
 ROLE_COLOR = {
-    'GINGIVA': (0.90, 0.45, 0.50, 0.65),
-    'DENTURE': (0.35, 0.62, 0.90, 1.00),
-    'ANTAGONIST': (0.55, 0.55, 0.55, 1.00),
+    'GINGIVA': (1.0, 0.55, 0.70, 0.5),      # hong, opacity 0.5
+    'DENTURE': (0.25, 0.80, 0.35, 0.5),     # xanh la, opacity 0.5
+    'ANTAGONIST': (0.55, 0.33, 0.15, 1.0),  # nau, opacity 1
 }
 ROLE_OBJECT_NAME = {
     'GINGIVA': "Gingiva",
-    'DENTURE': "Denture_Reference",
+    'DENTURE': "Denture",
     'ANTAGONIST': "Antagonist",
 }
 ROLE_PROPERTY = {
@@ -999,72 +1088,77 @@ ROLE_PROPERTY = {
 }
 
 
-class RMVB_OT_import_mesh(Operator, ImportHelper):
-    """Import file STL/PLY va gan vao dung vai tro trong thiet ke"""
-    bl_idname = "rmvb.import_mesh"
-    bl_label = "Import STL/PLY"
-    bl_options = {'REGISTER', 'UNDO'}
+def pick_mesh_object(context):
+    """Object mesh dang chon (uu tien active)."""
+    active = context.active_object
+    if active is not None and active.type == 'MESH' and active.select_get():
+        return active
+    for obj in context.selected_objects:
+        if obj.type == 'MESH':
+            return obj
+    if active is not None and active.type == 'MESH':
+        return active
+    return None
 
-    filepath: StringProperty(subtype='FILE_PATH', default="")
-    files: CollectionProperty(type=bpy.types.OperatorFileListElement)
-    directory: StringProperty(subtype='DIR_PATH', default="")
-    filter_glob: StringProperty(default="*.stl;*.ply;*.STL;*.PLY",
-                                options={'HIDDEN'})
+
+class RMVB_OT_set_role(Operator):
+    """Gan object mesh dang chon vao vai tro Gingiva / Denture / Antagonist
+    (doi mau hien thi; Gingiva con duoc chuan bi thanh khoi kin)"""
+    bl_idname = "rmvb.set_role"
+    bl_label = "Set"
+    bl_options = {'REGISTER', 'UNDO'}
 
     role: EnumProperty(
         name="Role",
         items=[('GINGIVA', "Gingiva", ""),
-               ('DENTURE', "Denture-reference", ""),
+               ('DENTURE', "Denture", ""),
                ('ANTAGONIST', "Antagonist", "")],
         default='GINGIVA')
 
     def execute(self, context):
         props = context.scene.rmvb
-        paths = []
-        for item in self.files:
-            full = os.path.join(self.directory, item.name) if self.directory else item.name
-            if os.path.exists(full):
-                paths.append(full)
-        single = bpy.path.abspath(self.filepath)
-        if not paths and single and os.path.exists(single):
-            paths.append(single)
-        if not paths:
-            self.report({'ERROR'}, "Chon file STL/PLY truoc")
+        obj = pick_mesh_object(context)
+        if obj is None:
+            self.report({'ERROR'}, "Chon mot object mesh trong scene truoc")
             return {'CANCELLED'}
+        for role, field in ROLE_PROPERTY.items():
+            if role != self.role and getattr(props, field) == obj:
+                self.report({'ERROR'}, "'%s' dang la %s" % (obj.name, role.title()))
+                return {'CANCELLED'}
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-        coll = ensure_collection(COL_IMPORT)
-        created = []
-        for path in paths:
-            try:
-                mesh = mesh_from_file(path)
-            except Exception as exc:
-                self.report({'WARNING'}, "Bo qua %s: %s"
-                            % (os.path.basename(path), exc))
-                continue
-            obj = bpy.data.objects.new(
-                ROLE_OBJECT_NAME[self.role] if len(paths) == 1
-                else os.path.splitext(os.path.basename(path))[0],
-                mesh.copy())
-            coll.objects.link(obj)
-            created.append(obj)
-        if not created:
-            self.report({'ERROR'}, "Khong import duoc file nao")
-            return {'CANCELLED'}
-
-        if len(created) > 1:
-            obj = join_objects(created, ROLE_OBJECT_NAME[self.role], coll)
-        else:
-            obj = created[0]
-            obj.name = ROLE_OBJECT_NAME[self.role]
-        set_color(obj, ROLE_COLOR[self.role])
+        message = ""
+        if self.role == 'GINGIVA':
+            if obj.get("rmvb_gingiva_ready"):
+                message = " (da la khoi kin tu truoc)"
+            else:
+                if obj.data.users > 1:
+                    obj.data = obj.data.copy()      # khong sua mesh dung chung
+                try:
+                    info = prepare_gingiva(obj)
+                except Exception as exc:
+                    self.report({'ERROR'}, "Khong chuan bi duoc Gingiva: %s" % exc)
+                    return {'CANCELLED'}
+                obj["rmvb_gingiva_ready"] = True
+                message = " (fill %d lo mat tren, extrude de %s%g mm, %s)" % (
+                    info["filled"], "-" if info["direction"] < 0 else "+",
+                    GINGIVA_BASE_DEPTH,
+                    "khoi kin" if info["closed"] else "CHUA kin")
+                if not info["closed"]:
+                    self.report({'WARNING'},
+                                "Gingiva van con ho - Boolean co the khong on dinh")
+        obj.name = ROLE_OBJECT_NAME[self.role]
+        obj["rmvb_role"] = self.role
+        set_display_color(obj, ROLE_COLOR[self.role])
         setattr(props, ROLE_PROPERTY[self.role], obj)
         activate(context, obj)
-        self.report({'INFO'}, "Da import %d file -> %s" % (len(paths), obj.name))
+        self.report({'INFO'}, "Set %s: %s%s" % (self.role.title(), obj.name, message))
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-# 5. Place Connection - doc .constructionInfo va dat theo toa do XML
+# Place Connection - doc .constructionInfo va dat theo toa do XML
 # ---------------------------------------------------------------------------
 def clear_placed_connections(context, remove_pillars=False):
     props = context.scene.rmvb
@@ -1087,6 +1181,47 @@ def current_connection_name(props):
     if names:
         return names[min(props.connection_index, len(names) - 1)]
     return ""
+
+
+def prepare_connection_mesh(source):
+    """Chuan bi Base de dung lam khoi Boolean (mesh moi, khong sua `source`):
+
+    1. Base ho day (Connection): extrude -2 mm theo local Z, scale local x2.
+    2. Base ho dinh (Screw): extrude +30 mm theo local Z.
+    3. Nap kin 2 dau + Flip Normal (normal huong ra ngoai) de thanh solid.
+    Vong ho day GOC duoc luu trong mesh["rmvb_ring"] (x,y,z... local) de tao Pillar.
+    """
+    mesh = source.copy()
+    mesh.name = "Rmvb_ConnBase"
+    info = {"loops": 0, "closed": False}
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    loops = boundary_loops(bm)
+    info["loops"] = len(loops)
+    if loops:
+        ordered = sorted(loops, key=lambda item: item["z"])
+        bottom = ordered[0]
+        top = ordered[-1] if len(ordered) > 1 else None
+        ring = unique_loop_verts(bottom)
+        center = sum((v.co for v in ring), Vector()) / len(ring)
+        mesh["rmvb_ring"] = [c for v in ring for c in (v.co.x, v.co.y, v.co.z)]
+
+        new_bottom = _extrude_loop(bm, bottom)
+        new_top = _extrude_loop(bm, top) if top is not None else []
+        for vert in new_bottom:
+            vert.co.x = center.x + (vert.co.x - center.x) * CONN_BOTTOM_SCALE
+            vert.co.y = center.y + (vert.co.y - center.y) * CONN_BOTTOM_SCALE
+            vert.co.z -= CONN_BOTTOM_EXTRUDE
+        for vert in new_top:
+            vert.co.z += CONN_TOP_EXTRUDE
+        for loop in _loops_within(bm, new_bottom + new_top):
+            cap_loop(bm, loop)
+        outward_solid(bm)
+    info["closed"] = not any(e.is_boundary for e in bm.edges)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    return mesh, info
 
 
 class RMVB_OT_place_connection(Operator, ImportHelper):
@@ -1128,7 +1263,7 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
-            base_mesh = mesh_from_file(base_path)
+            base_mesh, base_info = prepare_connection_mesh(mesh_from_file(base_path))
         except Exception as exc:
             self.report({'ERROR'}, "Loi doc mesh Base: %s" % exc)
             return {'CANCELLED'}
@@ -1167,174 +1302,100 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
 
         props.construction_file = path
         props.connection_name = lib_name
-        self.report({'INFO'}, "Da dat %d Connection (%s) tu %s"
-                    % (len(implants), lib_name, os.path.basename(path)))
+        rebuild_segment_modifiers(context)
+        if base_info["loops"] != 2:
+            self.report({'WARNING'}, "Base co %d vung ho (can 2: day + dinh)"
+                        % base_info["loops"])
+        self.report({'INFO'}, "Da dat %d Connection (%s) tu %s%s"
+                    % (len(implants), lib_name, os.path.basename(path),
+                       "" if base_info["closed"] else " (Base chua kin)"))
+        return {'FINISHED'}
+
+
+class RMVB_OT_clear_connection(Operator):
+    """Xoa cac Connection da dat (va Bar Pillar) de chon lai constructionInfo"""
+    bl_idname = "rmvb.clear_connection"
+    bl_label = "Clear Connection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        if not props.placed and not props.pillars:
+            self.report({'INFO'}, "Chua co Connection nao")
+            return {'CANCELLED'}
+        clear_placed_connections(context, remove_pillars=True)
+        props.construction_file = ""
+        rebuild_segment_modifiers(context)
+        purge_unused_meshes()
+        self.report({'INFO'}, "Da xoa Connection va Bar Pillar - chon lai "
+                    "constructionInfo roi bam Place Connection")
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-# 6.1 Bar Pillar
+# Bar Pillar
 # ---------------------------------------------------------------------------
-def extrude_loop_to(bm, loop, target_z):
-    """Extrude vong bien thang len theo local Z den do cao target_z."""
-    old_count = len(bm.verts)
-    rim = list(loop["verts"])
-    result = bmesh.ops.extrude_edge_only(bm, edges=loop["edges"])
-    new_verts = [g for g in result['geom']
-                 if isinstance(g, bmesh.types.BMVert) and g.index >= old_count]
-    for vert in new_verts:
-        vert.co.z = target_z
-    new_faces = [g for g in result['geom'] if isinstance(g, bmesh.types.BMFace)]
-    return new_verts, new_faces, rim
-
-
-def bridge_extruded_rims(bm, new_verts):
-    """Noi cac mieng extrude lai thanh mat kin.
-
-    Sau khi extrude 2 vung ho len theo local Z, chi con lai 2 vong bien o
-    dinh. bridge_loops tao mat phang noi 2 vong do -> toan bo mesh thanh
-    solid kin (manifold), khong can nap day.
-    """
-    keep = set(new_verts)
-    rims = [e for e in bm.edges
-            if e.is_boundary and all(v in keep for v in e.verts)]
-    if len(rims) < 2:
-        return False
-    try:
-        bmesh.ops.bridge_loops(bm, edges=rims)
-    except Exception:
-        try:
-            bmesh.ops.edgenet_fill(bm, edges=rims)
-        except Exception:
-            return False
-    left = [e for e in bm.edges if e.is_boundary and all(v in keep for v in e.verts)]
-    if left:
-        try:
-            bmesh.ops.holes_fill(bm, edges=left)
-        except Exception:
-            pass
-    return not [e for e in bm.edges if e.is_boundary]
-
-
-def _co_key(co, digits=3):
-    """Key toa do (lam tron 1e-3 mm) dung de dinh danh vert sau khi weld."""
-    return (round(co[0], digits), round(co[1], digits), round(co[2], digits))
-
-
-def _vert_snapshot(verts, digits=3):
-    """Key toa do cua mot nhom vert.
-
-    Dung key so voi giu handle BMVert: remove_doubles/bridge co the lam mat
-    wrapper (ReferenceError) va dao so lai index toan bo bmesh.
-    """
-    try:
-        return [_co_key(v.co, digits) for v in verts]
-    except (ValueError, ReferenceError):
-        return []
-
-
-def _verts_by_snapshot(bm, keys, digits=3):
-    """Index cac vert trong bm co toa do trung voi mot trong cac key da snapshot."""
-    wanted = set(keys)
-    if not wanted:
-        return []
-    bm.verts.ensure_lookup_table()
-    return [v.index for v in bm.verts if _co_key(v.co, digits) in wanted]
-
-
-def _same_xy_footprint(loop_a, loop_b, digits=3):
-    """Hai vong bien co cung mat cat bang (x, y) -> extrude ca hai se trung nhau."""
-    key_a = {_co_key(v.co, digits)[:2] for v in loop_a["verts"]}
-    key_b = {_co_key(v.co, digits)[:2] for v in loop_b["verts"]}
-    if not key_a or not key_b:
-        return False
-    return len(key_a & key_b) >= 0.8 * min(len(key_a), len(key_b))
-
-
-def build_pillar_mesh(base_obj, lift, equalize):
-    """Tao mesh Bar Pillar tu mesh Connection Base - KIN (solid manifold).
-
-    Vung ho duoi (ket noi) extrude len `lift` mm, vung ho tren (lo oc) extrude
-    len toi cung do cao (neu equalize) hoac cung `lift` mm; hai mieng extrude
-    sau do duoc NOI lai thanh mot solid kin.
-
-    Vertex group `Outside`/`Screw` CHI chua cac dinh nam o dinh mui extrude
-    (khong gom vong mieng lo ban dau) -> Select Outside / Select Screws chon
-    dung pham vi can sua.
-    """
-    mesh = base_obj.data.copy()
-    mesh.name = base_obj.name + ".pillar"
+def connection_ring(base_obj):
+    """Vong ho day (Connection) goc cua Base: list Vector theo toa do local."""
+    stored = base_obj.data.get("rmvb_ring")
+    if stored:
+        flat = list(stored)
+        return [Vector(flat[i:i + 3]) for i in range(0, len(flat) - 2, 3)]
+    # Base chua duoc chuan bi (scene cu): lay vong ho thap nhat cua mesh
     bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bm.verts.ensure_lookup_table()
+    bm.from_mesh(base_obj.data)
     loops = boundary_loops(bm)
-    info = {"loops": len(loops), "skipped": [], "closed": False, "volume": 0.0}
-    if not loops:
-        bm.free()
-        return mesh, info
+    ring = []
+    if loops:
+        lowest = min(loops, key=lambda item: item["z"])
+        ring = [v.co.copy() for v in unique_loop_verts(lowest)]
+    bm.free()
+    return ring
 
-    ordered = sorted(loops, key=lambda item: item["z"])
-    lower = ordered[0]                                   # vung 2: ho ket noi
-    upper = ordered[-1] if len(ordered) > 1 else None    # vung 1: lo oc
-    for extra in ordered[1:-1]:
-        info["skipped"].append(round(extra["z"], 3))
 
-    top_z = lower["z"] + lift
-    same_ring = upper is not None and _same_xy_footprint(lower, upper)
-    if same_ring:
-        # Hai vung ho nam tren cung mot truc va trung mat cat XY: extrude ca hai
-        # se tao hai thanh vo trung khit nhau -> "pinched verts" gay crash natve
-        # cua solver Manifold tren Blender 4.5. Chi extrude mot mieng.
-        top_z = max(top_z, upper["z"] + lift)
-        info["degenerate"] = True
-    new_out, _faces_out, _rim_out = extrude_loop_to(bm, lower, top_z)
-    info["outside_top"] = top_z
-    screw_verts = []
-    new_all = list(new_out)
-    if upper is not None and not same_ring:
-        target = top_z if equalize else upper["z"] + lift
-        new_sc, _faces_sc, _rim_sc = extrude_loop_to(bm, upper, target)
-        screw_verts = list(new_sc)      # chi dinh o DINH mui extrude, bo mieng lo
-        new_all += new_sc
-        info["screw_top"] = target
-    elif same_ring:
-        info["screw_top"] = top_z
-        screw_verts = list(new_out)
-    else:
-        info["screw_top"] = None
+def build_pillar_mesh(base_obj, lift):
+    """Bar Pillar = sao chep cac diem vung ho day (Connection) cua Base, extrude len
+    `lift` mm theo local Z, fill kin ca day lan dinh -> solid manifold.
 
-    pillar_verts = list(new_out)        # chi dinh o DINH mui extrude, bo mieng lo
-    pillar_snap = _vert_snapshot(pillar_verts)
-    screw_snap = _vert_snapshot(screw_verts)
-    info["closed"] = bridge_extruded_rims(bm, new_all)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-7)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    try:
-        volume = bm.calc_volume(signed=True)
-        if volume < 0:
-            bmesh.ops.reverse_faces(bm, faces=bm.faces)
-            volume = -volume
-        info["volume"] = volume
-    except Exception:
-        pass
-    info["closed"] = info["closed"] and not any(e.is_boundary for e in bm.edges)
-    bm.verts.ensure_lookup_table()
-    pillar_index = _verts_by_snapshot(bm, pillar_snap)
-    screw_index = _verts_by_snapshot(bm, screw_snap)
-    if not pillar_index and not screw_index:   # bo de cu theo chieu cao
-        pillar_index = [v.index for v in bm.verts if v.co.z >= top_z - TOP_EPS]
+    Tra ve (mesh, info). info["top_z"] = cao do dinh mui extrude (local).
+    """
+    ring = connection_ring(base_obj)
+    info = {"closed": False, "top_z": None, "volume": 0.0, "points": len(ring)}
+    if len(ring) < 3:
+        return None, info
+    bm = bmesh.new()
+    bottom = [bm.verts.new(co) for co in ring]
+    top = [bm.verts.new((co.x, co.y, co.z + lift)) for co in ring]
+    count = len(ring)
+    for i in range(count):
+        j = (i + 1) % count
+        try:
+            bm.faces.new((bottom[i], bottom[j], top[j], top[i]))
+        except ValueError:
+            pass
+    for cap in (bottom, top):
+        try:
+            bm.faces.new(cap)
+        except ValueError:
+            pass
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+    info["volume"] = outward_solid(bm)
+    info["closed"] = not any(e.is_boundary for e in bm.edges)
+    info["top_z"] = max(co.z for co in ring) + lift
+    mesh = bpy.data.meshes.new("%s.pillar" % base_obj.name)
     bm.to_mesh(mesh)
     bm.free()
-
-    info[VG_OUTSIDE] = pillar_index
-    info[VG_SCREW] = screw_index
     mesh.validate()
     mesh.update()
     return mesh, info
 
 
 class RMVB_OT_create_bar_pillar(Operator):
-    """Tao Bar Pillar tu cac Connection Base: extrude 2 vung ho thang len local Z"""
+    """Tao Bar Pillar: sao chep vung ho day (Connection) cua tung Base, extrude len
+    theo local Z va fill kin"""
     bl_idname = "rmvb.create_bar_pillar"
     bl_label = "Create Bar Pillar"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1351,142 +1412,41 @@ class RMVB_OT_create_bar_pillar(Operator):
 
         made = 0
         notes = []
-        all_closed = True
         for item in props.placed:
             base = item.base_object
             if base is None or base.type != 'MESH':
                 continue
             try:
-                mesh, info = build_pillar_mesh(base, props.pillar_lift,
-                                               props.pillar_equalize)
+                mesh, info = build_pillar_mesh(base, props.pillar_lift)
             except Exception as exc:
                 self.report({'WARNING'}, "Rang %s: %s" % (item.tooth, exc))
+                continue
+            if mesh is None:
+                notes.append("rang %s khong co vung ho day" % item.tooth)
                 continue
             obj = bpy.data.objects.new("BarPillar_%s" % item.tooth, mesh)
             coll.objects.link(obj)
             obj.matrix_world = base.matrix_world.copy()
-            for group in (VG_OUTSIDE, VG_SCREW):
-                if obj.vertex_groups.get(group) is None:
-                    obj.vertex_groups.new(name=group)
-                indices = info.get(group) or []
-                if indices:
-                    obj.vertex_groups[group].add(indices, 1.0, 'REPLACE')
-            for group, key in ((VG_OUTSIDE, "outside_top"), (VG_SCREW, "screw_top")):
-                top_z = info.get(key)
-                if top_z is not None:
-                    obj["rmvb_top_" + group] = float(top_z)
-            set_color(obj, (0.85, 0.65, 0.25, 1.0))
             obj["rmvb_role"] = "PILLAR"
             obj["rmvb_tooth"] = item.tooth
-            if info.get("degenerate"):
-                obj["rmvb_degenerate"] = True
+            obj["rmvb_top_z"] = float(info["top_z"])
+            set_color(obj, (0.85, 0.65, 0.25, 1.0))
             ref = props.pillars.add()
             ref.object = obj
             ref.tooth = item.tooth
             made += 1
-            if not info.get("closed"):
-                all_closed = False
-                notes.append("rang %s pillar khong kin" % item.tooth)
-            if info.get("degenerate"):
-                notes.append("rang %s 2 vung ho trung nhau (chi extrude 1 mieng)"
-                             % item.tooth)
-            if info.get("loops", 0) != 2:
-                notes.append("rang %s co %d vung ho" % (item.tooth, info["loops"]))
+            if not info["closed"]:
+                notes.append("rang %s pillar chua kin" % item.tooth)
         if not made:
             self.report({'ERROR'}, "Khong tao duoc Bar Pillar nao")
             return {'CANCELLED'}
-        message = "Da tao %d Bar Pillar (vung 2 cao %g mm, solid kin)" % (
-            made, props.pillar_lift)
-        if not all_closed:
-            message = "Da tao %d Bar Pillar (vung 2 cao %g mm, CHUA kin)" % (
-                made, props.pillar_lift)
+        rebuild_segment_modifiers(context)
+        purge_unused_meshes()
         if notes:
-            self.report({'WARNING'},
-                        "Khong dung 2 vung ho: " + "; ".join(notes))
-        self.report({'INFO'}, message)
+            self.report({'WARNING'}, "; ".join(notes))
+        self.report({'INFO'}, "Da tao %d Bar Pillar (extrude len %g mm, solid kin)"
+                    % (made, props.pillar_lift))
         return {'FINISHED'}
-
-
-def _filter_top_verts(obj, group_name, verts, eps=TOP_EPS):
-    """Loc cac dinh nam o DINH mui extrude cua vertex group.
-
-    Thu tu uu tien:
-      1. Group chi co 1 muc z (pillar tao bang ban moi) -> giu nguyen va ghi
-         lai cao do dinh vao `obj["rmvb_top_<group>"]` de lan sau dung.
-      2. Co cao do dinh da luu tren object -> loc theo cao do do (dung ca khi
-         group cua pillar cu van con ghi ca vong mieng lo).
-      3. Pillar cu khong co metadata va group nhieu muc z -> giu toan bo de
-         tranh chon sai (tao lai Bar Pillar se dung hoan toan).
-    """
-    if len(verts) < 2:
-        return list(verts)
-    zs = [v.co.z for v in verts]
-    key = "rmvb_top_" + group_name
-    if max(zs) - min(zs) <= eps:
-        obj[key] = sum(zs) / len(zs)
-        return list(verts)
-    top_z = obj.get(key)
-    if isinstance(top_z, (int, float)):
-        keep = [v for v, z in zip(verts, zs) if abs(z - top_z) <= eps]
-        if keep:
-            return keep
-    return list(verts)
-
-
-def select_vertex_group(context, group_name, top_only=True):
-    """Chon dinh thuoc vertex group (Edit Mode hoac Object Mode).
-
-    top_only=True -> chi chon cac dinh o dinh mui extrude (xem
-    _filter_top_verts), khong chon theo ca vong mieng lo ban dau.
-    """
-    targets = [ob for ob in context.selected_objects
-               if ob.type == 'MESH' and ob.vertex_groups.get(group_name)]
-    if not targets:
-        active = context.active_object
-        if active is not None and active.type == 'MESH':
-            targets = [active]
-    if not targets:
-        return -1
-    count = 0
-    if context.mode == 'EDIT_MESH':
-        for obj in targets:
-            group = obj.vertex_groups.get(group_name)
-            if group is None:
-                continue
-            try:
-                bm = bmesh.from_edit_mesh(obj.data)
-            except Exception:
-                continue
-            deform = bm.verts.layers.deform.verify()
-            members = [v for v in bm.verts
-                       if v[deform].get(group.index, 0.0) > 0.5]
-            keep = set(_filter_top_verts(obj, group_name, members)
-                       if top_only else members)
-            for vert in bm.verts:
-                state = vert in keep
-                if vert.select != state:
-                    vert.select_set(state)
-                if state:
-                    count += 1
-            bmesh.update_edit_mesh(obj.data, destructive=False)
-    else:
-        for obj in targets:
-            group = obj.vertex_groups.get(group_name)
-            if group is None:
-                continue
-            bpy.ops.object.select_all(action='DESELECT')
-            activate(context, obj)
-            members = [v for v in obj.data.vertices
-                       if any(g.group == group.index and g.weight > 0.5
-                              for g in v.groups)]
-            keep = {v.index for v in (_filter_top_verts(obj, group_name, members)
-                                      if top_only else members)}
-            for vert in obj.data.vertices:
-                vert.select = vert.index in keep
-                if vert.select:
-                    count += 1
-            obj.data.update()
-    return count
 
 
 class RMVB_OT_edit_bar_pillar(Operator):
@@ -1495,56 +1455,62 @@ class RMVB_OT_edit_bar_pillar(Operator):
     bl_label = "Edit Bar Pillar"
 
     def execute(self, context):
-        props = context.scene.rmvb
-        pillars = [r.object for r in props.pillars if r.object is not None]
+        pillars = _enter_pillar_edit(context)
         if not pillars:
             self.report({'ERROR'}, "Chua co Bar Pillar. Bam Create Bar Pillar truoc")
             return {'CANCELLED'}
-        if context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in pillars:
-            obj.hide_set(False)
-            obj.select_set(True)
-        context.view_layer.objects.active = pillars[0]
-        bpy.ops.object.mode_set(mode='EDIT')
-        use_local_orientation(context)
         self.report({'INFO'}, "Edit Bar Pillar - Transform Orientation: Local")
         return {'FINISHED'}
 
 
-class RMVB_OT_select_pillar_region(Operator):
-    """Chon DINH DA EXTRUDE cua vung ho tren (Screw) hoac ho duoi (Outside)"""
-    bl_idname = "rmvb.select_pillar_region"
-    bl_label = "Select Pillar Region"
+def _enter_pillar_edit(context):
+    props = context.scene.rmvb
+    pillars = [r.object for r in props.pillars
+               if r.object is not None and r.object.name in bpy.data.objects]
+    if not pillars:
+        return []
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in pillars:
+        obj.hide_set(False)
+        obj.select_set(True)
+    context.view_layer.objects.active = pillars[0]
+    bpy.ops.object.mode_set(mode='EDIT')
+    use_local_orientation(context)
+    return pillars
 
-    region: EnumProperty(
-        name="Region",
-        items=[('SCREWS', "Select Screws",
-                "Chi cac dinh da extrude cua lo oc (dinh mui tren)"),
-               ('OUTSIDE', "Select Outside",
-                "Chi cac dinh da extrude cua ho ket noi (dinh mui duoi)")],
-        default='SCREWS')
 
-    all_levels: BoolProperty(
-        name="All Levels",
-        description="Chon ca vong mieng lo ban dau, khong loc rieng dinh extrude",
-        default=False)
+class RMVB_OT_select_pillar_top(Operator):
+    """Vao Edit Mode va CHI chon phan dinh da extrude cua Bar Pillar"""
+    bl_idname = "rmvb.select_pillar_top"
+    bl_label = "Select Top"
 
     def execute(self, context):
-        group = VG_SCREW if self.region == 'SCREWS' else VG_OUTSIDE
-        found = select_vertex_group(context, group, top_only=not self.all_levels)
-        if found < 0:
-            self.report({'ERROR'},
-                        "Khong tim thay vung '%s'. Vao Edit Bar Pillar truoc." % group)
+        pillars = _enter_pillar_edit(context)
+        if not pillars:
+            self.report({'ERROR'}, "Chua co Bar Pillar. Bam Create Bar Pillar truoc")
             return {'CANCELLED'}
-        if not found:
-            self.report({'WARNING'},
-                        "Vung '%s' khong con dinh nao o dinh extrude "
-                        "(bam All Levels de chon ca mieng lo)" % group)
-            return {'CANCELLED'}
-        self.report({'INFO'}, "Da chon %d dinh da extrude thuoc vung %s" % (
-            found, group))
+        try:
+            context.tool_settings.mesh_select_mode = (True, False, False)
+        except Exception:
+            pass
+        total = 0
+        for obj in pillars:
+            bm = bmesh.from_edit_mesh(obj.data)
+            for elem in list(bm.verts) + list(bm.edges) + list(bm.faces):
+                elem.select_set(False)
+            top_z = obj.get("rmvb_top_z")
+            if not isinstance(top_z, (int, float)):
+                top_z = max(v.co.z for v in bm.verts)
+            for vert in bm.verts:
+                if vert.co.z >= top_z - TOP_EPS:
+                    vert.select_set(True)
+                    total += 1
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(obj.data, destructive=False)
+        self.report({'INFO'}, "Da chon %d dinh o dinh mui extrude cua %d Bar Pillar"
+                    % (total, len(pillars)))
         return {'FINISHED'}
 
 
@@ -1561,99 +1527,124 @@ class RMVB_OT_exit_edit(Operator):
 
 
 # ---------------------------------------------------------------------------
-# 6.2 Bar Segment - ve line snap tren be mat Gingiva va Sweep thanh bar
+# Quy trinh Bar Segment + Top Bar:
+#   1. Create Top Bar Plane  -> PlaneVisual + PlaneCubeCut (an) + Mui ten huong lap
+#   2. Draw Line Bar         -> line ve tren PlaneVisual (1 modifier Shrinkwrap)
+#   3. Bar Segment TU CAP NHAT khi sua line / Plane / mui ten / thong so
 # ---------------------------------------------------------------------------
-def polyline_from_object(obj):
-    """Lay danh sach toa do world theo thu tu di doc duong line."""
-    bm = bmesh.new()
-    bm.from_mesh(obj.data)
-    bm.verts.ensure_lookup_table()
-    points = []
-    if not bm.verts:
-        bm.free()
-        return points, False
-    ends = [v for v in bm.verts if len(v.link_edges) <= 1]
-    closed = not ends
-    start = ends[0] if ends else bm.verts[0]
+def valid_obj(obj):
+    try:
+        return obj is not None and obj.name in bpy.data.objects
+    except ReferenceError:
+        return False
+
+
+def ensure_arrow(context, location):
+    """Mui ten huong lap: Empty SINGLE_ARROW huong len Z+ (xoay duoc de doi huong
+    lap = huong canh ben cua Bar)."""
+    props = context.scene.rmvb
+    arrow = props.bar_arrow
+    if not valid_obj(arrow):
+        arrow = bpy.data.objects.new(OBJ_ARROW, None)
+        arrow.empty_display_type = 'SINGLE_ARROW'
+        arrow.empty_display_size = 12.0
+        arrow.show_in_front = True
+        arrow.color = (0.1, 0.9, 0.2, 1.0)
+        arrow.location = location
+        arrow["rmvb_role"] = "ARROW"
+        ensure_collection(COL_BARDESIGN).objects.link(arrow)
+        props.bar_arrow = arrow
+    return arrow
+
+
+def arrow_direction(arrow, depsgraph=None):
+    """Huong lap (world, don vi) = truc Z cua mui ten (Z+ neu chua co mui ten)."""
+    if not valid_obj(arrow):
+        return Vector((0.0, 0.0, 1.0))
+    obj = arrow.evaluated_get(depsgraph) if depsgraph is not None else arrow
+    direction = obj.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
+    if direction.length < 1e-9:
+        return Vector((0.0, 0.0, 1.0))
+    return direction.normalized()
+
+
+def project_to_plane(point, origin, normal):
+    return point - normal * (point - origin).dot(normal)
+
+
+# ---------------------------------------------------------------------------
+# Line: Edit Mode + 1 modifier Shrinkwrap (Nearest Surface Point, Above Surface)
+# ---------------------------------------------------------------------------
+def add_line_modifier(obj, plane):
+    """Chi 1 modifier RMVB_Shrinkwrap bam line vao PlaneVisual; hien ket qua ngay
+    trong Edit Mode va On Cage de diem dieu khien nam dung tren Plane."""
+    obj.modifiers.clear()
+    mod = obj.modifiers.new(name=MOD_PREFIX + "Shrinkwrap", type='SHRINKWRAP')
+    mod.target = plane
+    mod.wrap_method = 'NEAREST_SURFACEPOINT'
+    mod.wrap_mode = 'ABOVE_SURFACE'
+    mod.offset = 0.0
+    mod.show_in_editmode = True
+    if hasattr(mod, "show_on_cage"):
+        try:
+            mod.show_on_cage = True
+        except Exception:
+            pass
+    return mod
+
+
+def walk_ordered_path(mesh, matrix):
+    """Doc chuoi dinh theo thu tu noi canh. Tra ve (points_world, closed)."""
+    count = len(mesh.vertices)
+    adj = {i: [] for i in range(count)}
+    for edge in mesh.edges:
+        a, b = edge.vertices
+        adj[a].append(b)
+        adj[b].append(a)
+    endpoints = [i for i, nb in adj.items() if len(nb) == 1]
+    closed = (count >= 3 and not endpoints
+              and all(len(nb) == 2 for nb in adj.values()))
+    start = endpoints[0] if endpoints else 0
+    order = []
     visited = set()
-    current = start
-    while current is not None:
-        visited.add(current.index)
-        points.append(obj.matrix_world @ current.co)
-        nxt = None
-        for edge in current.link_edges:
-            other = edge.other_vert(current)
-            if other.index not in visited:
-                nxt = other
-                break
-        if nxt is None and closed and len(points) > 1:
-            for edge in current.link_edges:
-                other = edge.other_vert(current)
-                if other.index == start.index:
-                    points.append(points[0])
-                    break
-            nxt = None
-        current = nxt
-    bm.free()
-    return points, closed
+    cur = start
+    prev = None
+    while cur is not None and cur not in visited:
+        visited.add(cur)
+        order.append(cur)
+        nxts = [v for v in adj[cur] if v != prev and v not in visited]
+        prev = cur
+        cur = nxts[0] if nxts else None
+    return [matrix @ mesh.vertices[i].co for i in order], closed
 
 
-def rebuild_polyline(obj, points, closed=False):
-    """Ghi lai toan bo duong line tu danh sach diem world (kieu ve polyline
-    nhu GingivaWaxupDetection: khong giu con tro bmesh, dung list diem).
-
-    closed=False (mac dinh) -> line MO, khong noi diem dau voi diem cuoi.
-    """
-    mesh = obj.data
-    mesh.clear_geometry()
-    inverse = obj.matrix_world.inverted()
-    verts = [tuple(inverse @ Vector(p)) for p in points]
-    edges = [(i, i + 1) for i in range(len(verts) - 1)]
-    if closed and len(verts) >= 3:
-        edges.append((len(verts) - 1, 0))
-    mesh.from_pydata(verts, edges, [])
-    mesh.update()
+def line_world_points(line, depsgraph):
+    """Cac diem line sau modifier Shrinkwrap (ke ca khi line dang o Edit Mode)."""
+    evaluated = line.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        points, _closed = walk_ordered_path(mesh, evaluated.matrix_world)
+    finally:
+        evaluated.to_mesh_clear()
+    return points
 
 
-def sweep_polyline(points, width, height, closed=False, up=None):
-    """Tao mesh dang thanh co tiet dien nhat (width x height) di theo points."""
+def clean_points(points, eps=1e-4):
+    """Bo cac diem trung lien tiep (do dai canh = 0 lam hong tiet dien)."""
+    out = []
+    for point in points:
+        if not out or (point - out[-1]).length > eps:
+            out.append(point)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Khoi bar tiet dien hinh binh hanh
+# ---------------------------------------------------------------------------
+def bmesh_from_rings(rings):
+    """Noi cac vong 4 dinh thanh khoi bar mo (nap kin 2 dau)."""
     bm = bmesh.new()
-    if closed and len(points) > 2 \
-            and (Vector(points[-1]) - Vector(points[0])).length < 1e-6:
-        points = list(points[:-1])      # vong kin: bo diem lap o cuoi
-    if len(points) < 2:
-        bm.free()
-        return None
-    up = up if up is not None else Vector((0.0, 0.0, 1.0))
-    count = len(points)
-    rings = []
-    for index, point in enumerate(points):
-        if closed:
-            prev_p = points[(index - 1) % count]
-            next_p = points[(index + 1) % count]
-        else:
-            prev_p = points[index - 1] if index > 0 else points[index]
-            next_p = points[index + 1] if index + 1 < count else points[index]
-        tangent = next_p - prev_p
-        if tangent.length < 1e-6:
-            tangent = next_p - point if (next_p - point).length > 1e-6 else Vector((0, 1, 0))
-        tangent.normalize()
-        side = up.cross(tangent)
-        if side.length < 1e-6:
-            side = Vector((1.0, 0.0, 0.0))
-        side.normalize()
-        normal = tangent.cross(side)
-        if normal.length < 1e-6:
-            normal = Vector((0.0, 0.0, 1.0))
-        normal.normalize()
-        hw = width * 0.5
-        ring = [
-            point - side * hw,
-            point + side * hw,
-            point + side * hw + normal * height,
-            point - side * hw + normal * height,
-        ]
-        rings.append([bm.verts.new(co) for co in ring])
+    verts = [[bm.verts.new(co) for co in ring] for ring in rings]
 
     def bridge(a, b):
         for i in range(4):
@@ -1663,59 +1654,234 @@ def sweep_polyline(points, width, height, closed=False, up=None):
             except ValueError:
                 pass
 
-    for i in range(len(rings) - 1):
-        bridge(rings[i], rings[i + 1])
-    if closed:
-        bridge(rings[-1], rings[0])
-    else:
+    for i in range(len(verts) - 1):
+        bridge(verts[i], verts[i + 1])
+    for cap in (tuple(reversed(verts[0])), tuple(verts[-1])):
         try:
-            bm.faces.new(tuple(reversed(rings[0])))
-        except ValueError:
-            pass
-        try:
-            bm.faces.new(tuple(rings[-1]))
+            bm.faces.new(cap)
         except ValueError:
             pass
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    mesh = bpy.data.meshes.new("Rmvb_sweep")
-    bm.to_mesh(mesh)
-    bm.free()
-    return mesh
+    outward_solid(bm)
+    return bm
 
 
+def parallelogram_rings(points, normal, drop, width):
+    """Cac vong 4 dinh: mat tren nam tren Plane (rong `width`, can giua line), canh
+    ben di them vector `drop` (song song mui ten huong lap). Goc line duoc vat
+    mep (mitre) de be rong khong bi hep lai."""
+    count = len(points)
+    if count < 2:
+        return None
+    dirs = [(points[i + 1] - points[i]).normalized() for i in range(count - 1)]
+    half = width * 0.5
+    rings = []
+    for i, point in enumerate(points):
+        t_prev = dirs[i - 1] if i > 0 else dirs[0]
+        t_next = dirs[i] if i < count - 1 else dirs[-1]
+        tangent = t_prev + t_next
+        if tangent.length < 1e-6:
+            tangent = t_next
+        tangent.normalize()
+        side = normal.cross(tangent)
+        if side.length < 1e-9:
+            side = Vector((1.0, 0.0, 0.0))
+        side.normalize()
+        offset = side * (half / max(0.5, tangent.dot(t_next)))
+        left = point - offset
+        right = point + offset
+        rings.append([left, right, right + drop, left + drop])
+    return rings
+
+
+# ---------------------------------------------------------------------------
+# Bar Segment tu cap nhat (handler depsgraph + update cua thong so)
+# ---------------------------------------------------------------------------
+_SYNC = {"sig": None, "busy": False, "error": ""}
+
+
+def sync_bar_segment(scene, depsgraph=None, force=False):
+    """Dung lai mesh Bar Segment tu line + PlaneVisual + mui ten + thong so.
+
+    Line nam tren Plane (Shrinkwrap) -> extrude theo huong NGUOC mui ten
+    `Chieu cao bar` (do vuong goc Plane), canh ben song song mui ten. Chi ghi
+    lai khi dau vao thay doi. Tra ve True neu da cap nhat.
+    """
+    props = scene.rmvb
+    line, plane = props.bar_line, props.top_plane
+    if _SYNC["busy"] or not valid_obj(line) or not valid_obj(plane):
+        return False
+    seg = props.bar_segment
+    if valid_obj(props.bar_backup) or (valid_obj(seg) and seg.get("rmvb_applied")):
+        return False                      # da Apply Bar Design: khong dung lai
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    points = clean_points(line_world_points(line, depsgraph))
+    if len(points) < 2:
+        return False
+
+    matrix = plane.evaluated_get(depsgraph).matrix_world
+    direction = arrow_direction(props.bar_arrow, depsgraph)
+    normal = (matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+    if normal.dot(direction) < 0:
+        normal = -normal
+    cosine = normal.dot(direction)
+    if cosine < 0.1:
+        _SYNC["error"] = "PlaneVisual gan song song voi mui ten huong lap"
+        return False
+    origin = matrix.translation
+    signature = (
+        tuple(round(c, 4) for p in points for c in p),
+        tuple(round(c, 4) for row in matrix for c in row),
+        tuple(round(c, 5) for c in direction),
+        round(props.bar_width, 5), round(props.bar_height, 5),
+    )
+    if not force and signature == _SYNC["sig"] and valid_obj(seg):
+        return False
+
+    _SYNC["busy"] = True
+    try:
+        flat = [project_to_plane(p, origin, normal) for p in points]
+        drop = -direction * (props.bar_height / cosine)
+        rings = parallelogram_rings(flat, normal, drop, props.bar_width)
+        if rings is None:
+            return False
+        bm = bmesh_from_rings(rings)
+        if not valid_obj(seg):
+            mesh = bpy.data.meshes.new(OBJ_SEGMENT)
+            seg = bpy.data.objects.new(OBJ_SEGMENT, mesh)
+            ensure_collection(COL_SEGMENT).objects.link(seg)
+            set_color(seg, (0.20, 0.65, 0.95, 1.0))
+            seg["rmvb_role"] = "SEGMENT"
+            props.bar_segment = seg
+            created = True
+        else:
+            created = False
+        bm.to_mesh(seg.data)
+        bm.free()
+        seg.data.update()
+        seg["rmvb_topbar"] = True
+        if created:
+            rebuild_segment_modifiers(bpy.context)
+        _SYNC["sig"] = signature
+        _SYNC["error"] = ""
+    finally:
+        _SYNC["busy"] = False
+    return True
+
+
+@persistent
+def rmvb_load_post(_dummy=None):
+    """Mo file: group da bat Lock Rotation tu ban cu (copy ca 3 truc) duoc dung lai
+    constraint kieu moi (chi khoa X/Y)."""
+    for scene in bpy.data.scenes:
+        props = getattr(scene, "rmvb", None)
+        if props is None:
+            continue
+        for group in props.groups:
+            if (group.lock_rot_topbar and valid_obj(group.empty)
+                    and CST_ROT_LIMIT not in group.empty.constraints):
+                try:
+                    apply_group_locks(group, props)
+                except Exception as exc:
+                    print("[Rmvb-Bar] Khong nang cap duoc Lock Rotation: %s" % exc)
+
+
+@persistent
+def rmvb_depsgraph_handler(scene, depsgraph):
+    """Line / PlaneVisual / mui ten duoc sua (ke ca trong Edit Mode) -> cap nhat Bar Segment."""
+    if _SYNC["busy"]:
+        return
+    try:
+        props = scene.rmvb
+    except AttributeError:
+        return
+    line, plane = props.bar_line, props.top_plane
+    if not (valid_obj(line) and valid_obj(plane)):
+        return
+    watched = {line.name, line.data.name, plane.name, plane.data.name}
+    if valid_obj(props.bar_arrow):
+        watched.add(props.bar_arrow.name)
+    if not any(update.id.name in watched for update in depsgraph.updates):
+        return
+    try:
+        sync_bar_segment(scene, depsgraph)
+    except Exception as exc:
+        message = str(exc)
+        if message != _SYNC["error"]:
+            _SYNC["error"] = message
+            print("[Rmvb-Bar] Khong cap nhat duoc Bar Segment: %s" % message)
+
+
+class RMVB_OT_update_bar_segment(Operator):
+    """Dung lai Bar Segment ngay (du phong neu tu cap nhat khong chay)"""
+    bl_idname = "rmvb.update_bar_segment"
+    bl_label = "Cập nhật Bar Segment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        if not valid_obj(props.top_plane):
+            self.report({'ERROR'}, "Bam Create Top Bar Plane truoc")
+            return {'CANCELLED'}
+        if not valid_obj(props.bar_line):
+            self.report({'ERROR'}, "Chua co line. Bam Draw Line Bar truoc")
+            return {'CANCELLED'}
+        if context.mode != 'OBJECT' and context.mode != 'EDIT_MESH':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        if not sync_bar_segment(context.scene, force=True):
+            self.report({'WARNING'}, _SYNC["error"] or
+                        "Khong dung lai duoc Bar Segment (line can it nhat 2 diem, "
+                        "hoac Bar Design da Apply)")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Da cap nhat Bar Segment")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Draw Line Bar (snap PlaneVisual): modal ve theo con tro, line o Edit Mode
+# ---------------------------------------------------------------------------
 class RMVB_OT_create_bar_line(Operator):
-    """Tao duong line bat dau tu 3D Cursor va ve theo be mat Gingiva"""
+    """Tao line bat dau tu 3D Cursor (chieu len PlaneVisual) va vao che do ve theo
+    con tro (E hoac click de them diem NGAY tai vi tri con tro tren Plane)"""
     bl_idname = "rmvb.create_bar_line"
     bl_label = "Draw Line Bar"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         props = context.scene.rmvb
-        target = props.gingiva_object
-        if target is None or target.type != 'MESH':
-            self.report({'ERROR'}, "Can import Gingiva truoc khi ve line")
+        plane = props.top_plane
+        if not valid_obj(plane):
+            self.report({'ERROR'}, "Bam Create Top Bar Plane truoc khi ve line")
+            return {'CANCELLED'}
+        if valid_obj(props.bar_backup):
+            self.report({'ERROR'}, "Dang co Bar Design da Apply - bam Delete Bar Design truoc")
             return {'CANCELLED'}
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        old = props.bar_line
-        if old is not None and old.name in bpy.data.objects:
-            remove_object(old)
-        coll = ensure_collection(COL_SEGMENT)
-        start = context.scene.cursor.location.copy()
-        hit, local, _n, _i = target.closest_point_on_mesh(
-            target.matrix_world.inverted() @ start)
-        if hit:
-            start = target.matrix_world @ local
+        if valid_obj(props.bar_line):
+            remove_object(props.bar_line)
+        context.view_layer.update()
+        matrix = plane.matrix_world
+        normal = (matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+        start = project_to_plane(context.scene.cursor.location.copy(),
+                                 matrix.translation, normal)
         mesh = bpy.data.meshes.new(OBJ_LINE)
         mesh.from_pydata([start], [], [])
         mesh.update()
         line = bpy.data.objects.new(OBJ_LINE, mesh)
-        coll.objects.link(line)
+        ensure_collection(COL_SEGMENT).objects.link(line)
         props.bar_line = line
+        _SYNC["sig"] = None
+        add_line_modifier(line, plane)
         set_color(line, (1.0, 0.35, 0.05, 1.0))
-        line.display_type = 'WIRE'
-        activate(context, line)
+
+        bpy.ops.object.select_all(action='DESELECT')
+        line.select_set(True)
+        context.view_layer.objects.active = line
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        self.report({'INFO'}, "Di chuot tren PlaneVisual, nhan E (hoac click) de them diem")
         try:
             bpy.ops.rmvb.draw_bar_line('INVOKE_DEFAULT')
         except Exception as exc:
@@ -1724,10 +1890,11 @@ class RMVB_OT_create_bar_line(Operator):
 
 
 class RMVB_OT_draw_bar_line(Operator):
-    """Ve duong bar MO theo con tro: E/click trai = them diem NAM TREN be mat
-    Gingiva, Backspace/Ctrl+Z = xoa diem cuoi, Enter = xong, Esc = huy"""
+    """Ve line theo con tro: di chuot tren PlaneVisual roi nhan E (hoac click trai) de
+    them diem NGAY TAI con tro. Backspace xoa diem cuoi, Enter/Esc/chuot phai ket thuc"""
     bl_idname = "rmvb.draw_bar_line"
-    bl_label = "Ve duong bar (snap Gingiva)"
+    bl_label = "Ve duong bar (theo con tro)"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def _find_view(self, context):
         area = view_3d_area(context)
@@ -1740,7 +1907,7 @@ class RMVB_OT_draw_bar_line(Operator):
         return area, region, area.spaces.active.region_3d
 
     def _raycast(self, context, mouse_x, mouse_y):
-        """Vi tri world tren be mat Gingiva duoi con tro (hoac None)."""
+        """Vi tri world tren PlaneVisual duoi con tro (hoac None)."""
         if self.region is None or self.rv3d is None:
             return None
         coord = (mouse_x - self.region.x, mouse_y - self.region.y)
@@ -1749,62 +1916,110 @@ class RMVB_OT_draw_bar_line(Operator):
             return None
         direction = view3d_utils.region_2d_to_vector_3d(self.region, self.rv3d, coord)
         origin = view3d_utils.region_2d_to_origin_3d(self.region, self.rv3d, coord)
-        target = self.target
-        inverse = target.matrix_world.inverted()
-        # Ray rieng vao object Gingiva (Object.ray_cast) -> khong vo tinh cham
-        # vao rung/răng/pillar nam che tren be mat.
+        plane = self.plane
+        inverse = plane.matrix_world.inverted()
         try:
-            done, local, _n, _i = target.ray_cast(
+            done, local, _n, _i = plane.ray_cast(
                 inverse @ origin, (inverse.to_3x3() @ direction).normalized())
         except Exception:
             done = False
-        if done:
-            return target.matrix_world @ local
-        depsgraph = context.evaluated_depsgraph_get()
-        result, location, _n, _f, hit_obj, _m = context.scene.ray_cast(
-            depsgraph, origin, direction)
-        if not result:
+        if not done:
             return None
-        if hit_obj is not None and hit_obj != target \
-                and getattr(hit_obj, "original", None) != target:
-            return None                      # chi ve tren dung be mat Gingiva
-        hit, local, _n2, _i = target.closest_point_on_mesh(inverse @ location)
-        return (target.matrix_world @ local) if hit else location
+        return plane.matrix_world @ local
 
-    def _redraw(self):
-        if self.area:
-            self.area.tag_redraw()
+    def _pick_tip(self):
+        """Dinh dau line dang ho (de noi diem moi vao)."""
+        bm = self.bm
+        bm.verts.ensure_lookup_table()
+        tip = None
+        if bm.select_history:
+            last = bm.select_history[-1]
+            if isinstance(last, bmesh.types.BMVert) and last.is_valid:
+                tip = last
+        if tip is None:
+            open_ends = [v for v in bm.verts if len(v.link_edges) <= 1]
+            sel = [v for v in open_ends if v.select]
+            if sel:
+                tip = sel[-1]
+            elif open_ends:
+                tip = open_ends[-1]
+            elif bm.verts:
+                tip = bm.verts[-1]
+        return tip
 
-    def _push_point(self, world):
-        """Them mot diem vao cuoi duong line va ve lai toan bo polyline
-        (danh sach diem la source of truth -> khong bao gio lost ket noi)."""
-        self.points.append(Vector(world))
-        rebuild_polyline(self.line, self.points, self.closed)
-        self._redraw()
+    def _select_only(self, vert):
+        bm = self.bm
+        for v in bm.verts:
+            v.select_set(False)
+        for e in bm.edges:
+            e.select_set(False)
+        bm.select_history.clear()
+        if vert is not None and vert.is_valid:
+            vert.select_set(True)
+            bm.select_history.add(vert)
 
     def _add_point(self, context, event):
         world = self._raycast(context, event.mouse_x, event.mouse_y)
         if world is None:
-            return False
-        self._push_point(world)
-        return True
+            self.report({'WARNING'}, "Khong cham vao PlaneVisual")
+            return
+        local = self.line.matrix_world.inverted() @ world
+        new = self.bm.verts.new(local)
+        if self.tip is not None and self.tip.is_valid:
+            try:
+                self.bm.edges.new((self.tip, new))
+            except ValueError:
+                pass
+        self._select_only(new)
+        self.tip = new
+        self.bm.verts.ensure_lookup_table()
+        bmesh.update_edit_mesh(self.line.data, destructive=False)
+        if self.area:
+            self.area.tag_redraw()
 
     def _remove_last(self, context):
-        if len(self.points) <= 1:
+        bm = self.bm
+        if self.tip is None or not self.tip.is_valid or len(bm.verts) <= 1:
             return
-        self.points.pop()
-        rebuild_polyline(self.line, self.points, self.closed)
-        self._redraw()
+        neighbor = None
+        for edge in self.tip.link_edges:
+            neighbor = edge.other_vert(self.tip)
+            break
+        try:
+            bm.verts.remove(self.tip)
+        except Exception:
+            pass
+        bm.verts.ensure_lookup_table()
+        if neighbor is None or not neighbor.is_valid:
+            neighbor = self._pick_tip()
+        self.tip = neighbor
+        self._select_only(neighbor)
+        bmesh.update_edit_mesh(self.line.data, destructive=True)
+        if self.area:
+            self.area.tag_redraw()
+
+    def _status(self, context, on=True):
+        try:
+            if on:
+                context.workspace.status_text_set(
+                    "Ve line bar tren PlaneVisual | E hoac Click trai: them diem tai con tro | "
+                    "Backspace: xoa diem cuoi | Cuon/Giua chuot: zoom-xoay | "
+                    "Enter/Esc/Chuot phai: xong")
+            else:
+                context.workspace.status_text_set(None)
+        except Exception:
+            pass
 
     def _draw_cb(self):
-        if self.hit_world is None or not self.points:
+        """Duong 'cao su' tu dinh dau toi vi tri con tro (preview)."""
+        if self.hit_world is None or self.tip is None or not self.tip.is_valid:
             return
         try:
             import gpu
             from gpu_extras.batch import batch_for_shader
         except Exception:
             return
-        tip_world = self.points[-1]
+        tip_world = self.line.matrix_world @ self.tip.co
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('NONE')
@@ -1813,10 +2028,11 @@ class RMVB_OT_draw_bar_line(Operator):
         try:
             batch = batch_for_shader(shader, 'LINES',
                                      {"pos": [tip_world, self.hit_world]})
+            shader.bind()
             shader.uniform_float("color", (1.0, 0.8, 0.1, 0.9))
             batch.draw(shader)
-            point = batch_for_shader(
-                shader, 'POINTS', {"pos": list(self.points) + [self.hit_world]})
+            point = batch_for_shader(shader, 'POINTS', {"pos": [self.hit_world]})
+            shader.bind()
             shader.uniform_float("color", (1.0, 0.3, 0.1, 1.0))
             point.draw(shader)
         except Exception:
@@ -1829,15 +2045,15 @@ class RMVB_OT_draw_bar_line(Operator):
 
     def invoke(self, context, event):
         props = context.scene.rmvb
-        target = props.gingiva_object
+        plane = props.top_plane
         line = props.bar_line
-        if target is None or target.type != 'MESH':
-            self.report({'ERROR'}, "Can import Gingiva truoc khi ve line")
+        if not valid_obj(plane):
+            self.report({'ERROR'}, "Bam Create Top Bar Plane truoc khi ve line")
             return {'CANCELLED'}
-        if line is None or line.name not in bpy.data.objects:
+        if not valid_obj(line):
             self.report({'ERROR'}, "Chua co line. Bam Draw Line Bar truoc")
             return {'CANCELLED'}
-        self.target = target
+        self.plane = plane
         self.line = line
         self.hit_world = None
         self.handle = None
@@ -1845,35 +2061,30 @@ class RMVB_OT_draw_bar_line(Operator):
         if self.region is None or self.rv3d is None:
             self.report({'ERROR'}, "Khong tim thay vung 3D View")
             return {'CANCELLED'}
-        # Danh sach diem world = source of truth (kieu GingivaWaxupDetection).
-        # Diem dau tien co the da co san (nut 3D Cursor luc tao line).
-        self.points, self.closed = polyline_from_object(line)
-        if self.closed and len(self.points) > 1 \
-                and (self.points[-1] - self.points[0]).length < 1e-6:
-            self.points.pop()          # polyline_from_object lap lai diem dau
-        self.restore = list(self.points)
-        if not self.points:
-            self.points = [line.matrix_world @ Vector((0.0, 0.0, 0.0))]
-            self.restore = list(self.points)
+
+        # Dam bao dang Edit Mode tren line (cap nhat bmesh truc tiep)
+        if not (context.mode == 'EDIT_MESH' and context.edit_object == line):
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+            line.select_set(True)
+            context.view_layer.objects.active = line
+            bpy.ops.object.mode_set(mode='EDIT')
+        self.bm = bmesh.from_edit_mesh(line.data)
+        self.tip = self._pick_tip()
+        self._select_only(self.tip)
+        bmesh.update_edit_mesh(line.data, destructive=False)
+
+        self._status(context, True)
         try:
             self.handle = bpy.types.SpaceView3D.draw_handler_add(
                 self._draw_cb, (), 'WINDOW', 'POST_VIEW')
         except Exception:
             self.handle = None
         context.window_manager.modal_handler_add(self)
-        self._status(context, True)
+        if self.area:
+            self.area.tag_redraw()
         return {'RUNNING_MODAL'}
-
-    def _status(self, context, on=True):
-        try:
-            if on:
-                context.workspace.status_text_set(
-                    "Ve duong bar MO | E/Click trai: them diem tren Gingiva | "
-                    "Backspace/Ctrl+Z: xoa diem cuoi | Enter: xong | Esc: huy")
-            else:
-                context.workspace.status_text_set(None)
-        except Exception:
-            pass
 
     def _finish(self, context):
         self._status(context, False)
@@ -1889,34 +2100,26 @@ class RMVB_OT_draw_bar_line(Operator):
     def modal(self, context, event):
         if event.value == 'PRESS' and (
                 event.type == 'E'
-                or (event.type == 'LEFTMOUSE' and not event.alt
-                    and not event.ctrl and not event.shift)):
-            if not self._add_point(context, event):
-                self.report({'WARNING'}, "Khong cham vao be mat Gingiva")
+                or (event.type == 'LEFTMOUSE' and not event.alt)):
+            self._add_point(context, event)
             return {'RUNNING_MODAL'}
-        if event.value == 'PRESS' and (
-                event.type in {'BACK_SPACE', 'DEL'}
-                or (event.type == 'Z' and event.ctrl)):
+        if event.value == 'PRESS' and event.type in {'BACK_SPACE', 'DEL'}:
             self._remove_last(context)
             return {'RUNNING_MODAL'}
         if event.value == 'PRESS' and event.type in {'RET', 'NUMPAD_ENTER',
-                                                     'SPACE', 'RIGHTMOUSE'}:
+                                                     'SPACE', 'ESC', 'RIGHTMOUSE'}:
             self._finish(context)
-            self.report({'INFO'}, "Line bar mo co %d diem - bam Create Bar Segment"
-                        % len(self.points))
+            self.report({'INFO'}, "Da xong ve line - sua line (Edit Mode) hoac Plane, "
+                        "Bar Segment tu cap nhat")
             return {'FINISHED'}
-        if event.value == 'PRESS' and event.type == 'ESC':
-            self._finish(context)
-            rebuild_polyline(self.line, self.restore, self.closed)
-            self.report({'INFO'}, "Da huy ve line bar (giu line nhu luc dau)")
-            return {'CANCELLED'}
         if event.type == 'MOUSEMOVE':
             self.hit_world = self._raycast(context, event.mouse_x, event.mouse_y)
             if self.area:
                 self.area.tag_redraw()
             return {'RUNNING_MODAL'}
         if (event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
-                           'WHEELINMOUSE', 'WHEELOUTMOUSE'}
+                           'WHEELINMOUSE', 'WHEELOUTMOUSE', 'TRACKPADPAN',
+                           'TRACKPADZOOM'}
                 or (event.type == 'LEFTMOUSE' and event.alt)
                 or (event.type.startswith('NUMPAD_')
                     and event.type != 'NUMPAD_ENTER')):
@@ -1924,129 +2127,641 @@ class RMVB_OT_draw_bar_line(Operator):
         return {'RUNNING_MODAL'}
 
 
-class RMVB_OT_close_bar_line(Operator):
-    """Noi diem dau va diem cuoi cua line thanh vong kin"""
-    bl_idname = "rmvb.close_bar_line"
-    bl_label = "Noi vong line bar"
-    bl_options = {'REGISTER', 'UNDO'}
+class RMVB_OT_edit_bar_line(Operator):
+    """Vao Edit Mode tren line de sua diem (Bar Segment tu cap nhat theo)"""
+    bl_idname = "rmvb.edit_bar_line"
+    bl_label = "Edit Line Bar"
 
     def execute(self, context):
-        props = context.scene.rmvb
-        line = props.bar_line
-        if line is None or line.name not in bpy.data.objects:
-            self.report({'ERROR'}, "Chua co line bar")
-            return {'CANCELLED'}
-        bm = bmesh.new()
-        bm.from_mesh(line.data)
-        ends = [v for v in bm.verts if len(v.link_edges) <= 1]
-        if len(ends) < 2:
-            bm.free()
-            self.report({'INFO'}, "Line da kin vong")
-            return {'FINISHED'}
-        try:
-            bm.edges.new((ends[0], ends[-1]))
-            bm.to_mesh(line.data)
-            line.data.update()
-        except ValueError:
-            pass
-        bm.free()
-        self.report({'INFO'}, "Da noi vong line bar")
-        return {'FINISHED'}
-
-
-class RMVB_OT_create_bar_segment(Operator):
-    """Tao Bar Segment: thanh co tiet chu nhat di theo line bar tren Gingiva"""
-    bl_idname = "rmvb.create_bar_segment"
-    bl_label = "Create Bar Segment"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        props = context.scene.rmvb
-        line = props.bar_line
-        if line is None or line.name not in bpy.data.objects:
-            self.report({'ERROR'}, "Chua co line bar. Bam Draw Line Bar truoc")
-            return {'CANCELLED'}
-        points, closed = polyline_from_object(line)
-        if len(points) < 2:
-            self.report({'ERROR'}, "Line bar can it nhat 2 diem")
-            return {'CANCELLED'}
-
-        # Up = truc Z trung binh cua cac Bar Pillar (neu co) de bar doc dung
-        # huong khung; nguoi dung co the xoay lai trong Edit Mode.
-        up = Vector((0.0, 0.0, 1.0))
-        pillars = [r.object for r in props.pillars if r.object is not None]
-        if pillars:
-            total = Vector((0.0, 0.0, 0.0))
-            for pillar in pillars:
-                total += pillar.matrix_world.to_quaternion() @ Vector((0, 0, 1))
-            if total.length > 1e-6:
-                up = total.normalized()
-
-        clearance = props.bar_clearance
-        target = props.gingiva_object
-        if clearance and target is not None and target.type == 'MESH':
-            moved = []
-            inverse = target.matrix_world.inverted()
-            for point in points:
-                hit, local, normal, _i = target.closest_point_on_mesh(inverse @ point)
-                if hit:
-                    world = target.matrix_world @ local
-                    direction = target.matrix_world.to_quaternion() @ normal
-                    if direction.length > 1e-6:
-                        direction.normalize()
-                    moved.append(world + direction * clearance)
-                else:
-                    moved.append(point)
-            points = moved
-
-        mesh = sweep_polyline(points, props.bar_width, props.bar_height, closed, up)
-        if mesh is None:
-            self.report({'ERROR'}, "Khong tao duoc Bar Segment")
-            return {'CANCELLED'}
-        coll = ensure_collection(COL_SEGMENT)
-        old = props.bar_segment
-        if old is not None and old.name in bpy.data.objects:
-            remove_object(old)
-        obj = bpy.data.objects.new(OBJ_SEGMENT, mesh)
-        coll.objects.link(obj)
-        set_color(obj, (0.20, 0.65, 0.95, 1.0))
-        obj["rmvb_role"] = "SEGMENT"
-        props.bar_segment = obj
-        activate(context, obj)
-        purge_unused_meshes()
-        self.report({'INFO'}, "Da tao Bar Segment (%d miet tiet dien %g x %g mm)"
-                    % (len(points), props.bar_width, props.bar_height))
-        return {'FINISHED'}
-
-
-class RMVB_OT_edit_bar_segment(Operator):
-    """Vao Edit Mode (transform orientation Local) de chinh Bar Segment"""
-    bl_idname = "rmvb.edit_bar_segment"
-    bl_label = "Edit Bar Segment"
-
-    def execute(self, context):
-        props = context.scene.rmvb
-        obj = props.bar_segment
-        if obj is None or obj.name not in bpy.data.objects:
-            self.report({'ERROR'},
-                        "Chua co Bar Segment. Bam Create Bar Segment truoc")
+        line = context.scene.rmvb.bar_line
+        if not valid_obj(line):
+            self.report({'ERROR'}, "Chua co line. Bam Draw Line Bar truoc")
             return {'CANCELLED'}
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         bpy.ops.object.select_all(action='DESELECT')
-        obj.hide_set(False)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
+        line.hide_set(False)
+        line.select_set(True)
+        context.view_layer.objects.active = line
         bpy.ops.object.mode_set(mode='EDIT')
-        use_local_orientation(context)
-        self.report({'INFO'}, "Edit Bar Segment - Transform Orientation: Local")
+        self.report({'INFO'}, "Edit line - Bar Segment tu cap nhat khi keo diem")
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Modifier cua Bar Segment (chi ADD modifier, khong apply)
+# ---------------------------------------------------------------------------
+_MANIFOLD_CACHE = {}
+
+
+def mesh_is_manifold(mesh):
+    """Mesh kin (moi canh dung 2 mat) - du dieu kien cho solver Manifold."""
+    key = (mesh.name, len(mesh.vertices), len(mesh.polygons))
+    cached = _MANIFOLD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    ok = bool(bm.faces) and all(edge.is_manifold for edge in bm.edges)
+    bm.free()
+    if len(_MANIFOLD_CACHE) > 256:
+        _MANIFOLD_CACHE.clear()
+    _MANIFOLD_CACHE[key] = ok
+    return ok
+
+
+def add_boolean_modifier(target, operand, operation, name):
+    """Them Boolean modifier (khong apply). Operand kin -> Manifold, khong kin -> Exact."""
+    mod = target.modifiers.new(name=name, type='BOOLEAN')
+    mod.operation = operation
+    mod.operand_type = 'OBJECT'
+    mod.object = operand
+    manifold = operand.type == 'MESH' and mesh_is_manifold(operand.data)
+    try:
+        mod.solver = 'MANIFOLD' if manifold else 'EXACT'
+    except TypeError:
+        mod.solver = 'EXACT'
+        manifold = False
+    if mod.solver == 'EXACT':
+        for prop, value in (("use_self", False), ("use_hole_tolerant", not manifold)):
+            if hasattr(mod, prop):
+                try:
+                    setattr(mod, prop, value)
+                except Exception:
+                    pass
+    mod.show_expanded = False
+    return mod
+
+
+def rebuild_segment_modifiers(context):
+    """Dung lai toan bo modifier cua Bar Segment theo thu tu co dinh:
+
+        Difference Gingiva
+        -> [Cut Top Bar]   Union tung Bar Pillar -> Difference PlaneCubeCut
+                           -> Difference tung Base
+        -> [Apply Attachment on Bar]  Union / Difference tung Part Bar
+
+    Chi them modifier; Segment da Apply thi bo qua.
+    """
+    props = context.scene.rmvb
+    seg = props.bar_segment
+    if not valid_obj(seg) or seg.get("rmvb_applied"):
+        return 0
+    for mod in list(seg.modifiers):
+        if mod.name.startswith(MOD_PREFIX):
+            seg.modifiers.remove(mod)
+    gingiva = props.gingiva_object
+    if valid_obj(gingiva):
+        add_boolean_modifier(seg, gingiva, 'DIFFERENCE', MOD_PREFIX + "CutGingiva")
+    if seg.get("rmvb_cut"):
+        for ref in props.pillars:
+            if valid_obj(ref.object):
+                add_boolean_modifier(seg, ref.object, 'UNION',
+                                     MOD_PREFIX + "Union_" + ref.tooth)
+        if valid_obj(props.top_cutter):
+            add_boolean_modifier(seg, props.top_cutter, 'DIFFERENCE',
+                                 MOD_PREFIX + "CutPlane")
+        for item in props.placed:
+            if valid_obj(item.base_object):
+                add_boolean_modifier(seg, item.base_object, 'DIFFERENCE',
+                                     MOD_PREFIX + "CutBase_" + item.tooth)
+    if seg.get("rmvb_attach"):
+        for index, group in enumerate(props.groups):
+            if valid_obj(group.part_bar):
+                add_boolean_modifier(
+                    seg, group.part_bar,
+                    'UNION' if group.on_bar else 'DIFFERENCE',
+                    "%sAtt_%d_%s" % (MOD_PREFIX, index, group.name[:30]))
+    return len([m for m in seg.modifiers if m.name.startswith(MOD_PREFIX)])
 
 
 # ---------------------------------------------------------------------------
-# 6.3 Top Bar Plane - mat phang dieu khien khoi cat (an)
+# Top Bar: PlaneVisual + PlaneCubeCut + khoi hinh binh hanh
+# ---------------------------------------------------------------------------
+def plane_mesh(name, half):
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([(-half, -half, 0.0), (half, -half, 0.0),
+                      (half, half, 0.0), (-half, half, 0.0)], [], [(0, 1, 2, 3)])
+    mesh.update()
+    return mesh
+
+
+def cube_mesh(name, half, height):
+    """Plane `2*half` extrude +Z local `height` -> hop kin, normal ra ngoai."""
+    bm = bmesh.new()
+    bottom = [bm.verts.new(co) for co in ((-half, -half, 0.0), (half, -half, 0.0),
+                                          (half, half, 0.0), (-half, half, 0.0))]
+    top = [bm.verts.new((v.co.x, v.co.y, height)) for v in bottom]
+    for i in range(4):
+        j = (i + 1) % 4
+        bm.faces.new((bottom[i], bottom[j], top[j], top[i]))
+    bm.faces.new(bottom)
+    bm.faces.new(top)
+    outward_solid(bm)
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
+    bm.free()
+    return mesh
+
+
+def design_bounds(context, direction):
+    """(tam, cao do lon nhat doc `direction`) cua cac Bar Pillar (neu chua co thi
+    cua cac Base; chua co nua thi lay 3D Cursor)."""
+    props = context.scene.rmvb
+    objs = [r.object for r in props.pillars if valid_obj(r.object)]
+    if not objs:
+        objs = [i.base_object for i in props.placed if valid_obj(i.base_object)]
+    context.view_layer.update()
+    corners = []
+    for obj in objs:
+        corners.extend(obj.matrix_world @ Vector(c) for c in obj.bound_box)
+    if not corners:
+        cursor = context.scene.cursor.location.copy()
+        return cursor, cursor.dot(direction)
+    center = sum(corners, Vector()) / len(corners)
+    return center, max(co.dot(direction) for co in corners)
+
+
+def replace_mesh_geometry(dst, src):
+    """Thay hinh hoc cua mesh `dst` bang cua `src` (giu nguyen datablock + object)."""
+    bm = bmesh.new()
+    bm.from_mesh(src)
+    bm.to_mesh(dst)
+    bm.free()
+    dst.update()
+    bpy.data.meshes.remove(src)
+
+
+def fit_plane_size(plane, cutter):
+    """Plane/Cube tao tu ban cu (50 mm) duoc phong len PLANE_SIZE, giu nguyen vi tri,
+    huong xoay va scale cua object. Mesh da bi sua tay (khac co luu) thi khong dong den.
+    Tra ve True neu da doi co."""
+    verts = plane.data.vertices
+    if not len(verts):
+        return False
+    extent = 2.0 * max(abs(v.co.x) for v in verts)
+    stored = plane.get("rmvb_size")
+    if stored is None:
+        stored = extent                    # ban cu chua ghi co: coi nhu dung co mesh
+    resized = False
+    if abs(stored - PLANE_SIZE) > 1e-6 and abs(extent - stored) < 1e-3:
+        half = PLANE_SIZE * 0.5
+        replace_mesh_geometry(plane.data, plane_mesh(OBJ_PLANE, half))
+        if valid_obj(cutter):
+            replace_mesh_geometry(cutter.data, cube_mesh(OBJ_CUTTER, half, PLANE_CUBE_HEIGHT))
+        resized = True
+    plane["rmvb_size"] = PLANE_SIZE if (resized or abs(extent - PLANE_SIZE) < 1e-3) else stored
+    return resized
+
+
+class RMVB_OT_create_top_bar_plane(Operator):
+    """Buoc DAU TIEN cua Bar Segment: tao PlaneVisual (100 mm, xanh duong, opacity 0.4) va
+    PlaneCubeCut (an) trong collection CutPlane + Mui ten huong lap. Sau do Draw Line Bar
+    se ve tren PlaneVisual va Bar Segment tu cap nhat theo line, Plane, mui ten"""
+    bl_idname = "rmvb.create_top_bar_plane"
+    bl_label = "Create Top Bar Plane"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        coll = ensure_collection(COL_CUTPLANE)
+        direction = arrow_direction(props.bar_arrow)
+        created = False
+        plane = props.top_plane
+        if not valid_obj(plane):
+            center, top = design_bounds(context, direction)
+            origin = center + direction * (top - center.dot(direction))
+            plane = bpy.data.objects.new(OBJ_PLANE, plane_mesh(OBJ_PLANE, PLANE_SIZE * 0.5))
+            coll.objects.link(plane)
+            rot = direction.to_track_quat('Z', 'Y').to_matrix().to_4x4()
+            plane.matrix_world = Matrix.Translation(origin) @ rot
+            set_display_color(plane, (0.10, 0.35, 1.0, 0.4))
+            plane["rmvb_role"] = "PLANE_VISUAL"
+            plane["rmvb_size"] = PLANE_SIZE
+            props.top_plane = plane
+            created = True
+        cutter = props.top_cutter
+        if not valid_obj(cutter):
+            cutter = bpy.data.objects.new(
+                OBJ_CUTTER, cube_mesh(OBJ_CUTTER, PLANE_SIZE * 0.5, PLANE_CUBE_HEIGHT))
+            coll.objects.link(cutter)
+            cutter.parent = plane
+            cutter.matrix_parent_inverse = Matrix.Identity(4)
+            set_display_color(cutter, (1.0, 0.50, 0.10, 0.5))
+            cutter["rmvb_role"] = "PLANE_CUBE_CUT"
+            cutter.hide_render = True
+            cutter.hide_set(True)                 # an khoi Viewport luc tao
+            props.top_cutter = cutter
+        resized = False if created else fit_plane_size(plane, cutter)
+        context.view_layer.update()
+        ensure_arrow(context, plane.matrix_world.translation)
+        for group in props.groups:
+            if group.lock_topbar or group.lock_rot_topbar:
+                apply_group_locks(group, props)
+        if valid_obj(props.bar_line):
+            if valid_obj(props.bar_line) and props.bar_line.modifiers:
+                props.bar_line.modifiers[0].target = plane
+            sync_bar_segment(context.scene, force=True)
+        activate(context, plane)
+        if resized:
+            message = "Da phong to PlaneVisual + PlaneCubeCut len %g mm" % PLANE_SIZE
+        else:
+            message = "%s PlaneVisual + PlaneCubeCut (%g mm) + Mui ten huong lap - bam Draw " \
+                      "Line Bar de ve line tren Plane" % ("Da tao" if created else "Da co", PLANE_SIZE)
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+class RMVB_OT_cut_top_bar(Operator):
+    """Them modifier: Union Bar Segment voi tat ca Bar Pillar, Difference PlaneCubeCut
+    (Manifold), Difference Base. Chi them modifier, khong apply"""
+    bl_idname = "rmvb.cut_top_bar"
+    bl_label = "Cut Top Bar"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        seg = props.bar_segment
+        if not valid_obj(seg):
+            self.report({'ERROR'}, "Chua co Bar Segment")
+            return {'CANCELLED'}
+        if seg.get("rmvb_applied"):
+            self.report({'ERROR'}, "Bar Segment da Apply - bam Delete Bar Design de sua tiep")
+            return {'CANCELLED'}
+        if not valid_obj(props.top_cutter):
+            self.report({'ERROR'}, "Chua co PlaneCubeCut - bam Create Top Bar Plane truoc")
+            return {'CANCELLED'}
+        seg["rmvb_cut"] = True
+        count = rebuild_segment_modifiers(context)
+        activate(context, seg)
+        self.report({'INFO'}, "Da them modifier Cut Top Bar (Bar Segment co %d modifier, "
+                    "chua apply)" % count)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Attachment: moi lan Add = 1 group (Empty cha + Part Bar + Part Sleeve + Visual)
+# ---------------------------------------------------------------------------
+def current_attachment_name(props):
+    names = get_attachment_items()
+    if props.active_attachment in names:
+        return props.active_attachment
+    if names:
+        return names[min(props.attachment_index, len(names) - 1)]
+    return ""
+
+
+def slugify(text):
+    return re.sub(r"[^\w\-.]+", "_", (text or "att"), flags=re.UNICODE)
+
+
+def unique_group_name(props, base):
+    names = {group.name for group in props.groups}
+    if base not in names:
+        return base
+    index = 2
+    while "%s_%d" % (base, index) in names:
+        index += 1
+    return "%s_%d" % (base, index)
+
+
+def group_by_name(props, name):
+    for group in props.groups:
+        if group.name == name:
+            return group
+    return None
+
+
+def group_objects(group):
+    """Moi object thuoc group (khong gom Empty)."""
+    objs = [group.part_bar, group.part_sleeve] + [v.object for v in group.visuals]
+    return [o for o in objs if valid_obj(o)]
+
+
+def attach_to(child, parent):
+    """Gan child vao parent (toa do local cua child = toa do cua parent)."""
+    child.parent = parent
+    child.matrix_parent_inverse = Matrix.Identity(4)
+
+
+def unparent_keep_world(obj):
+    world = obj.matrix_world.copy()
+    obj.parent = None
+    obj.matrix_world = world
+
+
+def _lock_cycle(props, group, target):
+    """Lock tu group -> target co tao vong khep kin (A -> B -> A) khong?"""
+    seen = {group.name}
+    current = target
+    while current is not None:
+        if current.name in seen:
+            return True
+        seen.add(current.name)
+        if current.lock_attachment and current.lock_target:
+            current = group_by_name(props, current.lock_target)
+        else:
+            break
+    return False
+
+
+LOCK_CONSTRAINTS = (CST_ON_PLANE, CST_ROT_LIMIT, CST_ROT_PLANE, CST_COPY_LOC, CST_COPY_ROT)
+
+
+def apply_group_locks(group, props):
+    """Dung lai cac constraint khoa tren Empty cua group:
+
+    - Lock Z voi Top Bar        : LIMIT_LOCATION z = 0 trong he truc cua PlaneVisual
+    - Lock Rotation voi Top Bar : khoa nghieng X/Y theo PlaneVisual, Z tu do. LIMIT_ROTATION
+                                  dua X/Y rieng cua group ve 0, roi COPY_ROTATION (Before
+                                  Original) dat huong cua Plane lam he truc cha -> Z cua
+                                  group luon vuong goc Plane, xoay Z la xoay quanh phap
+                                  tuyen Plane
+    - Lock Location & Rotation voi Attachment: COPY_LOCATION + COPY_ROTATION
+    """
+    empty = group.empty
+    if not valid_obj(empty):
+        return
+    plane = props.top_plane
+    if valid_obj(plane) and empty.parent == plane:
+        bpy.context.view_layer.update()      # scene v0.2.0: Lock Z tung parent vao Plane
+        unparent_keep_world(empty)
+    for constraint in list(empty.constraints):
+        if constraint.name in LOCK_CONSTRAINTS:
+            empty.constraints.remove(constraint)
+    if group.lock_topbar and valid_obj(plane):
+        constraint = empty.constraints.new('LIMIT_LOCATION')
+        constraint.name = CST_ON_PLANE
+        constraint.owner_space = 'CUSTOM'
+        constraint.space_object = plane
+        constraint.use_min_z = True
+        constraint.use_max_z = True
+        constraint.min_z = 0.0
+        constraint.max_z = 0.0
+        if hasattr(constraint, "use_transform_limit"):
+            constraint.use_transform_limit = True
+    if group.lock_rot_topbar and valid_obj(plane):
+        if empty.rotation_mode != 'XYZ':
+            empty.rotation_mode = 'XYZ'
+        limit = empty.constraints.new('LIMIT_ROTATION')
+        limit.name = CST_ROT_LIMIT
+        limit.owner_space = 'WORLD'        # Empty khong co parent: world = local (LOCAL khong khoa duoc)
+        for axis in ("x", "y"):
+            setattr(limit, "use_limit_" + axis, True)
+            setattr(limit, "min_" + axis, 0.0)
+            setattr(limit, "max_" + axis, 0.0)
+        if hasattr(limit, "use_transform_limit"):
+            limit.use_transform_limit = True
+        constraint = empty.constraints.new('COPY_ROTATION')
+        constraint.name = CST_ROT_PLANE
+        constraint.target = plane
+        constraint.mix_mode = 'BEFORE'
+    if group.lock_attachment and group.lock_target:
+        target = group_by_name(props, group.lock_target)
+        if (target is not None and target != group and valid_obj(target.empty)
+                and not _lock_cycle(props, group, target)):
+            for kind, name in (('COPY_LOCATION', CST_COPY_LOC),
+                               ('COPY_ROTATION', CST_COPY_ROT)):
+                constraint = empty.constraints.new(kind)
+                constraint.name = name
+                constraint.target = target.empty
+    bpy.context.view_layer.update()
+
+
+def set_move_tool(context):
+    """Chuyen cong cu 3D View sang Move (builtin.move). Bo qua neu khong co 3D View."""
+    area = view_3d_area(context)
+    if area is None:
+        return False
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    try:
+        with context.temp_override(area=area, region=region):
+            bpy.ops.wm.tool_set_by_id(name="builtin.move", space_type='VIEW_3D')
+        return True
+    except Exception as exc:
+        print("[Rmvb-Bar] Khong dat duoc cong cu Move: %s" % exc)
+        return False
+
+
+def select_group_for_move(context, group):
+    """Chon + active Plain Axes (Empty) cua group, Object Mode, cong cu Move."""
+    empty = group.empty
+    if not valid_obj(empty):
+        return False
+    try:
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    try:
+        empty.hide_select = False
+        empty.hide_set(False)
+        for obj in context.view_layer.objects:
+            if obj.select_get():
+                obj.select_set(False)
+        empty.select_set(True)
+        context.view_layer.objects.active = empty
+    except Exception as exc:
+        print("[Rmvb-Bar] Khong chon duoc '%s': %s" % (empty.name, exc))
+        return False
+    set_move_tool(context)
+    return True
+
+
+class RMVB_OT_select_attachment_group(Operator):
+    """Chon Plain Axes cua group Attachment (Object Mode, cong cu Move) de di chuyen nhanh"""
+    bl_idname = "rmvb.select_attachment_group"
+    bl_label = "Chon group Attachment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(name="Index", default=-1)
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        index = self.index if self.index >= 0 else props.group_index
+        if not (0 <= index < len(props.groups)):
+            self.report({'ERROR'}, "Chua chon group Attachment")
+            return {'CANCELLED'}
+        set_group_index(props, index)
+        if not select_group_for_move(context, props.groups[index]):
+            self.report({'ERROR'}, "Khong chon duoc Empty cua group")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class RMVB_OT_add_attachment(Operator):
+    """Them nguyen bo Attachment da chon (Part Bar, Part Sleeve, Visual Object) thanh
+    mot GROUP moi tai 3D Cursor"""
+    bl_idname = "rmvb.add_attachment"
+    bl_label = "Add selected Attachment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        context.view_layer.update()
+        name = current_attachment_name(props)
+        if not name:
+            self.report({'ERROR'}, "Chua chon Attachment trong Dental-Lib")
+            return {'CANCELLED'}
+        entry = lib_attachment(name) or {}
+        lib = dlib()
+        assets = {}
+        for slot in ("part_bar", "part_sleeve"):
+            path = lib.attachment_asset(name, slot) if lib else ""
+            if path and os.path.exists(path):
+                try:
+                    assets[slot] = mesh_from_file(path)
+                except Exception as exc:
+                    self.report({'WARNING'}, "Loi doc %s cua '%s': %s" % (slot, name, exc))
+        visuals = []
+        if lib:
+            for slot, path, rgba in lib_visuals(name):
+                if not path or not os.path.exists(path):
+                    continue
+                try:
+                    visuals.append((slot, mesh_from_file(path), rgba))
+                except Exception as exc:
+                    self.report({'WARNING'}, "Loi doc Visual Object '%s': %s" % (slot, exc))
+        if not assets and not visuals:
+            self.report({'ERROR'}, "Attachment '%s' chua co mesh nao (STL/PLY)" % name)
+            return {'CANCELLED'}
+
+        coll = ensure_collection(COL_ATTACHMENT)
+        matrix = context.scene.cursor.matrix.copy()
+        gname = unique_group_name(props, name)
+        empty = bpy.data.objects.new("Att_" + gname, None)
+        empty.empty_display_type = 'PLAIN_AXES'
+        empty.empty_display_size = 4.0
+        empty.show_in_front = True
+        coll.objects.link(empty)
+        empty.matrix_world = matrix
+        empty["rmvb_role"] = "ATTACHMENT_GROUP"
+
+        group = props.groups.add()
+        group.empty = empty
+        group["prev_name"] = gname
+        group.name = gname
+        group.lib_name = name
+        group.on_bar = bool(entry.get("on_bar", True))
+        group.on_sleeve = bool(entry.get("on_sleeve", False))
+
+        for slot, field, role in (("part_bar", "part_bar", "ATTACHMENT"),
+                                  ("part_sleeve", "part_sleeve", "ATTACHMENT_SLEEVE")):
+            mesh = assets.get(slot)
+            if mesh is None:
+                continue
+            obj = object_from_mesh("%s_%s" % (gname, slot), mesh, coll)
+            attach_to(obj, empty)
+            set_display_color(obj, lib_slot_color(name, slot))
+            obj["rmvb_role"] = role
+            obj["rmvb_attachment"] = name
+            setattr(group, field, obj)
+        for label, mesh, rgba in visuals:
+            vobj = object_from_mesh("%s_%s" % (gname, slugify(label)), mesh, coll)
+            attach_to(vobj, empty)
+            vobj["rmvb_role"] = "VISUAL"
+            vobj["rmvb_attachment"] = name
+            set_display_color(vobj, rgba)
+            ref = group.visuals.add()
+            ref.object = vobj
+            ref.tooth = label
+
+        set_group_index(props, len(props.groups) - 1)
+        rebuild_segment_modifiers(context)
+        self.report({'INFO'}, "Da them group Attachment '%s' (%d part, %d Visual Object)"
+                    % (gname, len(assets), len(visuals)))
+        return {'FINISHED'}
+
+
+def remove_group(props, index):
+    group = props.groups[index]
+    for obj in group_objects(group):
+        remove_object(obj)
+    remove_object(group.empty)
+    props.groups.remove(index)
+    set_group_index(props, min(props.group_index, len(props.groups) - 1))
+
+
+class RMVB_OT_remove_attachment_group(Operator):
+    """Xoa group Attachment dang chon"""
+    bl_idname = "rmvb.remove_attachment_group"
+    bl_label = "Xoa group dang chon"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        if not (0 <= props.group_index < len(props.groups)):
+            self.report({'ERROR'}, "Chua chon group Attachment")
+            return {'CANCELLED'}
+        name = props.groups[props.group_index].name
+        remove_group(props, props.group_index)
+        for group in props.groups:       # bo Lock dang tro toi group vua xoa
+            if group.lock_target == name:
+                group.lock_target = ""
+        rebuild_segment_modifiers(context)
+        self.report({'INFO'}, "Da xoa group '%s'" % name)
+        return {'FINISHED'}
+
+
+class RMVB_OT_clear_attachments(Operator):
+    """Xoa toan bo group Attachment da dat"""
+    bl_idname = "rmvb.clear_attachments"
+    bl_label = "Xoa tat ca Attachment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        while len(props.groups):
+            remove_group(props, len(props.groups) - 1)
+        rebuild_segment_modifiers(context)
+        self.report({'INFO'}, "Da xoa Attachment")
+        return {'FINISHED'}
+
+
+class RMVB_OT_apply_attachment_bar(Operator):
+    """Apply Part Bar cua cac group Attachment len Bar Segment: Union (Add on Bar)
+    hoac Difference (Remove on Bar). Chi them modifier, khong apply"""
+    bl_idname = "rmvb.apply_attachment_bar"
+    bl_label = "Apply Attachment on Bar"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        seg = props.bar_segment
+        if not valid_obj(seg):
+            self.report({'ERROR'}, "Chua co Bar Segment")
+            return {'CANCELLED'}
+        if seg.get("rmvb_applied"):
+            self.report({'ERROR'}, "Bar Segment da Apply - bam Delete Bar Design de sua tiep")
+            return {'CANCELLED'}
+        parts = [g for g in props.groups if valid_obj(g.part_bar)]
+        if not parts:
+            self.report({'ERROR'}, "Chua co Attachment nao co Part Bar")
+            return {'CANCELLED'}
+        seg["rmvb_attach"] = True
+        rebuild_segment_modifiers(context)
+        unions = sum(1 for g in parts if g.on_bar)
+        self.report({'INFO'}, "Da them %d modifier Attachment (%d Union, %d Difference)"
+                    % (len(parts), unions, len(parts) - unions))
+        return {'FINISHED'}
+
+
+class RMVB_UL_attachment_groups(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "name", text="", emboss=False, icon='EMPTY_AXIS')
+        row.label(text="Bar:%s Sleeve:%s" % ("+" if item.on_bar else "-",
+                                             "+" if item.on_sleeve else "-"))
+        op = row.operator(RMVB_OT_select_attachment_group.bl_idname, text="",
+                          icon=_ic('RESTRICT_SELECT_OFF'))
+        op.index = index
+
+
+# ---------------------------------------------------------------------------
+# Sleeve: ham dung khoi (kin, dilate, solidify)
 # ---------------------------------------------------------------------------
 def world_copy(obj, name, coll):
     """Ban sao object cung toa do world (mesh local duoc copy)."""
@@ -2054,71 +2769,6 @@ def world_copy(obj, name, coll):
     coll.objects.link(copy)
     copy.matrix_world = obj.matrix_world.copy()
     return copy
-
-
-def cap_boundary(bm, edges):
-    """Nap kin mot vong bien (danh sach canh) bang 1 mat n-gon."""
-    verts = ordered_loop_verts(edges)
-    if len(verts) > 1 and verts[0] is verts[-1]:
-        verts = verts[:-1]
-    if len(verts) < 3:
-        return False
-    try:
-        bm.faces.new(verts)
-        return True
-    except ValueError:
-        try:
-            bmesh.ops.holes_fill(bm, edges=edges)
-            return not any(e.is_boundary for e in edges)
-        except Exception:
-            return False
-
-
-def connection_cut_solid(base, extend, name, coll, flip=True):
-    """Khoi cat lay tu Connection Base (diem a).
-
-    Extrude 2 vung ho ra 2 HUONG NGUOC nhau `extend` mm (vung ket noi xuong
-    duoi, vung lo oc len tren), nap kin 2 dau extrude -> lang tru kin bao tron
-    than Connection, roi DAO MAT de DIFFERENCE cat het phan Segment xuyen qua.
-    """
-    copy = world_copy(base, name, coll)
-    bm = bmesh.new()
-    bm.from_mesh(copy.data)
-    loops = boundary_loops(bm)
-    if loops:
-        ordered = sorted(loops, key=lambda item: item["z"])
-        targets = [(ordered[0], ordered[0]["z"] - extend)]
-        if len(ordered) > 1:
-            targets.append((ordered[-1], ordered[-1]["z"] + extend))
-        for loop, target_z in targets:
-            new_verts, _faces, _rim = extrude_loop_to(bm, loop, target_z)
-            keep = set(new_verts)
-            rims = [e for e in bm.edges
-                    if e.is_boundary and all(v in keep for v in e.verts)]
-            if not cap_boundary(bm, rims):
-                bmesh.ops.holes_fill(bm, edges=rims)
-        left = [e for e in bm.edges if e.is_boundary]
-        if left:
-            bmesh.ops.holes_fill(bm, edges=left)
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-        if flip:
-            bmesh.ops.reverse_faces(bm, faces=bm.faces)
-    bm.to_mesh(copy.data)
-    bm.free()
-    copy.data.update()
-    return copy
-
-
-def cut_segment_by_connections(segment, bases, extend, name, coll, flip=True):
-    """Bar Segment - (moi Connection dao mat) -> tra ve ban da cat."""
-    ws = world_copy(segment, name, coll)
-    for base in bases:
-        if base is None or base.type != 'MESH':
-            continue
-        operand = connection_cut_solid(base, extend, base.name + ".neg", coll, flip)
-        boolean_objects(ws, [operand], 'DIFFERENCE')
-        remove_object(operand)
-    return ws
 
 
 def fill_holes(obj, relax=1e-6):
@@ -2182,427 +2832,6 @@ def closed_copy(obj, name, coll):
     return fill_holes(world_copy(obj, name, coll))
 
 
-def design_objects(context):
-    """Moi object tham gia khoi bar (pillar + segment)."""
-    props = context.scene.rmvb
-    objs = [r.object for r in props.pillars if r.object is not None]
-    if props.bar_segment is not None and props.bar_segment.name in bpy.data.objects:
-        objs.append(props.bar_segment)
-    return objs
-
-
-def _bbox_corners(objs):
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    corners = []
-    for obj in objs:
-        evaluated = obj.evaluated_get(depsgraph)
-        corners.extend(evaluated.matrix_world @ Vector(c) for c in evaluated.bound_box)
-    return corners
-
-
-def objects_top_z(objs):
-    corners = _bbox_corners(objs)
-    return max(co.z for co in corners) if corners else 0.0
-
-
-def bar_center(objs):
-    corners = _bbox_corners(objs)
-    if not corners:
-        return Vector((0.0, 0.0, 0.0))
-    total = Vector((0.0, 0.0, 0.0))
-    for corner in corners:
-        total += corner
-    return total / len(corners)
-
-
-class RMVB_OT_create_top_bar_plane(Operator):
-    """Tao mat phang Top Bar + khoi lop (an) bi khoa toa do theo mat phang"""
-    bl_idname = "rmvb.create_top_bar_plane"
-    bl_label = "Create Top Bar Plane"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        props = context.scene.rmvb
-        objs = design_objects(context)
-        if not objs:
-            self.report({'ERROR'}, "Chua co Bar Pillar / Bar Segment nao")
-            return {'CANCELLED'}
-
-        coll = ensure_collection(COL_TOPBAR)
-        for name in (OBJ_PLANE, OBJ_CUTTER):
-            old = bpy.data.objects.get(name)
-            if old is not None:
-                remove_object(old)
-
-        center = bar_center(objs)
-        top = objects_top_z(objs)
-        size = props.cutter_size * 0.5
-
-        plane_mesh = bpy.data.meshes.new(OBJ_PLANE)
-        plane_mesh.from_pydata(
-            [(-size, -size, 0), (size, -size, 0), (size, size, 0), (-size, size, 0)],
-            [], [(0, 1, 2, 3)])
-        plane_mesh.update()
-        plane = bpy.data.objects.new(OBJ_PLANE, plane_mesh)
-        coll.objects.link(plane)
-        plane.location = (center.x, center.y, top)
-        set_color(plane, (1.0, 0.90, 0.20, 1.0))
-        plane["rmvb_role"] = "TOPBAR_PLANE"
-
-        height = props.cutter_height
-        block = bpy.data.meshes.new(OBJ_CUTTER)
-        block.from_pydata(
-            [(-size, -size, 0.0), (size, -size, 0.0), (size, size, 0.0),
-             (-size, size, 0.0), (-size, -size, height), (size, -size, height),
-             (size, size, height), (-size, size, height)],
-            [], [(0, 1, 2, 3), (7, 6, 5, 4), (0, 4, 5, 1),
-                 (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)])
-        block.validate()
-        _bm = bmesh.new()
-        _bm.from_mesh(block)
-        bmesh.ops.recalc_face_normals(_bm, faces=_bm.faces)
-        _bm.to_mesh(block)
-        _bm.free()
-        block.update()
-        cutter = bpy.data.objects.new(OBJ_CUTTER, block)
-        coll.objects.link(cutter)
-        cutter.parent = plane
-        cutter.matrix_parent_inverse = plane.matrix_world.inverted()
-        cutter.display_type = 'WIRE'
-        cutter["rmvb_role"] = "TOPBAR_CUTTER"
-        cutter.hide_render = True
-        cutter.hide_set(True)
-
-        props.top_plane = plane
-        props.top_cutter = cutter
-        activate(context, plane)
-        self.report({'INFO'}, "Da tao Top Bar Plane tai Z=%.2f (khoi cat %g mm, an)"
-                    % (top, height))
-        return {'FINISHED'}
-
-
-class RMVB_OT_cut_top_bar(Operator):
-    """3 buoc: Pillar - Segment, union Pillar + Segment, cat theo khoi Top Bar"""
-    bl_idname = "rmvb.cut_top_bar"
-    bl_label = "Cut Top Bar"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        props = context.scene.rmvb
-        pillars = [r.object for r in props.pillars if r.object is not None]
-        segment = props.bar_segment
-        if segment is not None and segment.name not in bpy.data.objects:
-            segment = None
-        if not pillars and segment is None:
-            self.report({'ERROR'}, "Chua co Bar Pillar hoac Bar Segment")
-            return {'CANCELLED'}
-
-        coll = ensure_collection(COL_TOPBAR)
-        temp = ensure_collection("Rmvb Temp", coll)
-        # Xoa ket qua cu de bam Cut Top Bar nhieu lan khong tao object trung
-        previous = bpy.data.objects.get(OBJ_BAR)
-        if previous is not None:
-            remove_object(previous)
-        bases = {}
-        for item in props.placed:
-            if item.base_object is not None:
-                bases[item.tooth] = item.base_object
-        work = []
-        note = ""
-        try:
-            # Buoc 1 (diem a + b): Bar Segment - tung Connection dao mat.
-            # Connection duoc extrude 2 vung ho ra 2 huong nguoc nhau
-            # `connection_cut_extend` mm, nap 2 dau roi dao mat -> lang tru kin
-            # cat xuyen hoan toan phan Segment di qua tru Connection.
-            segment_cut = None
-            if segment is not None:
-                bases_list = [b for b in bases.values() if b is not None]
-                extend = props.connection_cut_extend
-                v_seg = solid_volume(segment)
-                segment_cut = cut_segment_by_connections(
-                    segment, bases_list, extend, OBJ_SEGMENT + ".cut", temp, True)
-                v_cut = solid_volume(segment_cut)
-                if v_cut > v_seg * 1.001 or v_cut < 0.02 * v_seg:
-                    # DIFFERENCE khong duoc lam khoi TANG len: khi operand da
-                    # kin thi normal dao bi solver hieu nguoc -> dung lai
-                    # normal goc (khoi van la lang tru chieu dai nhu diem a)
-                    remove_object(segment_cut)
-                    segment_cut = cut_segment_by_connections(
-                        segment, bases_list, extend, OBJ_SEGMENT + ".cut",
-                        temp, False)
-                    note = " (khoi Connection giu normal goc)"
-            # Buoc 2: union toan bo Bar Pillar + Segment da cat
-            solvers = None
-            for pillar in pillars:
-                copy = world_copy(pillar, pillar.name + ".union", temp)
-                copy["rmvb_degenerate"] = bool(pillar.get("rmvb_degenerate"))
-                if copy["rmvb_degenerate"]:
-                    # Pillar co thanh vo trung khit: Manifold crash native
-                    # (SplitPinchedVerts) tren Blender 4.5 -> dung EXACT
-                    solvers = ('EXACT',)
-                work.append(copy)
-            if segment_cut is not None:
-                work.append(segment_cut)
-            if not work:
-                raise RuntimeError("Khong co thanh phan de union")
-            bar = union_all(work, OBJ_BAR, coll, solvers=solvers)
-            if bar is None:
-                raise RuntimeError("Khong hop nhat duoc Bar tu cac thanh phan")
-            if solvers:
-                bar["rmvb_degenerate"] = True
-            purge_collection(temp)
-
-            # Buoc 3: cat theo khoi an gan voi Top Bar Plane
-            cutter = props.top_cutter
-            if cutter is not None and cutter.name in bpy.data.objects:
-                was_hidden = cutter.hide_get()
-                if was_hidden:
-                    cutter.hide_set(False)
-                context.view_layer.update()
-                boolean_objects(bar, [cutter], props.cut_mode, solvers=solvers)
-                if was_hidden:
-                    cutter.hide_set(True)
-
-            # Attachment: toggle Add/Remove on Bar = UNION (them) hoac
-            # DIFFERENCE (khoet l6)
-            if props.apply_attachment_bar:
-                for ref in props.attachments:
-                    if ref.object is None or ref.object.name not in bpy.data.objects:
-                        continue
-                    copy = world_copy(ref.object, ref.object.name + ".bar", temp)
-                    boolean_objects(bar, [copy],
-                                    'UNION' if ref.on_bar else 'DIFFERENCE',
-                                    solvers=solvers)
-                    remove_object(copy)
-        except Exception as exc:
-            purge_collection(temp)
-            self.report({'ERROR'}, "Loi Cut Top Bar: %s" % exc)
-            return {'CANCELLED'}
-
-        purge_collection(temp)
-        try:
-            bpy.data.collections.remove(temp)
-        except Exception:
-            pass
-
-        bar["rmvb_role"] = "BAR"
-        set_color(bar, (0.85, 0.55, 0.15, 1.0))
-        activate(context, bar)
-        purge_unused_meshes()
-        message = "Da Cut Top Bar (%s)%s" % (props.cut_mode, note)
-        self.report({'INFO'}, message)
-        return {'FINISHED'}
-
-
-# ---------------------------------------------------------------------------
-# 6.4 Attachment
-# ---------------------------------------------------------------------------
-def current_attachment_name(props):
-    names = get_attachment_items()
-    if props.active_attachment in names:
-        return props.active_attachment
-    if names:
-        return names[min(props.attachment_index, len(names) - 1)]
-    return ""
-
-
-def attachment_axis_empty(context):
-    """Empty dung lam truc chung cho cac Attachment (Group Axis Attachment)."""
-    empty = bpy.data.objects.get(OBJ_ATTACH_AXIS)
-    if empty is None:
-        empty = bpy.data.objects.new(OBJ_ATTACH_AXIS, None)
-        empty.empty_display_type = 'PLAIN_AXES'
-        empty.empty_display_size = 6.0
-        ensure_collection(COL_ATTACHMENT).objects.link(empty)
-        empty["rmvb_role"] = "ATTACH_AXIS"
-    return empty
-
-
-class RMVB_OT_add_attachment(Operator):
-    """Dat Attachment da chon (Apply Part Bar) vao vi tri hien tai cua bar"""
-    bl_idname = "rmvb.add_attachment"
-    bl_label = "Add selected Attachment"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        props = context.scene.rmvb
-        context.view_layer.update()
-        name = current_attachment_name(props)
-        if not name:
-            self.report({'ERROR'}, "Chua chon Attachment trong Dental-Lib")
-            return {'CANCELLED'}
-        entry = lib_attachment(name) or {}
-        lib = dlib()
-        asset = lib.attachment_asset(name, "part_bar") if lib else ""
-        if not asset or not os.path.exists(asset):
-            self.report({'ERROR'}, "Attachment '%s' chua co Apply Part Bar (STL/PLY)"
-                        % name)
-            return {'CANCELLED'}
-        try:
-            mesh = mesh_from_file(asset)
-        except Exception as exc:
-            self.report({'ERROR'}, "Loi doc mesh Attachment: %s" % exc)
-            return {'CANCELLED'}
-
-        coll = ensure_collection(COL_ATTACHMENT)
-        # Diem 6: dat theo 3D Cursor (vi tri + huong cua cursor), add nhieu lan
-        anchor = context.scene.cursor.location.copy()
-        matrix = context.scene.cursor.matrix.copy()
-
-        index = len(props.attachments)
-        obj = object_from_mesh("Attachment_%s_%d" % (slugify(name), index),
-                               mesh, coll, matrix)
-        # Diem: mau Apply Part Bar lay tu thu vien (mac dinh do, alpha 0.5)
-        set_display_color(obj, lib_slot_color(name, "part_bar"))
-        obj["rmvb_role"] = "ATTACHMENT"
-        obj["rmvb_attachment"] = name
-
-        ref = props.attachments.add()
-        ref.att_name = name
-        ref.object = obj
-        ref.on_bar = bool(entry.get("on_bar", True))
-        ref.on_sleeve = bool(entry.get("on_sleeve", False))
-
-        # Diem 9: Visual Object chi xuat hien kem, khong tham gia boolean
-        made_visuals = 0
-        if lib:
-            for slot, path, rgba in lib_visuals(name):
-                if not path or not os.path.exists(path):
-                    continue
-                try:
-                    vmesh = mesh_from_file(path)
-                except Exception as exc:
-                    self.report({'WARNING'},
-                                "Loi doc Visual Object '%s': %s" % (slot, exc))
-                    continue
-                vobj = object_from_mesh("Visual_%s_%s_%d" % (slugify(name),
-                                                              slugify(slot), index),
-                                        vmesh, coll, matrix)
-                vobj["rmvb_role"] = "VISUAL"
-                vobj["rmvb_attachment"] = name
-                # Diem: mau Visual Object chon trong thu vien Dental-Lib
-                set_display_color(vobj, rgba)
-                vref = ref.visuals.add()
-                vref.object = vobj
-                vref.tooth = slot
-                made_visuals += 1
-
-        plane = props.top_plane
-        if props.group_axis:
-            axis = attachment_axis_empty(context)
-            if props.group_axis_topbar and plane is not None:
-                lock_to_plane(axis, plane)
-                # Empty vua di chuyen nen cac Attachment da parent truoc do
-                # phai duoc chieu lai len Plane
-                for other in props.attachments:
-                    for child in ([other.object] +
-                                  [v.object for v in other.visuals]):
-                        if child is not None and child.parent == axis:
-                            project_to_plane(child, plane)
-            parent_keep_transform(obj, axis)
-            for vref in ref.visuals:
-                if vref.object is not None:
-                    if props.group_axis_topbar and plane is not None:
-                        project_to_plane(vref.object, plane)
-                    parent_keep_transform(vref.object, axis)
-            if props.group_axis_topbar and plane is not None:
-                project_to_plane(obj, plane)
-        elif props.group_axis_topbar:
-            if plane is None:
-                self.report({'WARNING'},
-                            "Chua co Top Bar Plane - khong lock duoc truc")
-            else:
-                lock_to_plane(obj, plane)
-                for vref in ref.visuals:
-                    if vref.object is not None:
-                        lock_to_plane(vref.object, plane)
-        self.report({'INFO'}, "Da dat Attachment '%s' (index %d, %d Visual Object)"
-                    % (name, index, made_visuals))
-        return {'FINISHED'}
-
-
-def project_to_plane(obj, plane):
-    """Tinh dich tam cua obj nam len mat phang Plane (giu nguyen rotation)."""
-    bpy.context.view_layer.update()
-    world = obj.matrix_world.copy()
-    local = plane.matrix_world.inverted() @ world.translation
-    local.z = 0.0
-    obj.matrix_world = (Matrix.Translation(plane.matrix_world @ local)
-                        @ world.to_quaternion().to_matrix().to_4x4())
-    return obj
-
-
-def lock_to_plane(obj, plane):
-    """Diem 7: Attachment xoay theo Plane va tam luon nam tren mat Plane.
-
-    Parent vao Plane (khong dung matrix_parent_inverse de tinh ro), dat vi tri
-    local = chieu cua tam len mat phang (z = 0) va them LIMIT_LOCATION khoa
-    dung chieu Z trong he truc Plane; X/Y tu do, rotation follow Plane.
-    """
-    bpy.context.view_layer.update()
-    world = obj.matrix_world.copy()
-    parent_rot = plane.matrix_world.to_quaternion()
-    local = plane.matrix_world.inverted() @ world.translation
-    local.z = 0.0                                   # chieu ve mat phang
-    scale = plane.matrix_world.to_scale()
-    obj.parent = plane
-    obj.matrix_parent_inverse = Matrix.Identity(4)
-    obj.location = local
-    obj.rotation_mode = 'QUATERNION'
-    obj.rotation_quaternion = (parent_rot.inverted()
-                               @ world.to_quaternion())
-    obj.scale = Vector((
-        world.to_scale()[0] / (scale[0] or 1.0),
-        world.to_scale()[1] / (scale[1] or 1.0),
-        world.to_scale()[2] / (scale[2] or 1.0)))
-    constraint = obj.constraints.get(CST_ON_PLANE)
-    if constraint is None:
-        constraint = obj.constraints.new('LIMIT_LOCATION')
-        constraint.name = CST_ON_PLANE
-    if hasattr(constraint, "owner_space"):
-        constraint.owner_space = 'LOCAL'
-    constraint.use_min_z = True
-    constraint.use_max_z = True
-    constraint.min_z = 0.0
-    constraint.max_z = 0.0
-    constraint.use_transform_limit = True
-    bpy.context.view_layer.update()
-
-
-def parent_keep_transform(child, parent):
-    """Parent giu nguyen vi tri world cua child."""
-    child.parent = parent
-    child.matrix_parent_inverse = parent.matrix_world.inverted()
-
-
-def slugify(text):
-    return re.sub(r"[^\w\-.]+", "_", (text or "att"), flags=re.UNICODE)
-
-
-class RMVB_OT_clear_attachments(Operator):
-    """Xoa toan bo Attachment da dat tren bar"""
-    bl_idname = "rmvb.clear_attachments"
-    bl_label = "Xoa Attachment da dat"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        props = context.scene.rmvb
-        for ref in list(props.attachments):
-            for vref in list(ref.visuals):
-                remove_object(vref.object)
-            ref.visuals.clear()
-            remove_object(ref.object)
-        props.attachments.clear()
-        axis = bpy.data.objects.get(OBJ_ATTACH_AXIS)
-        if axis is not None:
-            bpy.data.objects.remove(axis, do_unlink=True)
-        self.report({'INFO'}, "Da xoa Attachment")
-        return {'FINISHED'}
-
-
-# ---------------------------------------------------------------------------
-# 7. Sleeve Design
-# ---------------------------------------------------------------------------
 def _solidify(obj, thickness, offset):
     mod = obj.modifiers.new("RMVB_solidify", 'SOLIDIFY')
     mod.thickness = thickness
@@ -2642,73 +2871,65 @@ def sleeve_shell(source, inner_gap, wall, name, coll):
     return _solidify(inner, wall, 1.0)
 
 
-def bar_source(context):
-    """Object bar hien hanh (ket qua Cut Top Bar hoac gop pillar + segment)."""
-    props = context.scene.rmvb
-    bar = bpy.data.objects.get(OBJ_BAR)
-    if bar is not None:
-        return bar
-    objs = design_objects(context)
-    if not objs:
+# ---------------------------------------------------------------------------
+# Sleeve Design
+# ---------------------------------------------------------------------------
+def bar_source(context, coll):
+    """Ban sao (da ap modifier) cua Bar Segment, toa do world."""
+    seg = context.scene.rmvb.bar_segment
+    if not valid_obj(seg):
         return None
-    coll = ensure_collection(COL_SEGMENT)
-    copies = []
-    deg = False
-    for o in objs:
-        copy = world_copy(o, o.name + ".src", coll)
-        if o.get("rmvb_degenerate"):
-            copy["rmvb_degenerate"] = True
-            deg = True
-        copies.append(copy)
-    joined = join_objects(copies, OBJ_BAR + ".src", coll)
-    if joined is not None and deg:
-        joined["rmvb_degenerate"] = True
-    return joined
+    return evaluated_mesh_object(seg, "BarSegment.src", coll)
 
 
 class RMVB_OT_create_sleeve_design(Operator):
-    """Tao Sleeve: vo mong bao quanh bar voi offset + chieu day da chon"""
+    """Tao Sleeve: vo mong bao quanh bar voi offset + chieu day da chon, cat phan
+    tiep xuc voi nuou (Difference Gingiva)"""
     bl_idname = "rmvb.create_sleeve_design"
     bl_label = "Create Sleeve Design"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         props = context.scene.rmvb
-        source = bar_source(context)
-        if source is None:
-            self.report({'ERROR'}, "Chua co bar (hay tao Bar Pillar/Segment truoc)")
+        if not valid_obj(props.bar_segment):
+            self.report({'ERROR'}, "Chua co Bar Segment (hay tao Bar Segment truoc)")
             return {'CANCELLED'}
 
         coll = ensure_collection(COL_SLEEVE)
         work = ensure_collection("Rmvb Temp", coll)
-        old = props.sleeve_object
-        if old is not None and old.name in bpy.data.objects:
-            remove_object(old)
+        if valid_obj(props.sleeve_object):
+            remove_object(props.sleeve_object)
 
         inner_gap = max(props.sleeve_offset, 0.0)
         wall = max(props.sleeve_thickness, 0.01)
+        cut_gingiva = False
         try:
+            source = bar_source(context, work)
             sleeve = sleeve_shell(source, inner_gap, wall, "Sleeve", work)
+            remove_object(source)
             sleeve.name = OBJ_SLEEVE
             sleeve.data.name = OBJ_SLEEVE
-            if source is not None and source.get("rmvb_degenerate"):
-                sleeve["rmvb_degenerate"] = True
             for user in list(sleeve.users_collection):
                 if user != coll:
                     user.objects.unlink(sleeve)
             if sleeve.name not in coll.objects:
                 coll.objects.link(sleeve)
 
-            # Toggle Add/Remove on Sleeve: UNION (them) hoac DIFFERENCE (khoet)
+            # Add/Remove on Sleeve (Dental-Lib): Add = Union, Remove = Difference
             if props.apply_attachment_sleeve:
-                for ref in props.attachments:
-                    if ref.object is None or ref.object.name not in bpy.data.objects:
+                for group in props.groups:
+                    if not valid_obj(group.part_sleeve):
                         continue
-                    copy = world_copy(ref.object, ref.object.name + ".sleeve", work)
+                    copy = world_copy(group.part_sleeve, group.name + ".sleeve", work)
                     boolean_objects(sleeve, [copy],
-                                    'UNION' if ref.on_sleeve else 'DIFFERENCE',
-                                    solvers=solvers_for(sleeve))
+                                    'UNION' if group.on_sleeve else 'DIFFERENCE')
                     remove_object(copy)
+
+            # Cat phan tiep xuc voi nuou
+            gingiva = props.gingiva_object
+            if valid_obj(gingiva) and gingiva.type == 'MESH':
+                boolean_objects(sleeve, [gingiva], 'DIFFERENCE')
+                cut_gingiva = True
         except Exception as exc:
             purge_collection(work)
             self.report({'ERROR'}, "Loi tao Sleeve: %s" % exc)
@@ -2720,25 +2941,109 @@ class RMVB_OT_create_sleeve_design(Operator):
         except Exception:
             pass
 
-        # Diem: mau Sleeve = mau Apply Part Sleeve trong thu vien
-        # (mac dinh hong, alpha 0.5 de nhin xuyen qua bar ben trong)
         set_display_color(sleeve, lib_slot_color(
             current_attachment_name(props) or "", "part_sleeve"))
         sleeve["rmvb_role"] = "SLEEVE"
         props.sleeve_object = sleeve
         activate(context, sleeve)
         purge_unused_meshes()
-        self.report({'INFO'}, "Da tao Sleeve (offset %g mm, day %g mm)"
-                    % (inner_gap, wall))
+        self.report({'INFO'}, "Da tao Sleeve (offset %g mm, day %g mm%s)"
+                    % (inner_gap, wall, ", da cat Gingiva" if cut_gingiva else ""))
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-# 8. Save Design
+# Save Design
 # ---------------------------------------------------------------------------
+class RMVB_OT_apply_bar_design(Operator):
+    """Backup Bar Segment (BarSegmentBackup, giu nguyen modifier) roi Apply toan bo
+    modifier tren Bar Segment goc"""
+    bl_idname = "rmvb.apply_bar_design"
+    bl_label = "Apply Bar Design"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        seg = props.bar_segment
+        if not valid_obj(seg):
+            self.report({'ERROR'}, "Chua co Bar Segment")
+            return {'CANCELLED'}
+        if seg.get("rmvb_applied"):
+            self.report({'WARNING'}, "Bar Design da Apply - bam Delete Bar Design de sua tiep")
+            return {'CANCELLED'}
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        context.view_layer.update()
+        depsgraph = context.evaluated_depsgraph_get()
+        baked = _mesh_from_evaluated(seg.evaluated_get(depsgraph))
+        if len(baked.polygons) == 0:
+            bpy.data.meshes.remove(baked)
+            self.report({'ERROR'}, "Ket qua modifier rong - kiem tra lai cac Boolean")
+            return {'CANCELLED'}
+
+        backup = seg.copy()
+        backup.data = seg.data.copy()
+        backup.name = OBJ_BACKUP
+        backup.data.name = OBJ_BACKUP
+        for user in seg.users_collection:
+            user.objects.link(backup)
+        backup["rmvb_role"] = "SEGMENT_BACKUP"
+        backup.hide_set(True)
+
+        old = seg.data
+        baked.name = old.name
+        seg.data = baked
+        if old.users == 0:
+            bpy.data.meshes.remove(old)
+        for mod in list(seg.modifiers):
+            seg.modifiers.remove(mod)
+        seg["rmvb_applied"] = True
+        props.bar_backup = backup
+        activate(context, seg)
+        purge_unused_meshes()
+        self.report({'INFO'}, "Da Apply Bar Design (%d mat). Ban sua duoc luu o '%s' (an)"
+                    % (len(baked.polygons), backup.name))
+        return {'FINISHED'}
+
+
+class RMVB_OT_delete_bar_design(Operator):
+    """Xoa Bar Segment da Apply, dua BarSegmentBackup tro lai thanh ban chinh sua"""
+    bl_idname = "rmvb.delete_bar_design"
+    bl_label = "Delete Bar Design"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        backup = props.bar_backup
+        seg = props.bar_segment
+        if not valid_obj(backup):
+            self.report({'ERROR'}, "Khong co BarSegmentBackup - Bar Design chua duoc Apply")
+            return {'CANCELLED'}
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        if valid_obj(seg) and seg != backup:
+            remove_object(seg)
+        backup.name = OBJ_SEGMENT
+        backup.data.name = OBJ_SEGMENT
+        backup.hide_set(False)
+        backup["rmvb_role"] = "SEGMENT"
+        props.bar_segment = backup
+        props.bar_backup = None
+        rebuild_segment_modifiers(context)
+        activate(context, backup)
+        purge_unused_meshes()
+        self.report({'INFO'}, "Da xoa Bar Design da Apply - dang chinh sua '%s'"
+                    % backup.name)
+        return {'FINISHED'}
+
+
 def write_construction_info(stl_path, source_ci):
-    """Diem 10: chep constructionInfo goc va thay <Filename> dau bang ten STL
-    moi (dung cach add-on iBar dang lam). Tra ve duong dan file ghi duoc."""
+    """Chep constructionInfo goc va thay <Filename> dau bang ten STL moi (dung
+    cach add-on iBar dang lam). Tra ve duong dan file ghi duoc."""
     src = bpy.path.abspath(source_ci) if source_ci else ""
     if not src or not os.path.exists(src):
         folder = os.path.dirname(stl_path)
@@ -2772,63 +3077,74 @@ def write_construction_info(stl_path, source_ci):
 
 
 class RMVB_OT_save_design(Operator):
-    """Xuat STL cho Bar Design hoac Sleeve Design (kem Visual Object + constructionInfo)"""
+    """Xuat STL cho Bar Design va Sleeve Design (kem Visual Object + constructionInfo)"""
     bl_idname = "rmvb.save_design"
-    bl_label = "Save Design"
+    bl_label = "Save Bar & Sleeve Design"
     bl_options = {'REGISTER', 'UNDO'}
-
-    which: EnumProperty(
-        name="Which",
-        items=[('BAR', "Bar Design", ""), ('SLEEVE', "Sleeve Design", "")],
-        default='BAR')
 
     def execute(self, context):
         props = context.scene.rmvb
-        if self.which == 'BAR':
-            objects = [bpy.data.objects.get(OBJ_BAR)]
-            prefix = "Rmvb_Bar"
-            if objects[0] is None:
-                objects = [r.object for r in props.pillars if r.object is not None]
-                if props.bar_segment is not None:
-                    objects.append(props.bar_segment)
-        else:
-            objects = [props.sleeve_object]
-            prefix = "Rmvb_Sleeve"
-        objects = [o for o in objects if o is not None]
-        if not objects:
-            self.report({'ERROR'}, "Chua co %s de luu" % prefix)
+        items = []
+        if valid_obj(props.bar_segment):
+            items.append(("Rmvb_Bar", props.bar_segment))
+        if valid_obj(props.sleeve_object):
+            items.append(("Rmvb_Sleeve", props.sleeve_object))
+        if not items:
+            self.report({'ERROR'}, "Chua co Bar Segment hoac Sleeve de luu")
             return {'CANCELLED'}
-
-        # Diem 9: Visual Object chi duoc xuat kem, khong tham gia boolean
-        visuals = []
-        for ref in props.attachments:
-            for vref in ref.visuals:
-                obj = vref.object
-                if obj is not None and obj.name not in [o.name for o in objects]:
-                    visuals.append(obj)
-
-        folder = bpy.path.abspath(props.save_dir) if props.save_dir else project_dir()
+        folder = bpy.path.abspath(props.save_dir) if props.save_dir else ""
         if not folder or not os.path.isdir(folder):
-            folder = project_dir()
-        filepath = os.path.join(folder, "%s_%s.stl" % (prefix, timestamp()))
-        try:
-            export_stl(objects + visuals, filepath, context)
-        except Exception as exc:
-            self.report({'ERROR'}, "Khong xuat duoc STL: %s" % exc)
+            self.report({'ERROR'}, "Chon thu muc luu (file .blend chua duoc luu)")
             return {'CANCELLED'}
-        ci_path = write_construction_info(filepath, props.construction_file)
-        self.report({'INFO'}, "Da luu: %s" % filepath)
-        if ci_path:
-            self.report({'INFO'}, "Da cap nhat: %s" % ci_path)
-        else:
-            self.report({'WARNING'},
-                        "Khong tim thay constructionInfo de cap nhat")
+
+        # Visual Object chi duoc xuat kem, khong tham gia boolean
+        visuals = []
+        for group in props.groups:
+            visuals.extend(v.object for v in group.visuals if valid_obj(v.object))
+
+        stamp = timestamp()
+        saved = []
+        for prefix, obj in items:
+            filepath = os.path.join(folder, "%s_%s.stl" % (prefix, stamp))
+            try:
+                export_stl([obj] + visuals, filepath, context)
+            except Exception as exc:
+                self.report({'ERROR'}, "Khong xuat duoc %s: %s" % (prefix, exc))
+                return {'CANCELLED'}
+            saved.append(filepath)
+            ci_path = write_construction_info(filepath, props.construction_file)
+            if ci_path:
+                saved.append(ci_path)
+            else:
+                self.report({'WARNING'}, "Khong tim thay constructionInfo de cap nhat")
+        self.report({'INFO'}, "Da luu: " + ", ".join(os.path.basename(p) for p in saved))
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
+_ICON_NAMES = None
+
+
+def _ic(name):
+    """Ten icon hop le cho UILayout (icon sai lam Blender huy ca ham draw())."""
+    global _ICON_NAMES
+    if _ICON_NAMES is None:
+        names = set()
+        try:
+            for func in bpy.types.UILayout.bl_rna.functions.values():
+                for pname, prop in func.parameters.items():
+                    if pname == "icon" and hasattr(prop, "enum_items"):
+                        names.update(i.identifier for i in prop.enum_items)
+        except Exception:
+            pass
+        _ICON_NAMES = names
+    if not name:
+        return 'NONE'
+    return name if (not _ICON_NAMES or name in _ICON_NAMES) else 'NONE'
+
+
 class RMVB_PT_panel(Panel):
     bl_label = "Rmvb-Bar"
     bl_idname = "VIEW3D_PT_rmvb_bar"
@@ -2840,148 +3156,169 @@ class RMVB_PT_panel(Panel):
         layout = self.layout
         props = context.scene.rmvb
         if dlib() is None:
-            layout.label(text="Chua bat add-on Dental-Lib", icon='ERROR')
+            layout.label(text="Chua bat add-on Dental-Lib", icon=_ic('ERROR'))
 
-        # ---- 1-3: Import ------------------------------------------------
+        # ---- Set -----------------------------------------------------------
         box = layout.box()
-        box.label(text="1. Import", icon='IMPORT')
-        col = box.column(align=True)
-        for role, label in (('GINGIVA', "Import Gingiva (STL/PLY)"),
-                            ('DENTURE', "Import Denture-reference (STL/PLY)"),
-                            ('ANTAGONIST', "Import Antagonist (STL/PLY)")):
-            col.operator(RMVB_OT_import_mesh.bl_idname, text=label,
-                         icon='MESH_UVSPHERE').role = role
-        for label, field in (("Gingiva", "gingiva_object"),
-                             ("Denture", "denture_object"),
-                             ("Antagonist", "antagonist_object")):
+        box.label(text="1. Set (chọn object rồi bấm Set)", icon=_ic('RESTRICT_SELECT_OFF'))
+        for role, label, field in (
+                ('GINGIVA', "Set Gingiva", "gingiva_object"),
+                ('DENTURE', "Set Denture", "denture_object"),
+                ('ANTAGONIST', "Set Antagonist", "antagonist_object")):
             row = box.row(align=True)
-            row.label(text=label, icon='OUTLINER_OB_MESH')
-            row.prop(props, field, text="")
+            row.operator(RMVB_OT_set_role.bl_idname, text=label,
+                         icon=_ic('MESH_UVSPHERE')).role = role
+            sub = row.row(align=True)
+            sub.enabled = False
+            sub.prop(props, field, text="")
 
-        # ---- 4-5: Connection --------------------------------------------
+        # ---- Connection ----------------------------------------------------
         box = layout.box()
-        box.label(text="2. Connection Base", icon='MESH_CYLINDER')
-        box.prop(props, "connection_base")
-        if props.connection_name:
-            box.label(text="Library: " + props.connection_name, icon='INFO')
+        box.label(text="2. Connection Base", icon=_ic('MESH_CYLINDER'))
+        box.label(text="Select Connection Base")
+        box.menu("RMVB_MT_pick_connection",
+                 text=current_connection_name(props) or "(Trống)",
+                 icon=_ic('MESH_CYLINDER'))
         box.prop(props, "place_parts")
-        box.operator(RMVB_OT_place_connection.bl_idname,
-                     text="Place Connection (XML constructionInfo)",
-                     icon='EMPTY_SINGLE_ARROW')
+        row = box.row(align=True)
+        row.operator(RMVB_OT_place_connection.bl_idname,
+                     text="Place Connection (constructionInfo)",
+                     icon=_ic('EMPTY_SINGLE_ARROW'))
+        row.operator(RMVB_OT_clear_connection.bl_idname, text="", icon=_ic('TRASH'))
         if props.construction_file:
             box.label(text=os.path.basename(bpy.path.abspath(props.construction_file)),
-                      icon='FILE')
-        box.label(text="Da dat: %d implant" % len(props.placed), icon='CHECKMARK')
+                      icon=_ic('FILE'))
+        box.label(text="Đã đặt: %d implant" % len(props.placed), icon=_ic('CHECKMARK'))
 
-        # ---- 6.1 Bar Pillar ---------------------------------------------
+        # ---- Bar Pillar ----------------------------------------------------
         box = layout.box()
-        box.label(text="3. Bar Design - Bar Pillar", icon='MESH_CONE')
+        box.label(text="3. Bar Design - Bar Pillar", icon=_ic('MESH_CONE'))
         box.prop(props, "pillar_lift")
-        box.prop(props, "pillar_equalize")
         col = box.column(align=True)
         col.operator(RMVB_OT_create_bar_pillar.bl_idname,
-                     text="Create Bar Pillar", icon='MOD_SCREW')
+                     text="Create Bar Pillar", icon=_ic('MOD_SCREW'))
         sub = col.column(align=True)
         sub.operator(RMVB_OT_edit_bar_pillar.bl_idname,
-                     text="Edit Bar Pillar (Local)", icon='EDITMODE_HLT')
-        sub.operator(RMVB_OT_select_pillar_region.bl_idname,
-                     text="Select Screws", icon='VERTEXSEL').region = 'SCREWS'
-        sub.operator(RMVB_OT_select_pillar_region.bl_idname,
-                     text="Select Outside", icon='FACESEL').region = 'OUTSIDE'
+                     text="Edit Bar Pillar (Local)", icon=_ic('EDITMODE_HLT'))
+        sub.operator(RMVB_OT_select_pillar_top.bl_idname,
+                     text="Select Top", icon=_ic('VERTEXSEL'))
         sub.operator(RMVB_OT_exit_edit.bl_idname, text="Exit Edit Bar Pillar",
-                     icon='OBJECT_DATA')
-        box.label(text="Bar Pillar: %d" % len(props.pillars), icon='INFO')
+                     icon=_ic('OBJECT_DATA'))
+        box.label(text="Bar Pillar: %d" % len(props.pillars), icon=_ic('INFO'))
 
-        # ---- 6.2 Bar Segment --------------------------------------------
+        # ---- Bar Segment + Top Bar ----------------------------------------
         box = layout.box()
-        box.label(text="4. Bar Design - Bar Segment", icon='CURVE_PATH')
+        box.label(text="4. Bar Design - Bar Segment & Top Bar", icon=_ic('CURVE_PATH'))
+        plane_ok = valid_obj(props.top_plane)
+        box.operator(RMVB_OT_create_top_bar_plane.bl_idname,
+                     text="Create Top Bar Plane" if not plane_ok else "Create Top Bar Plane (đã có)",
+                     icon=_ic('MESH_PLANE'))
+        if valid_obj(props.bar_arrow):
+            box.label(text="Mũi tên hướng lắp: xoay '%s' để đổi hướng" % OBJ_ARROW,
+                      icon=_ic('EMPTY_SINGLE_ARROW'))
         col = box.column(align=True)
+        col.enabled = plane_ok
         col.operator(RMVB_OT_create_bar_line.bl_idname,
-                     text="Draw Line Bar (snap Gingiva)", icon='GREASEPENCIL')
-        col.operator(RMVB_OT_close_bar_line.bl_idname,
-                     text="Noi diem dau-cuoi (tuy chon)", icon='MESH_CIRCLE')
+                     text="Draw Line Bar (snap Plane)", icon=_ic('GREASEPENCIL'))
+        row = col.row(align=True)
+        row.operator(RMVB_OT_edit_bar_line.bl_idname, text="Edit Line Bar",
+                     icon=_ic('EDITMODE_HLT'))
+        row.operator(RMVB_OT_exit_edit.bl_idname, text="Exit Edit",
+                     icon=_ic('OBJECT_DATA'))
         col.prop(props, "bar_width")
         col.prop(props, "bar_height")
-        col.prop(props, "bar_clearance")
-        col.operator(RMVB_OT_create_bar_segment.bl_idname,
-                     text="Create Bar Segment", icon='MOD_SCREW')
-        col.operator(RMVB_OT_edit_bar_segment.bl_idname,
-                     text="Edit Bar Segment (Local)", icon='EDITMODE_HLT')
-        col.operator(RMVB_OT_exit_edit.bl_idname, text="Exit Edit Bar Segment",
-                     icon='OBJECT_DATA')
-
-        # ---- 6.3 Top Bar Plane ------------------------------------------
-        box = layout.box()
-        box.label(text="5. Bar Design - Top Bar", icon='MESH_PLANE')
-        box.prop(props, "cutter_height")
-        box.prop(props, "cutter_size")
-        box.operator(RMVB_OT_create_top_bar_plane.bl_idname,
-                     text="Create Top Bar Plane", icon='MESH_PLANE')
-        box.prop(props, "cut_mode")
-        box.prop(props, "connection_cut_extend")
+        col.operator(RMVB_OT_update_bar_segment.bl_idname, text="Cập nhật Bar Segment",
+                     icon=_ic('FILE_REFRESH'))
+        if plane_ok:
+            box.label(text="Sửa line / dời-xoay Plane / mũi tên: Bar Segment tự cập nhật",
+                      icon=_ic('INFO'))
         box.operator(RMVB_OT_cut_top_bar.bl_idname, text="Cut Top Bar",
-                     icon='MOD_BOOLEAN')
-        box.label(text="Plane: di chuyen / xoay de dat lai khoi cut", icon='INFO')
+                     icon=_ic('MOD_BOOLEAN'))
 
-        # ---- 6.4 Attachment ----------------------------------------------
+        # ---- Attachment ----------------------------------------------------
         box = layout.box()
-        box.label(text="6. Bar Design - Attachment", icon='MESH_CUBE')
-        box.prop(props, "attachment_name")
+        box.label(text="5. Attachment", icon=_ic('MESH_CUBE'))
+        box.label(text="Select Attachment")
+        box.menu("RMVB_MT_pick_attachment",
+                 text=current_attachment_name(props) or "(Trống)",
+                 icon=_ic('MESH_CUBE'))
         box.operator(RMVB_OT_add_attachment.bl_idname,
-                     text="Add selected Attachment", icon='ADD')
-        box.prop(props, "group_axis")
-        box.prop(props, "group_axis_topbar")
-        box.prop(props, "apply_attachment_bar")
-        box.operator(RMVB_OT_clear_attachments.bl_idname,
-                     text="Xoa Attachment da dat", icon='X')
-        visual_count = sum(len(ref.visuals) for ref in props.attachments)
-        box.label(text="Da dat: %d  Visual: %d" % (len(props.attachments),
-                                                   visual_count), icon='INFO')
+                     text="Add selected Attachment", icon=_ic('ADD'))
+        if len(props.groups):
+            box.template_list("RMVB_UL_attachment_groups", "", props, "groups",
+                              props, "group_index", rows=3)
+            if 0 <= props.group_index < len(props.groups):
+                group = props.groups[props.group_index]
+                box.prop(group, "name", text="Tên Attachment")
+                box.prop(group, "lock_topbar")
+                box.prop(group, "lock_rot_topbar")
+                box.prop(group, "lock_attachment")
+                if group.lock_attachment:
+                    box.prop_search(group, "lock_target", props, "groups",
+                                    text="Attachment")
+            row = box.row(align=True)
+            row.operator(RMVB_OT_remove_attachment_group.bl_idname,
+                         text="Xóa group", icon=_ic('X'))
+            row.operator(RMVB_OT_clear_attachments.bl_idname,
+                         text="Xóa tất cả", icon=_ic('TRASH'))
+        box.operator(RMVB_OT_apply_attachment_bar.bl_idname,
+                     text="Apply Attachment on Bar", icon=_ic('MOD_BOOLEAN'))
 
-        # ---- 7 Sleeve Design ---------------------------------------------
+        # ---- Sleeve Design -------------------------------------------------
         box = layout.box()
-        box.label(text="7. Sleeve Design", icon='MOD_SOLIDIFY')
+        box.label(text="6. Sleeve Design", icon=_ic('MOD_SOLIDIFY'))
         box.prop(props, "sleeve_offset")
         box.prop(props, "sleeve_thickness")
         box.prop(props, "apply_attachment_sleeve")
         box.operator(RMVB_OT_create_sleeve_design.bl_idname,
-                     text="Create Sleeve Design", icon='MOD_SOLIDIFY')
+                     text="Create Sleeve Design", icon=_ic('MOD_SOLIDIFY'))
 
-        # ---- 8 Save Design -----------------------------------------------
+        # ---- Save Design ---------------------------------------------------
         box = layout.box()
-        box.label(text="8. Save Design", icon='EXPORT')
-        box.prop(props, "save_dir")
+        box.label(text="7. Save Design", icon=_ic('EXPORT'))
         col = box.column(align=True)
-        col.operator(RMVB_OT_save_design.bl_idname, text="Save Bar Design",
-                     icon='EXPORT').which = 'BAR'
-        col.operator(RMVB_OT_save_design.bl_idname, text="Save Sleeve Design",
-                     icon='EXPORT').which = 'SLEEVE'
+        col.operator(RMVB_OT_apply_bar_design.bl_idname, text="Apply Bar Design",
+                     icon=_ic('CHECKMARK'))
+        col.operator(RMVB_OT_delete_bar_design.bl_idname, text="Delete Bar Design",
+                     icon=_ic('TRASH'))
+        box.prop(props, "save_dir")
+        box.operator(RMVB_OT_save_design.bl_idname, text="Save Bar & Sleeve Design",
+                     icon=_ic('EXPORT'))
 
 
 # ---------------------------------------------------------------------------
 # Register
 # ---------------------------------------------------------------------------
 _classes = (
+    RMVB_OT_pick_library_item,
+    RMVB_MT_pick_connection,
+    RMVB_MT_pick_attachment,
     RMVB_PG_PlacedConnection,
     RMVB_PG_PartRef,
-    RMVB_PG_AttachmentRef,
+    RMVB_PG_AttachmentGroup,
     RMVB_PG_props,
-    RMVB_OT_import_mesh,
+    RMVB_OT_set_role,
     RMVB_OT_place_connection,
+    RMVB_OT_clear_connection,
     RMVB_OT_create_bar_pillar,
     RMVB_OT_edit_bar_pillar,
-    RMVB_OT_select_pillar_region,
+    RMVB_OT_select_pillar_top,
     RMVB_OT_exit_edit,
+    RMVB_OT_create_top_bar_plane,
     RMVB_OT_create_bar_line,
     RMVB_OT_draw_bar_line,
-    RMVB_OT_close_bar_line,
-    RMVB_OT_create_bar_segment,
-    RMVB_OT_edit_bar_segment,
-    RMVB_OT_create_top_bar_plane,
+    RMVB_OT_edit_bar_line,
+    RMVB_OT_update_bar_segment,
     RMVB_OT_cut_top_bar,
     RMVB_OT_add_attachment,
+    RMVB_OT_select_attachment_group,
+    RMVB_OT_remove_attachment_group,
     RMVB_OT_clear_attachments,
+    RMVB_OT_apply_attachment_bar,
+    RMVB_UL_attachment_groups,
     RMVB_OT_create_sleeve_design,
+    RMVB_OT_apply_bar_design,
+    RMVB_OT_delete_bar_design,
     RMVB_OT_save_design,
     RMVB_PT_panel,
 )
@@ -2991,9 +3328,17 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.rmvb = PointerProperty(type=RMVB_PG_props)
+    if rmvb_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(rmvb_load_post)
+    if rmvb_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(rmvb_depsgraph_handler)
 
 
 def unregister():
+    if rmvb_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(rmvb_load_post)
+    if rmvb_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(rmvb_depsgraph_handler)
     del bpy.types.Scene.rmvb
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
@@ -3001,4 +3346,3 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-

@@ -261,6 +261,7 @@ Dưới đây là lịch sử các thay đổi dựa trên Git commit history:
 
 | Commit | Ngày | Mô tả thay đổi |
 |---|---|---|
+| `pending` | 07/10/2026 | Rmvb-Bar v0.3.2 (Lock Rotation với Top Bar chỉ khóa X/Y, Z tự do; file cũ tự nâng cấp); v0.3.1 (PlaneVisual và PlaneCubeCut 100 mm, Plane bản cũ tự phóng to); v0.3.0 (Create Top Bar Plane lên đầu, line vẽ trên PlaneVisual chỉ với 1 modifier Shrinkwrap, Bar Segment tự tạo/tự cập nhật theo line-Plane-mũi tên, bỏ nút Create Bar Segment/Nối đầu-cuối/Edit Bar Segment/khe hở Gingiva); v0.2.2 (thêm Lock Rotation với Top Bar; bấm mục danh sách Attachment chọn Plain Axes + công cụ Move; Lock Z không còn parent vào Plane); v0.2.1 (combobox Connection/Attachment chuyển sang menu thả xuống + operator, sửa lỗi không đổi được lựa chọn); v0.2.0: Set thay Import, Gingiva thành khối, Base chuẩn bị Boolean, Pillar từ vòng hở đáy, line theo thuật toán Splitter, Top Bar hình bình hành + mũi tên hướng lắp, Attachment theo group, Apply/Delete Bar Design; Dental-Lib v0.1.4 (tooltip) |
 | `pending` | 29/09/2026 | Create Tubes: tube đi theo lỗ ốc nghiêng đo từ STL, phóng to đầu top bao trọn lỗ ốc (v2.9.1) |
 | `pending` | 28/09/2026 | Thêm 2 add-on mới Dental-Lib + Rmvb-Bar (thiết kế bar implant) và script cài đặt đa nền tảng (Ubuntu/macOS) |
 | `pending` | 24/06/2026 | Add mesh size guard for Hybrid/iBar STL export over 30 MB |
@@ -297,36 +298,40 @@ API cho add-on khác: `dental_lib.connection_names()`, `get_connection(name)`,
 
 ### `rmvb_bar.py` — Rmvb-Bar
 
-Tab **Rmvb-Bar** trong Sidebar. Quy trình: Import → Connection → Bar Pillar →
-Bar Segment → Top Bar → Attachment → Sleeve → Save.
+Tab **Rmvb-Bar** trong Sidebar. Quy trình: Set → Connection → Bar Pillar →
+Create Top Bar Plane → Draw Line Bar → (Bar Segment tự cập nhật) → Cut Top Bar → Attachment → Sleeve → Save. Mọi bước trên Bar Segment
+chỉ **thêm modifier** (không apply) cho tới khi bấm *Apply Bar Design*.
 
 | Nhóm | Nút | Hành vi |
 |---|---|---|
-| Import | Import Gingiva / Denture-reference / Antagonist | Đọc STL/PLY (chọn nhiều file), gộp về 1 object theo vai trò, tô màu riêng |
-| Connection | Select Connection Base (combobox) | Danh sách lấy từ Dental-Lib |
-| Connection | Place Connection (XML constructionInfo) | Chọn file `.constructionInfo`/`.xml`, đặt Base theo `MatrixImplantGeometry` của từng răng có `ImplantType != None` |
-| Bar Pillar | Create Bar Pillar | Detect 2 boundary loop của Base → extrude cả hai lên theo local Z (vùng 2 đúng `pillar_lift`, mặc định 7 li = 7 mm; vùng 1 về cùng cao độ) → **nối 2 miệng extrude thành solid kín** (manifold, không còn shell hở). Vertex group `Screw`/`Outside` **chỉ chứa các đỉnh nằm ở đỉnh mũi extrude** (không ghi vòng miệng lỗ gốc) |
-| Bar Pillar | Edit / Select Screws / Select Outside / Exit | Edit Mode + Transform Orientation **Local**; chỉ chọn **các đỉnh đã extrude** (lọc theo cao độ đỉnh lưu trong `obj["rmvb_top_Screw"/"rmvb_top_Outside"]`, tự làm mới khi chỉ còn 1 mặt phẳng đỉnh). Pillar tạo bằng bản cũ vẫn chọn đúng nếu có metadata; bật thuộc tính `All Levels` của operator nếu muốn chọn cả vòng miệng lỗ |
-| Bar Segment | Draw Line Bar | Vẽ **polyline mở** theo kiểu GingivaWaxupDetection: giữ danh sách điểm world rồi dựng lại mesh mỗi lần thêm điểm → mọi điểm đều nối liên tục thành 1 đường (không còn lỗi chỉ nối 2 điểm đầu). Snap trên bề mặt Gingiva bằng ray riêng của object (không dính mesh khác); E/click thêm điểm, Backspace/Ctrl+Z xoá điểm cuối, Enter xong, Esc khôi phục line như trước khi vẽ. **Không tự nối điểm đầu–cuối**; muốn kín thì bấm nút "Nối điểm đầu-cuối (tuy chọn)". |
-| Bar Segment | Create / Edit / Exit | Sweep tiết diện chữ nhật (rộng × cao) theo line — **đáy bar nằm đúng trên line** (kiểm chứng: sai số 0.0000 mm) |
-| Top Bar | Create Top Bar Plane | Mặt phẳng hiển thị + khối cắt (ẩn) parent theo mặt phẳng |
-| Top Bar | Cut Top Bar | 3 bước: (1) **Bar Segment − cột Connection** (mỗi Connection được extrude 2 vùng hở ra 2 hướng **ngược nhau** ~10 mm rồi nap 2 đầu → lăng trụ kin cắt xuyen hoan toan) → (2) **union Pillar + Segment** → (3) cắt bằng khối ẩn (DIFFERENCE). Sau đó union/difference các Attachment theo toggle. Khoảng chỗi chỉnh bằng *Chỗi Connection (mm)* |
-| Attachment | Select / Add | Apply Part Bar được đặt tại **3D Cursor** (vị trí + hướng), bấm Add nhiều lần để đặt nhiều cái |
-| Attachment | Group Axis Attachment | Gom các Attachment dưới một Empty trục chung |
-| Attachment | Group Axis với Top Bar | Attachment **xoay theo Plane** và **tâm luôn nằm trên Plane** (chỉ khoá translate dọc Z của Plane; X/Y tự do) |
-| Sleeve | Offset / Thickness / Apply attachment / Create | Vo = bar nới `offset` rồi đổ dày `thickness` |
-| Save | Save Bar Design / Save Sleeve Design | Xuất STL (`Rmvb_Bar_<yyMMdd-HHmm>.stl`) + **Visual Objects xuất kèm** (không tham gia boolean) + ghi `.constructionInfo` mới với `<Filename>` đổi sang tên STL (như add-on iBar) |
+| Set | Set Gingiva / Denture / Antagonist | Không còn Import: chọn object mesh có sẵn rồi bấm Set. Gingiva màu hồng (opacity 0.5), Denture xanh lá (0.5), Antagonist nâu (1). **Gingiva được chuẩn bị thành khối kín**: fill các lỗ nhỏ mặt trên, extrude vòng hở lớn nhất (mặt dưới) 10 mm theo local Z ra phía hở (thường −Z) rồi fill tạo đế |
+| Connection | Select Connection Base (menu thả xuống từ Dental-Lib) + Place Connection | Đặt Base theo `MatrixImplantGeometry`. Mỗi Base được chuẩn bị: vùng hở đáy **extrude −2 mm, scale local ×2**; vùng hở đỉnh (Screw) **extrude +30 mm**; nắp kín 2 đầu + Flip Normal (normal ra ngoài) để làm khối Boolean |
+| Connection | Clear Connection | Xoá Base + Bar Pillar đã đặt để chọn lại constructionInfo |
+| Bar Pillar | Create Bar Pillar | Chỉ lấy **vùng hở đáy (Connection)**: sao chép vòng điểm gốc của Base ra object `BarPillar_<răng>`, extrude lên `Extrude lên` mm (mặc định 7) theo local Z, fill kín đáy + đỉnh → solid manifold |
+| Bar Pillar | Edit / Select Top / Exit | Select Top: vào Edit Mode và chỉ chọn các đỉnh ở đỉnh mũi extrude (Select Screws/Outside đã bỏ) |
+| Bar Segment | **Create Top Bar Plane** (bước đầu tiên) | Tạo trong collection `CutPlane`: `PlaneVisual` 100 mm (xanh dương, opacity 0.4) và `PlaneCubeCut` (plane 100 mm extrude +100 mm = khối lập phương, opacity 0.5, **ẩn**, parent theo PlaneVisual); đặt ở đỉnh Bar Pillar. **Mũi tên hướng lắp** (`InsertionArrow`, Empty mũi tên Z+) cũng hiện ở bước này, xoay nó để đổi hướng lắp |
+| Bar Segment | Draw Line Bar (snap Plane) | Line chỉ có **1 modifier `RMVB_Shrinkwrap`** (Nearest Surface Point, Above Surface) bám vào PlaneVisual, hiện ngay trong Edit Mode (On Cage). Modal vẽ theo con trỏ: E/click thêm điểm **ngay trên Plane**, Backspace xoá điểm cuối, Enter/Esc/chuột phải xong. Không còn nút nối đầu–cuối. *Edit Line Bar* vào lại Edit Mode để sửa |
+| Bar Segment | Bar Segment **tự tạo và tự cập nhật** | Khi line có từ 2 điểm: line (nằm trên Plane) được extrude **ngược chiều mũi tên** `Chiều cao bar` (đo vuông góc Plane), rộng `Bề rộng bar`, cạnh bên song song mũi tên (tiết diện hình bình hành, vát mép ở góc). Sửa điểm line (kể cả đang Edit Mode), dời/xoay Plane hoặc mũi tên, đổi thông số đều dựng lại mesh ngay (handler `depsgraph_update_post`). Nút *Cập nhật Bar Segment* chỉ là dự phòng. Modifier đầu tiên của Bar Segment: Difference với Gingiva. Bar Segment không còn sửa tay được (mesh được dựng lại từ line) |
+| Top Bar | Cut Top Bar | Chỉ **Add Modifier** lên Bar Segment: Union với từng Bar Pillar → Difference `PlaneCubeCut` (Manifold) → Difference từng Base. Kiểu cắt luôn là cắt bỏ phần trong khối |
+| Attachment | Add selected Attachment | Mỗi lần Add = **1 group** (Empty cha + Part Bar + Part Sleeve + Visual Object) tại 3D Cursor; tên group tự đề xuất theo tên Attachment, sửa được ngay trên panel |
+| Attachment | Lock Z / Lock Rotation với Top Bar, Lock Location & Rotation với Attachment | Theo từng group, dùng constraint trên Empty: *Lock Z* giữ tâm group trên mặt PlaneVisual (khóa Z local của Plane, X/Y tự do, không đổi hướng xoay); *Lock Rotation* chỉ khóa xoay **X và Y** theo PlaneVisual (trục Z của group luôn vuông góc Plane, nghiêng Plane thì group nghiêng theo), **không khóa xoay Z** (vẫn xoay được quanh pháp tuyến Plane), không đổi vị trí; *Lock Location & Rotation* chọn tên group gốc trong combobox, group này luôn cùng vị trí + hướng |
+| Attachment | Bấm vào mục trong danh sách group | Chọn và active **Plain Axes** của group, về **Object Mode**, chuyển sang công cụ **Move** để kéo nhanh vị trí. Nút ô vuông cuối mỗi hàng làm lại việc này khi mục đã đang active |
+| Attachment | Apply Attachment on Bar | Chỉ **Add Modifier**: Part Bar Union (Add on Bar) hoặc Difference (Remove on Bar) lên Bar Segment |
+| Sleeve | Create Sleeve Design | Vỏ = bar nới `offset` rồi đổ dày `thickness`, áp Part Sleeve theo toggle Add/Remove on Sleeve, rồi **Difference với Gingiva** để cắt phần tiếp xúc nướu |
+| Save | Apply Bar Design | Backup Bar Segment ra `BarSegmentBackup` (ẩn, giữ nguyên modifier) rồi apply toàn bộ modifier trên Bar Segment gốc |
+| Save | Delete Bar Design | Xoá Bar Segment đã apply, `BarSegmentBackup` đổi tên lại thành `BarSegment` để tiếp tục sửa thiết kế |
+| Save | Save Bar & Sleeve Design | Một nút xuất `Rmvb_Bar_*.stl` + `Rmvb_Sleeve_*.stl` (+ Visual Object, + `.constructionInfo` mới). Thư mục lưu mặc định là thư mục chứa file `.blend`, để trống nếu chưa lưu file |
+
+Bar Pillar và Bar Segment nằm trong collection `BarDesign`.
 
 Toggle **Add/Remove on Bar** và **Add/Remove on Sleeve** trong Dental-Lib được hiểu là
-**UNION (true) / DIFFERENCE (false)** khi gộp Attachment vào Bar hoặc Sleeve.
+**Add = UNION / Remove = DIFFERENCE** khi gộp Attachment vào Bar (bấm *Apply
+Attachment on Bar*) hoặc Sleeve (bấm *Create Sleeve Design*).
 
-Vận hành đã kiểm chứng (Blender 5.2 LTS, headless): import → place 6 implant từ
-`Ex/*.constructionInfo` → 6 Bar Pillar **solid kín** (boundary=0, non-manifold=0,
-80.91 mm³/cái) → Bar Segment (đáy đúng trên line, cao 3.00 mm) → Cut Top Bar
-(bar manifold ~1.77e3 mm³, **giao với cột Connection = 0.00 mm³**, bấm 2 lần
-cho cùng kết quả và không sinh object rác) → Attachment tại cursor + Visual
-Object, tâm bám Plane khi xoay/kéo → Sleeve manifold → xuất STL
-+ `.constructionInfo` hợp lệ.
+Đã kiểm chứng headless trên Blender 4.5 và 5.1 (đường dẫn đầy đủ Set → Place →
+Pillar → Line → Segment → Top Bar → Cut → Attachment → Sleeve → Apply/Delete →
+Save) và trên giao diện thật (mô phỏng sự kiện chuột/phím cho chế độ vẽ line,
+vẽ panel không lỗi).
 
 ## 📄 License
 
