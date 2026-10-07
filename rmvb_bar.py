@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 3, 2),
+    "version": (0, 3, 7),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -44,6 +44,7 @@ from bpy.props import (
     BoolProperty,
     IntProperty,
     FloatProperty,
+    FloatVectorProperty,
     EnumProperty,
     CollectionProperty,
     PointerProperty,
@@ -94,6 +95,12 @@ CONN_BOTTOM_SCALE = 2.0         # ... roi scale local x2
 CONN_TOP_EXTRUDE = 30.0         # Base ho dinh (Screw): extrude 30 mm
 PLANE_SIZE = 100.0              # PlaneVisual / PlaneCubeCut: 100 x 100 mm
 PLANE_CUBE_HEIGHT = 100.0       # PlaneCubeCut: extrude +z local 100 mm (hop lap phuong)
+
+# Mau hien thi cua Implant Connection (RGBA)
+COLOR_CONN_VISUAL = (0.5, 0.5, 0.5, 1.0)     # ConnectionVisual: xam (Value 0.5), opacity 1
+COLOR_CONN_ANALOG = (0.10, 0.30, 1.00, 1.0)  # Analog: xanh lam, opacity 1
+COLOR_CONN_SCREW = (0.3, 0.3, 0.3, 0.8)      # Screw: xam (Value 0.3), opacity 0.8
+OBJ_CONN_VISUAL = "ConnectionVisual"
 
 # Mau dung khi thu vien khong khai bao (trung voi mac dinh cua Dental-Lib)
 FALLBACK_PART_BAR_COLOR = (1.0, 0.0, 0.0, 0.5)       # do, alpha 0.5
@@ -851,6 +858,7 @@ class RMVB_PG_PlacedConnection(PropertyGroup):
     tooth: StringProperty(name="Tooth", default="?")
     lib_name: StringProperty(name="Library", default="")
     base_object: PointerProperty(name="Base", type=bpy.types.Object)
+    visual_object: PointerProperty(name="ConnectionVisual", type=bpy.types.Object)
     analog_object: PointerProperty(name="Analog", type=bpy.types.Object)
     screw_object: PointerProperty(name="Screw", type=bpy.types.Object)
     scanbody_object: PointerProperty(name="Scanbody", type=bpy.types.Object)
@@ -911,12 +919,21 @@ class RMVB_PG_props(PropertyGroup):
     construction_file: StringProperty(name="constructionInfo",
                                       subtype='FILE_PATH', default="")
     placed: CollectionProperty(type=RMVB_PG_PlacedConnection)
-    place_parts: BoolProperty(
-        name="Đặt kèm Analog / Screw / Scanbody",
-        description="Tao them cac mesh con lai cua Connection (an) tai cung "
-                    "vi tri implant",
-        default=False)
-
+    use_org_txt: BoolProperty(
+        name="Transform theo before/transform.txt",
+        description="Khi Place Connection, doc before.txt + transform.txt (do add-on iBar ghi) o thu "
+                    "muc constructionInfo (hoac thu muc file .blend) va dua implant tu toa do file "
+                    "ve toa do lam viec: transform x before^-1. Save Bar & Sleeve se dua nguoc ve "
+                    "toa do file. Tat neu Gingiva dang o toa do file",
+        default=True)
+    org_active: BoolProperty(
+        name="Da transform theo txt", default=False,
+        description="Place Connection gan nhat da dung before/transform.txt")
+    org_matrix: FloatVectorProperty(
+        name="Toa do file -> lam viec", size=16,
+        default=(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1),
+        description="transform x before^-1 (4x4, theo hang)")
+    org_folder: StringProperty(name="Thu muc txt", default="")
     # Bar Pillar
     pillars: CollectionProperty(type=RMVB_PG_PartRef)
     pillar_lift: FloatProperty(
@@ -1034,11 +1051,15 @@ def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
     """Bien mesh Gingiva thanh KHOI kin:
 
     1. Cac vung ho nho (mat tren): fill de khong bi lung.
-    2. Vong ho lon nhat (mat duoi): extrude `depth` mm theo local Z ra phia mo,
-       roi fill de tao de -> toan bo Gingiva thanh khoi.
+    2. Vong ho lon nhat (mat duoi): extrude `depth` mm theo Z WORLD (global) huong -Z,
+       khong phu thuoc xoay / scale cua object, roi fill de tao de -> toan bo
+       Gingiva thanh khoi.
+
+    info["open_side_up"] = True neu than mesh nam DUOI vanh (mat ho quay len +Z world):
+    extrude -Z khi do di xuyen vao than mesh, nen Set Gingiva se canh bao.
     """
     info = {"loops": 0, "filled": 0, "extruded": False, "closed": False,
-            "direction": 0}
+            "open_side_up": False}
     bm = bmesh.new()
     bm.from_mesh(obj.data)
     loops = boundary_loops(bm)
@@ -1050,19 +1071,22 @@ def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
                 continue
             if cap_loop(bm, loop):
                 info["filled"] += 1
+        matrix = obj.matrix_world
         rim_verts = unique_loop_verts(base)
-        rim_center = sum((v.co for v in rim_verts), Vector()) / max(1, len(rim_verts))
-        body = sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts))
-        # Than mesh nam phia tren vanh -> mat mo quay xuong -> extrude -Z local
-        sign = -1.0 if body.z >= rim_center.z else 1.0
-        scale_z = (obj.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))).length or 1.0
+        rim_center = matrix @ (sum((v.co for v in rim_verts), Vector()) / max(1, len(rim_verts)))
+        body = matrix @ (sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts)))
+        info["open_side_up"] = body.z < rim_center.z - 1e-6
+        # Dich chuyen (0, 0, -depth) trong toa do WORLD, doi sang toa do local cua mesh
+        try:
+            shift = matrix.to_3x3().inverted() @ Vector((0.0, 0.0, -depth))
+        except ValueError:
+            shift = Vector((0.0, 0.0, -depth))
         new_verts = _extrude_loop(bm, base)
         for vert in new_verts:
-            vert.co.z += sign * depth / scale_z
+            vert.co += shift
         for loop in _loops_within(bm, new_verts):
             cap_loop(bm, loop)
         info["extruded"] = True
-        info["direction"] = int(sign)
         outward_solid(bm)
         bm.to_mesh(obj.data)
         obj.data.update()
@@ -1141,10 +1165,13 @@ class RMVB_OT_set_role(Operator):
                     self.report({'ERROR'}, "Khong chuan bi duoc Gingiva: %s" % exc)
                     return {'CANCELLED'}
                 obj["rmvb_gingiva_ready"] = True
-                message = " (fill %d lo mat tren, extrude de %s%g mm, %s)" % (
-                    info["filled"], "-" if info["direction"] < 0 else "+",
-                    GINGIVA_BASE_DEPTH,
+                message = " (fill %d lo mat tren, extrude de -%g mm theo Z world, %s)" % (
+                    info["filled"], GINGIVA_BASE_DEPTH,
                     "khoi kin" if info["closed"] else "CHUA kin")
+                if info["open_side_up"]:
+                    self.report({'WARNING'},
+                                "Mat ho cua Gingiva quay LEN (+Z world): extrude -Z di xuyen vao "
+                                "than mesh. Xoay Gingiva cho mat ho huong xuong roi Set lai")
                 if not info["closed"]:
                     self.report({'WARNING'},
                                 "Gingiva van con ho - Boolean co the khong on dinh")
@@ -1163,8 +1190,8 @@ class RMVB_OT_set_role(Operator):
 def clear_placed_connections(context, remove_pillars=False):
     props = context.scene.rmvb
     for item in list(props.placed):
-        for field in ("base_object", "analog_object", "screw_object",
-                      "scanbody_object"):
+        for field in ("base_object", "visual_object", "analog_object",
+                      "screw_object", "scanbody_object"):
             remove_object(getattr(item, field))
     props.placed.clear()
     if remove_pillars:
@@ -1224,6 +1251,68 @@ def prepare_connection_mesh(source):
     return mesh, info
 
 
+ORG_BEFORE = "before.txt"
+ORG_TRANSFORM = "transform.txt"
+
+
+def read_matrix_txt(filepath):
+    """Doc file ma tran 4x4 do add-on iBar ghi: 4 dong, moi dong 4 so cach nhau bang dau phay."""
+    rows = []
+    with open(filepath, "r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append([float(value) for value in line.split(",")])
+    if len(rows) != 4 or any(len(row) != 4 for row in rows):
+        raise ValueError("%s can 4 dong x 4 so" % os.path.basename(filepath))
+    return Matrix(rows)
+
+
+def _find_file_ci(folder, name):
+    """Duong dan file `name` trong `folder` (khong phan biet hoa thuong), hoac ""."""
+    try:
+        for entry in os.listdir(folder):
+            full = os.path.join(folder, entry)
+            if entry.lower() == name and os.path.isfile(full):
+                return full
+    except OSError:
+        pass
+    return ""
+
+
+def load_org_transform(construction_path):
+    """Tim before.txt + transform.txt (thu muc constructionInfo truoc, roi thu muc .blend).
+
+    Tra ve (work_from_org, folder). work_from_org = transform x before^-1 chuyen toa do
+    file (ORG) sang toa do lam viec, giong 'Create Tubes' / 'Offset from ORG to current'
+    cua add-on iBar. Khong tim thay du 2 file -> (None, thu_muc_co_1_file_hoac_"").
+    Raise ValueError/OSError neu file hong.
+    """
+    folders = []
+    for folder in (os.path.dirname(os.path.abspath(construction_path)), blend_dir()):
+        if folder and folder not in folders:
+            folders.append(folder)
+    partial = ""
+    for folder in folders:
+        before = _find_file_ci(folder, ORG_BEFORE)
+        transform = _find_file_ci(folder, ORG_TRANSFORM)
+        if before and transform:
+            before_matrix = read_matrix_txt(before)
+            transform_matrix = read_matrix_txt(transform)
+            try:
+                inverse = before_matrix.inverted()
+            except ValueError:
+                raise ValueError("before.txt khong kha nghich")
+            return transform_matrix @ inverse, folder
+        if before or transform:
+            partial = folder
+    return None, partial
+
+
+def org_matrix_from_props(props):
+    flat = list(props.org_matrix)
+    return Matrix([flat[i * 4:(i + 1) * 4] for i in range(4)])
+
+
 class RMVB_OT_place_connection(Operator, ImportHelper):
     """Doc file constructionInfo va dat Implant Connection theo dung toa do XML"""
     bl_idname = "rmvb.place_connection"
@@ -1263,32 +1352,71 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
-            base_mesh, base_info = prepare_connection_mesh(mesh_from_file(base_path))
+            source_mesh = mesh_from_file(base_path)
+            base_mesh, base_info = prepare_connection_mesh(source_mesh)
         except Exception as exc:
             self.report({'ERROR'}, "Loi doc mesh Base: %s" % exc)
             return {'CANCELLED'}
 
+        org = None
+        org_folder = ""
+        if props.use_org_txt:
+            try:
+                org, org_folder = load_org_transform(path)
+            except (OSError, ValueError) as exc:
+                self.report({'WARNING'}, "Khong doc duoc before/transform.txt (%s) - dat "
+                            "theo toa do file" % exc)
+            else:
+                if org is None:
+                    where = os.path.dirname(os.path.abspath(path))
+                    self.report({'WARNING'}, "Khong thay du before.txt + transform.txt%s trong '%s' "
+                                "(va thu muc .blend) - dat theo toa do file"
+                                % (" (moi co 1 file)" if org_folder else "", where))
+
+        # Hinh hien thi cua Base GOC (chua extrude/nap kin), normal huong ra ngoai
+        visual_mesh = source_mesh.copy()
+        visual_mesh.name = "Rmvb_ConnVisual"
+        bm = bmesh.new()
+        bm.from_mesh(visual_mesh)
+        outward_solid(bm)
+        bm.to_mesh(visual_mesh)
+        bm.free()
+        visual_mesh.update()
+
+        # Analog / Screw / Scanbody: luon dat vao scene (moi loai 1 ban copy dung chung)
         part_meshes = {}
-        if props.place_parts:
-            for slot in ("analog", "screw", "scanbody"):
-                asset = lib_connection_asset(lib_name, slot)
-                if asset and os.path.exists(asset):
-                    try:
-                        part_meshes[slot] = mesh_from_file(asset)
-                    except Exception as exc:
-                        self.report({'WARNING'}, "%s: %s" % (slot, exc))
+        for slot in ("analog", "screw", "scanbody"):
+            asset = lib_connection_asset(lib_name, slot)
+            if asset and os.path.exists(asset):
+                try:
+                    part_meshes[slot] = mesh_from_file(asset).copy()
+                    part_meshes[slot].name = "Rmvb_Conn_" + slot
+                except Exception as exc:
+                    self.report({'WARNING'}, "%s: %s" % (slot, exc))
+        part_style = {
+            "analog": (COLOR_CONN_ANALOG, False),
+            "screw": (COLOR_CONN_SCREW, False),
+            "scanbody": (FALLBACK_VISUAL_COLOR, True),     # Scanbody: an
+        }
 
         clear_placed_connections(context, remove_pillars=True)
         coll = ensure_collection(COL_CONNECTION)
         for implant in implants:
             tooth = str(implant["tooth"])
-            matrix = implant["matrix"]
+            matrix = org @ implant["matrix"] if org is not None else implant["matrix"]
+            # Base da xu ly (extrude) chi dung lam khoi Boolean -> an
             obj = object_from_mesh("Conn_%s_Base" % tooth, base_mesh, coll, matrix)
             set_color(obj, (0.72, 0.74, 0.78, 1.0))
+            obj.hide_set(True)
             item = props.placed.add()
             item.tooth = tooth
             item.lib_name = lib_name
             item.base_object = obj
+            visual = object_from_mesh("%s_%s" % (OBJ_CONN_VISUAL, tooth), visual_mesh,
+                                      coll, matrix)
+            set_display_color(visual, COLOR_CONN_VISUAL)
+            visual["rmvb_role"] = "CONNECTION_VISUAL"
+            item.visual_object = visual
             for slot, field in (("analog", "analog_object"),
                                 ("screw", "screw_object"),
                                 ("scanbody", "scanbody_object")):
@@ -1297,17 +1425,25 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
                     continue
                 part = object_from_mesh("Conn_%s_%s" % (tooth, slot.capitalize()),
                                         mesh, coll, matrix)
-                part.hide_set(True)
+                rgba, hidden = part_style[slot]
+                set_display_color(part, rgba)
+                if hidden:
+                    part.hide_set(True)
                 setattr(item, field, part)
 
         props.construction_file = path
         props.connection_name = lib_name
+        props.org_active = org is not None
+        props.org_folder = org_folder if org is not None else ""
+        if org is not None:
+            props.org_matrix = [org[i][j] for i in range(4) for j in range(4)]
         rebuild_segment_modifiers(context)
         if base_info["loops"] != 2:
             self.report({'WARNING'}, "Base co %d vung ho (can 2: day + dinh)"
                         % base_info["loops"])
-        self.report({'INFO'}, "Da dat %d Connection (%s) tu %s%s"
+        self.report({'INFO'}, "Da dat %d Connection (%s) tu %s%s%s"
                     % (len(implants), lib_name, os.path.basename(path),
+                       " + transform theo before/transform.txt" if org is not None else "",
                        "" if base_info["closed"] else " (Base chua kin)"))
         return {'FINISHED'}
 
@@ -1481,16 +1617,42 @@ def _enter_pillar_edit(context):
     return pillars
 
 
+def selected_pillars(context):
+    """Cac object Bar Pillar dang duoc chon (hoac dang o Edit Mode) trong viewport."""
+    objs = []
+    for obj in context.selected_objects:
+        if obj.type == 'MESH' and obj.get("rmvb_role") == "PILLAR" and obj not in objs:
+            objs.append(obj)
+    return objs
+
+
 class RMVB_OT_select_pillar_top(Operator):
-    """Vao Edit Mode va CHI chon phan dinh da extrude cua Bar Pillar"""
+    """Chon object Bar Pillar trong viewport roi bam: vao Edit Mode va CHI chon cac dinh
+    o dinh mui extrude cua (cac) Bar Pillar dang chon"""
     bl_idname = "rmvb.select_pillar_top"
     bl_label = "Select Top"
 
     def execute(self, context):
-        pillars = _enter_pillar_edit(context)
+        pillars = selected_pillars(context)
         if not pillars:
-            self.report({'ERROR'}, "Chua co Bar Pillar. Bam Create Bar Pillar truoc")
+            self.report({'ERROR'}, "Chon object Bar Pillar trong viewport truoc roi bam Select Top")
             return {'CANCELLED'}
+        active = context.active_object if context.active_object in pillars else pillars[0]
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in pillars:
+            obj.select_set(True)
+        # Pillar khong duoc chon: xoa dinh con chon tu lan truoc de ket qua dut khoat
+        for ref in context.scene.rmvb.pillars:
+            other = ref.object
+            if valid_obj(other) and other not in pillars:
+                for coll in (other.data.vertices, other.data.edges, other.data.polygons):
+                    coll.foreach_set("select", [False] * len(coll))
+                other.data.update()
+        context.view_layer.objects.active = active
+        bpy.ops.object.mode_set(mode='EDIT')
+        use_local_orientation(context)
         try:
             context.tool_settings.mesh_select_mode = (True, False, False)
         except Exception:
@@ -1509,8 +1671,8 @@ class RMVB_OT_select_pillar_top(Operator):
                     total += 1
             bm.select_flush_mode()
             bmesh.update_edit_mesh(obj.data, destructive=False)
-        self.report({'INFO'}, "Da chon %d dinh o dinh mui extrude cua %d Bar Pillar"
-                    % (total, len(pillars)))
+        self.report({'INFO'}, "Da chon %d dinh o dinh mui extrude cua %d Bar Pillar (%s)"
+                    % (total, len(pillars), ", ".join(str(o.get("rmvb_tooth", o.name)) for o in pillars)))
         return {'FINISHED'}
 
 
@@ -3102,22 +3264,38 @@ class RMVB_OT_save_design(Operator):
         for group in props.groups:
             visuals.extend(v.object for v in group.visuals if valid_obj(v.object))
 
+        # Da transform theo before/transform.txt luc Place Connection -> xuat ve toa do file
+        # (before x transform^-1), giong nut 'STLs ORG' cua add-on iBar
+        back = org_matrix_from_props(props).inverted() if props.org_active else None
         stamp = timestamp()
         saved = []
         for prefix, obj in items:
             filepath = os.path.join(folder, "%s_%s.stl" % (prefix, stamp))
+            targets = [obj] + visuals
+            temps = []
             try:
-                export_stl([obj] + visuals, filepath, context)
+                if back is not None:
+                    for source in targets:
+                        copy = evaluated_mesh_object(source, source.name + ".org")
+                        copy.matrix_world = back @ source.matrix_world
+                        temps.append(copy)
+                    targets = temps
+                export_stl(targets, filepath, context)
             except Exception as exc:
                 self.report({'ERROR'}, "Khong xuat duoc %s: %s" % (prefix, exc))
                 return {'CANCELLED'}
+            finally:
+                for temp in temps:
+                    remove_object(temp)
             saved.append(filepath)
             ci_path = write_construction_info(filepath, props.construction_file)
             if ci_path:
                 saved.append(ci_path)
             else:
                 self.report({'WARNING'}, "Khong tim thay constructionInfo de cap nhat")
-        self.report({'INFO'}, "Da luu: " + ", ".join(os.path.basename(p) for p in saved))
+        self.report({'INFO'}, "Da luu%s: %s" % (
+            " (toa do file goc)" if back is not None else "",
+            ", ".join(os.path.basename(p) for p in saved)))
         return {'FINISHED'}
 
 
@@ -3179,7 +3357,7 @@ class RMVB_PT_panel(Panel):
         box.menu("RMVB_MT_pick_connection",
                  text=current_connection_name(props) or "(Trống)",
                  icon=_ic('MESH_CYLINDER'))
-        box.prop(props, "place_parts")
+        box.prop(props, "use_org_txt")
         row = box.row(align=True)
         row.operator(RMVB_OT_place_connection.bl_idname,
                      text="Place Connection (constructionInfo)",
@@ -3189,6 +3367,12 @@ class RMVB_PT_panel(Panel):
             box.label(text=os.path.basename(bpy.path.abspath(props.construction_file)),
                       icon=_ic('FILE'))
         box.label(text="Đã đặt: %d implant" % len(props.placed), icon=_ic('CHECKMARK'))
+        if props.placed:
+            if props.org_active:
+                box.label(text="Tọa độ: transform theo before/transform.txt", icon=_ic('ORIENTATION_GLOBAL'))
+            else:
+                box.label(text="Tọa độ: theo file constructionInfo (không dùng txt)",
+                          icon=_ic('ORIENTATION_GLOBAL'))
 
         # ---- Bar Pillar ----------------------------------------------------
         box = layout.box()
@@ -3201,7 +3385,7 @@ class RMVB_PT_panel(Panel):
         sub.operator(RMVB_OT_edit_bar_pillar.bl_idname,
                      text="Edit Bar Pillar (Local)", icon=_ic('EDITMODE_HLT'))
         sub.operator(RMVB_OT_select_pillar_top.bl_idname,
-                     text="Select Top", icon=_ic('VERTEXSEL'))
+                     text="Select Top (chọn Bar Pillar trước)", icon=_ic('VERTEXSEL'))
         sub.operator(RMVB_OT_exit_edit.bl_idname, text="Exit Edit Bar Pillar",
                      icon=_ic('OBJECT_DATA'))
         box.label(text="Bar Pillar: %d" % len(props.pillars), icon=_ic('INFO'))
