@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 3),
+    "version": (0, 1, 4),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -18,7 +18,8 @@ Quan ly thu vien dung chung cho cac add-on nha khoa:
    Screw, Scanbody (moi slot 1 file STL/PLY).
 2. Attachment: Attachment Name, Apply Part Bar (hang tren) + toggle
    Add/Remove on Bar cung hang voi nut 'Gan file', tuong tu cho Apply Part
-   Sleeve, Visual Object (khong gioi han so luong, dat ten va CHON MAU tung
+   Sleeve (Add = Union, Remove = Difference khi Rmvb-Bar ap vao Bar / Sleeve),
+   Visual Object (khong gioi han so luong, dat ten va CHON MAU tung
    object).
    Mac dinh khi dat vao scene:
      - Apply Part Bar   : do, alpha 0.5
@@ -432,7 +433,11 @@ class DLIB_PG_AttachmentEntry(PropertyGroup):
     entry_name: StringProperty(name="Attachment Name", default="New Attachment")
     open: BoolProperty(name="Mo rong", default=True,
                        description="Thu/mo danh sach slot file cua entry nay")
-    on_bar: BoolProperty(name="Add/Remove on Bar", default=True)
+    on_bar: BoolProperty(
+        name="Add/Remove on Bar", default=True,
+        description="Tick = ADD (Boolean Union Part Bar vao Bar), bo tick = REMOVE "
+                    "(Boolean Difference khoet Part Bar khoi Bar). Duoc ap dung khi "
+                    "bam 'Apply Attachment on Bar' ben Rmvb-Bar (chi them modifier)")
     part_bar: StringProperty(name="Apply Part Bar", subtype='FILE_PATH', default="")
     part_bar_color: FloatVectorProperty(
         name="Mau Apply Part Bar",
@@ -440,7 +445,11 @@ class DLIB_PG_AttachmentEntry(PropertyGroup):
                     "(do, alpha 0.5 - luu trong library.json, khong hien tren panel)",
         subtype='COLOR', size=4, min=0.0, max=1.0,
         default=DEFAULT_PART_BAR_COLOR)
-    on_sleeve: BoolProperty(name="Add/Remove on Sleeve", default=False)
+    on_sleeve: BoolProperty(
+        name="Add/Remove on Sleeve", default=False,
+        description="Tick = ADD (Boolean Union Part Sleeve vao Sleeve), bo tick = "
+                    "REMOVE (Boolean Difference khoet Part Sleeve khoi Sleeve). Duoc "
+                    "ap dung khi bam 'Create Sleeve Design' ben Rmvb-Bar")
     part_sleeve: StringProperty(name="Apply Part Sleeve", subtype='FILE_PATH', default="")
     part_sleeve_color: FloatVectorProperty(
         name="Mau Apply Part Sleeve",
