@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 6),
+    "version": (0, 4, 9),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -90,8 +90,9 @@ CST_COPY_ROT = "RMVB_lock_rotation"
 
 # Thong so chuan bi mesh (mm, truc local cua mesh)
 GINGIVA_BASE_DEPTH = 10.0       # Gingiva: extrude day xuong 10 mm roi fill
-CONN_BOTTOM_EXTRUDE = 2.0       # Base ho day: extrude 2 mm
-CONN_BOTTOM_SCALE = 2.0         # ... roi scale local x2
+CONN_BOTTOM_LIFT = 0.1          # Base ho day, buoc 1: extrude +0.1 mm theo z local
+CONN_BOTTOM_EXTRUDE = 1.0       # buoc 2: tu phan moi extrude them -1 mm theo z local
+CONN_BOTTOM_SCALE = 1.5         # ... va scale local x1.5 (tam = tam vong ho goc)
 CONN_TOP_EXTRUDE = 30.0         # Base ho dinh (Screw): extrude 30 mm
 PLANE_SIZE = 100.0              # PlaneVisual / PlaneCubeCut: 100 x 100 mm
 PLANE_CUBE_HEIGHT = 100.0       # PlaneCubeCut: extrude +z local 100 mm (hop lap phuong)
@@ -1374,7 +1375,8 @@ def current_connection_name(props):
 def prepare_connection_mesh(source):
     """Chuan bi Base de dung lam khoi Boolean (mesh moi, khong sua `source`):
 
-    1. Base ho day (Connection): extrude -2 mm theo local Z, scale local x2.
+    1. Base ho day (Connection): extrude +0.1 mm theo local Z; roi tu phan moi extrude tiep
+       -1 mm theo local Z va scale local x1.5.
     2. Base ho dinh (Screw): extrude +30 mm theo local Z.
     3. Nap kin 2 dau + Flip Normal (normal huong ra ngoai) de thanh solid.
     Vong ho day GOC duoc luu trong mesh["rmvb_ring"] (x,y,z... local) de tao Pillar.
@@ -1394,7 +1396,11 @@ def prepare_connection_mesh(source):
         center = sum((v.co for v in ring), Vector()) / len(ring)
         mesh["rmvb_ring"] = [c for v in ring for c in (v.co.x, v.co.y, v.co.z)]
 
-        new_bottom = _extrude_loop(bm, bottom)
+        lifted = _extrude_loop(bm, bottom)
+        for vert in lifted:
+            vert.co.z += CONN_BOTTOM_LIFT
+        lift_loops = _loops_within(bm, lifted)
+        new_bottom = _extrude_loop(bm, lift_loops[0]) if lift_loops else lifted
         new_top = _extrude_loop(bm, top) if top is not None else []
         for vert in new_bottom:
             vert.co.x = center.x + (vert.co.x - center.x) * CONN_BOTTOM_SCALE
@@ -2534,21 +2540,18 @@ def add_boolean_modifier(target, operand, operation, name):
 
 ATT_PREFIX = MOD_PREFIX + "Att_"
 CUTBASE_PREFIX = MOD_PREFIX + "CutBase_"
-PREVIEW_PREFIXES = (CUTBASE_PREFIX, ATT_PREFIX)    # modifier do Enable / Disable Preview dieu khien
+PREVIEW_PREFIXES = (ATT_PREFIX,)    # modifier do Enable / Disable Preview dieu khien (CutBase KHONG gom)
 
 
 def preview_enabled(seg):
-    """Preview (CutBase + Attachment hien trong Viewport). Mac dinh BAT cho toi khi Add Attachment
-    (Add Attachment luon dua ve Disable Preview)."""
-    return bool(seg.get("rmvb_attach", True))
+    """Preview Attachment (modifier Attachment hien trong Viewport). Mac dinh TAT; Add Attachment
+    luon dua ve Disable Preview."""
+    return bool(seg.get("rmvb_attach", False))
 
 
 def preview_target_count(props, seg):
-    """So modifier CutBase + Attachment ma Bar Segment phai co."""
-    count = sum(1 for g in props.groups if valid_obj(g.part_bar))
-    if seg.get("rmvb_cut"):
-        count += sum(1 for i in props.placed if valid_obj(i.base_object))
-    return count
+    """So modifier Attachment ma Bar Segment phai co."""
+    return sum(1 for g in props.groups if valid_obj(g.part_bar))
 
 
 def rebuild_segment_modifiers(context):
@@ -2558,7 +2561,8 @@ def rebuild_segment_modifiers(context):
         -> [Cut Top Bar]   Union tung Bar Pillar -> Difference PlaneCubeCut
                            -> Difference tung Base
         -> Union / Difference tung Part Bar (them ngay khi Add Attachment)
-        (Enable / Disable Preview chi bat / tat Realtime Display in Viewport cua CutBase + Attachment)
+        (Enable / Disable Preview chi bat / tat Realtime Display in Viewport cua modifier Attachment;
+         CutBase luon bat)
 
     Chi them modifier; Segment da Apply thi bo qua.
     """
@@ -2583,9 +2587,8 @@ def rebuild_segment_modifiers(context):
                                  MOD_PREFIX + "CutPlane")
         for item in props.placed:
             if valid_obj(item.base_object):
-                mod = add_boolean_modifier(seg, item.base_object, 'DIFFERENCE',
-                                           CUTBASE_PREFIX + item.tooth)
-                mod.show_viewport = preview
+                add_boolean_modifier(seg, item.base_object, 'DIFFERENCE',
+                                     CUTBASE_PREFIX + item.tooth)
     for index, group in enumerate(props.groups):
         if valid_obj(group.part_bar):
             mod = add_boolean_modifier(
@@ -3054,7 +3057,7 @@ class RMVB_OT_add_attachment(Operator):
         set_group_index(props, len(props.groups) - 1)
         seg = props.bar_segment
         if valid_obj(seg) and not seg.get("rmvb_applied"):
-            # Add Attachment luon ve Disable Preview: CutBase + Attachment tat trong Viewport, Part hien
+            # Add Attachment luon ve Disable Preview: modifier Attachment tat trong Viewport, Part hien
             # de nguoi dung dat vi tri (bam Enable Preview de xem ket qua)
             set_attachment_preview(context, False)
         else:
@@ -3122,8 +3125,9 @@ def _preview_target(operator, context):
 
 
 def set_attachment_preview(context, enabled):
-    """Bat / tat Preview: Realtime Display in Viewport (show_viewport) cua cac modifier CutBase +
-    Attachment tren Bar Segment, va an / hien Part Bar + Part Sleeve. Tra ve so modifier doi."""
+    """Bat / tat Preview: Realtime Display in Viewport (show_viewport) cua cac modifier Attachment
+    tren Bar Segment (CutBase khong bi dong cham), va an / hien Part Bar + Part Sleeve.
+    Tra ve so modifier doi."""
     props = context.scene.rmvb
     seg = props.bar_segment
     seg["rmvb_attach"] = enabled
@@ -3140,9 +3144,9 @@ def set_attachment_preview(context, enabled):
 
 
 class RMVB_OT_enable_attachment_preview(Operator):
-    """Enable Preview: BAT Realtime Display in Viewport cua cac modifier CutBase (Difference Base)
-    va Attachment (Union / Difference Part Bar) tren Bar Segment, dong thoi AN Part Bar / Part
-    Sleeve (Apply Part on Bar / on Sleeve). Modifier da duoc them san, nut nay khong them / xoa"""
+    """Enable Preview: BAT Realtime Display in Viewport cua cac modifier Attachment (Union /
+    Difference Part Bar) tren Bar Segment, dong thoi AN Part Bar / Part Sleeve (Apply Part on Bar /
+    on Sleeve). Modifier da duoc them san, nut nay khong them / xoa"""
     bl_idname = "rmvb.enable_attachment_preview"
     bl_label = "Enable Preview"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3153,18 +3157,17 @@ class RMVB_OT_enable_attachment_preview(Operator):
         if seg is None:
             return {'CANCELLED'}
         if preview_target_count(props, seg) == 0:
-            self.report({'ERROR'}, "Chua co modifier CutBase / Attachment de xem truoc "
-                        "(Cut Top Bar hoac Add Attachment truoc)")
+            self.report({'ERROR'}, "Chua co Attachment nao co Part Bar")
             return {'CANCELLED'}
         count = set_attachment_preview(context, True)
-        self.report({'INFO'}, "Enable Preview: bat hien thi %d modifier CutBase + Attachment, da an "
+        self.report({'INFO'}, "Enable Preview: bat hien thi %d modifier Attachment, da an "
                     "Part Bar / Part Sleeve" % count)
         return {'FINISHED'}
 
 
 class RMVB_OT_disable_attachment_preview(Operator):
-    """Disable Preview: TAT Realtime Display in Viewport cua cac modifier CutBase + Attachment
-    (modifier va group Attachment van giu nguyen) va HIEN LAI Part Bar / Part Sleeve"""
+    """Disable Preview: TAT Realtime Display in Viewport cua cac modifier Attachment (modifier va
+    group Attachment van giu nguyen) va HIEN LAI Part Bar / Part Sleeve"""
     bl_idname = "rmvb.disable_attachment_preview"
     bl_label = "Disable Preview"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3174,7 +3177,7 @@ class RMVB_OT_disable_attachment_preview(Operator):
         if seg is None:
             return {'CANCELLED'}
         count = set_attachment_preview(context, False)
-        self.report({'INFO'}, "Disable Preview: tat hien thi %d modifier CutBase + Attachment, da hien "
+        self.report({'INFO'}, "Disable Preview: tat hien thi %d modifier Attachment, da hien "
                     "lai Part Bar / Part Sleeve" % count)
         return {'FINISHED'}
 
@@ -3527,9 +3530,9 @@ class RMVB_OT_apply_bar_design(Operator):
         activate(context, seg)
         purge_unused_meshes()
         if skipped:
-            self.report({'WARNING'}, "Preview dang tat: %d modifier CutBase / Attachment tat trong Viewport "
-                        "nen CHUA duoc ap vao Bar (Delete Bar Design, bam Enable Preview roi Apply lai "
-                        "neu can)" % skipped)
+            self.report({'WARNING'}, "Preview dang tat: %d modifier Attachment tat trong Viewport nen "
+                        "Part Bar CHUA duoc dua vao Bar (Delete Bar Design, bam Enable Preview roi Apply "
+                        "lai neu can)" % skipped)
         self.report({'INFO'}, "Da Apply Bar Design (%d mat). Ban sua duoc luu o '%s' (an)"
                     % (len(baked.polygons), backup.name))
         return {'FINISHED'}
