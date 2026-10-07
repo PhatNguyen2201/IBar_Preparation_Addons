@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 4),
+    "version": (0, 1, 7),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -437,7 +437,8 @@ class DLIB_PG_AttachmentEntry(PropertyGroup):
         name="Add/Remove on Bar", default=True,
         description="Tick = ADD (Boolean Union Part Bar vao Bar), bo tick = REMOVE "
                     "(Boolean Difference khoet Part Bar khoi Bar). Duoc ap dung khi "
-                    "bam 'Apply Attachment on Bar' ben Rmvb-Bar (chi them modifier)")
+                    "Add Attachment ben Rmvb-Bar (them san modifier, mac dinh Disable Preview; Enable / "
+                    "Disable Preview chi bat / tat Realtime Display in Viewport cua modifier do)")
     part_bar: StringProperty(name="Apply Part Bar", subtype='FILE_PATH', default="")
     part_bar_color: FloatVectorProperty(
         name="Mau Apply Part Bar",
