@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 3, 7),
+    "version": (0, 4, 1),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -101,6 +101,7 @@ COLOR_CONN_VISUAL = (0.5, 0.5, 0.5, 1.0)     # ConnectionVisual: xam (Value 0.5)
 COLOR_CONN_ANALOG = (0.10, 0.30, 1.00, 1.0)  # Analog: xanh lam, opacity 1
 COLOR_CONN_SCREW = (0.3, 0.3, 0.3, 0.8)      # Screw: xam (Value 0.3), opacity 0.8
 OBJ_CONN_VISUAL = "ConnectionVisual"
+OBJ_IMPLANT_GROUP = "Implant"                 # Plain Axes chung cua 1 implant: Implant_<rang>
 
 # Mau dung khi thu vien khong khai bao (trung voi mac dinh cua Dental-Lib)
 FALLBACK_PART_BAR_COLOR = (1.0, 0.0, 0.0, 0.5)       # do, alpha 0.5
@@ -857,6 +858,7 @@ def set_group_index(props, index):
 class RMVB_PG_PlacedConnection(PropertyGroup):
     tooth: StringProperty(name="Tooth", default="?")
     lib_name: StringProperty(name="Library", default="")
+    group_object: PointerProperty(name="Implant group", type=bpy.types.Object)
     base_object: PointerProperty(name="Base", type=bpy.types.Object)
     visual_object: PointerProperty(name="ConnectionVisual", type=bpy.types.Object)
     analog_object: PointerProperty(name="Analog", type=bpy.types.Object)
@@ -966,6 +968,11 @@ class RMVB_PG_props(PropertyGroup):
                                  unit='LENGTH')
     sleeve_thickness: FloatProperty(name="Sleeve thickness (mm)", default=0.5,
                                     min=0.01, unit='LENGTH')
+    sleeve_voxel: FloatProperty(
+        name="Remesh voxel (mm)", default=0.15, min=0.0, soft_min=0.05, soft_max=0.5, unit='LENGTH',
+        description="Cỡ voxel của lớp Remesh dùng RIÊNG để tạo Sleeve (không đổi Bar Segment): mặt Sleeve "
+                    "đều và mịn, hết tam giác dài mỏng / giao cắt. Nhỏ = chính xác hơn nhưng nặng hơn. "
+                    "0 = tắt Remesh (cách cũ)")
     apply_attachment_sleeve: BoolProperty(
         name="Apply attachment on Sleeve",
         description="Cong don cac Attachment (toggle Add/Remove on Sleeve cua "
@@ -1047,50 +1054,167 @@ def outward_solid(bm):
     return volume
 
 
+def face_components(bm):
+    """Cac thanh phan lien thong (list BMFace), lon nhat truoc."""
+    bm.faces.index_update()
+    bm.faces.ensure_lookup_table()
+    seen = set()
+    comps = []
+    for face in bm.faces:
+        if face.index in seen:
+            continue
+        stack = [face]
+        comp = []
+        seen.add(face.index)
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for edge in cur.edges:
+                for other in edge.link_faces:
+                    if other.index not in seen:
+                        seen.add(other.index)
+                        stack.append(other)
+        comps.append(comp)
+    comps.sort(key=len, reverse=True)
+    return comps
+
+
+def repair_manifold(bm, rounds=8):
+    """Xoa canh > 2 mat va dinh KHONG-manifold (that nut o vanh, dinh roi) cho den khi sach.
+
+    Moi diem bi xoa de lai 1 lo nho (vong canh mot dinh) duoc fill lai o buoc sau, nen
+    be mat chi doi o ban kinh 1 vong tam giac quanh diem loi."""
+    removed = 0
+    for _ in range(rounds):
+        bad_faces = {f for e in bm.edges if len(e.link_faces) > 2 for f in e.link_faces}
+        if bad_faces:
+            bmesh.ops.delete(bm, geom=list(bad_faces), context='FACES')
+            removed += len(bad_faces)
+        bad_verts = [v for v in bm.verts if not v.is_manifold]
+        if bad_verts:
+            bmesh.ops.delete(bm, geom=bad_verts, context='VERTS')
+            removed += len(bad_verts)
+        if not bad_faces and not bad_verts:
+            break
+    return removed
+
+
+def count_self_intersections(bm, limit=100000):
+    """So cap tam giac giao nhau (khong tinh cap chung dinh) - chi de bao cao."""
+    from mathutils.bvhtree import BVHTree
+    bm.verts.index_update()
+    bm.faces.ensure_lookup_table()
+    tree = BVHTree.FromBMesh(bm, epsilon=1e-6)
+    count = 0
+    for a, b in tree.overlap(tree):
+        if a >= b:
+            continue
+        if {v.index for v in bm.faces[a].verts} & {v.index for v in bm.faces[b].verts}:
+            continue
+        count += 1
+        if count >= limit:
+            break
+    return count
+
+
 def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
-    """Bien mesh Gingiva thanh KHOI kin:
+    """Bien mesh Gingiva thanh KHOI kin + manifold:
 
-    1. Cac vung ho nho (mat tren): fill de khong bi lung.
-    2. Vong ho lon nhat (mat duoi): extrude `depth` mm theo Z WORLD (global) huong -Z,
-       khong phu thuoc xoay / scale cua object, roi fill de tao de -> toan bo
-       Gingiva thanh khoi.
+    0. Lam sach: hop nhat dinh trung, xoa dinh that nut / canh > 2 mat (nguyen nhan mesh
+       sau extrude van hong va Boolean tu choi), bo manh roi rac nho.
+    1. Moi manh lon: cac vong ho nho (mat tren) fill de khong bi lung.
+    2. Vong ho lon nhat (mat duoi): extrude xuong de MOI diem da extrude cung nam tren
+       1 MAT PHANG song song Oxy (world), cach diem thap nhat cua cac vanh ho do `depth` mm
+       (z_de = Z world nho nhat cua vanh - depth; XY giu nguyen). Roi fill tao de phang
+       -> toan bo Gingiva thanh khoi. Khong phu thuoc xoay / scale cua object.
 
-    info["open_side_up"] = True neu than mesh nam DUOI vanh (mat ho quay len +Z world):
-    extrude -Z khi do di xuyen vao than mesh, nen Set Gingiva se canh bao.
+    info: loops, filled, extruded, closed (khong con canh ho), manifold (kin + khong canh
+    > 2 mat + khong dinh that nut), repaired (so dinh/mat da xoa), islands (manh roi bi bo),
+    intersections (cap tam giac tu giao con lai), floor_z, open_side_up (than mesh nam DUOI
+    vanh: de keo xuong se di xuyen vao than mesh nen Set Gingiva canh bao).
     """
-    info = {"loops": 0, "filled": 0, "extruded": False, "closed": False,
-            "open_side_up": False}
+    info = {"loops": 0, "filled": 0, "extruded": False, "closed": False, "manifold": False,
+            "repaired": 0, "islands": 0, "intersections": 0,
+            "open_side_up": False, "floor_z": None}
     bm = bmesh.new()
     bm.from_mesh(obj.data)
+    # 1e-5 mm: chi gop dinh trung toa do (Blender 4.5 gop khong het neu nguong qua nho)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+    info["repaired"] = repair_manifold(bm)
+
+    comps = face_components(bm)
+    if len(comps) > 1:
+        # giu cac manh lon (>= 1% manh lon nhat); manh nho hon la rac cua scan -> bo
+        threshold = max(4, int(len(comps[0]) * 0.01) + 1)
+        trash = [f for comp in comps if len(comp) < threshold for f in comp]
+        if trash:
+            info["islands"] = sum(1 for comp in comps if len(comp) < threshold)
+            bmesh.ops.delete(bm, geom=trash, context='FACES')
+            info["repaired"] += repair_manifold(bm)
+    comps = face_components(bm)
+    comp_of = {f.index: ci for ci, comp in enumerate(comps) for f in comp}
+
+    bm.verts.index_update()
+    bm.edges.index_update()
     loops = boundary_loops(bm)
     info["loops"] = len(loops)
     if loops:
-        base = max(loops, key=loop_perimeter)
+        by_comp = {}
         for loop in loops:
-            if loop is base:
-                continue
-            if cap_loop(bm, loop):
-                info["filled"] += 1
+            face = loop["edges"][0].link_faces[0]
+            by_comp.setdefault(comp_of.get(face.index, 0), []).append(loop)
+        bases = []
+        for ci in sorted(by_comp):
+            lps = by_comp[ci]
+            base = max(lps, key=loop_perimeter)
+            bases.append(base)
+            for loop in lps:
+                if loop is not base and cap_loop(bm, loop):
+                    info["filled"] += 1
+
         matrix = obj.matrix_world
-        rim_verts = unique_loop_verts(base)
-        rim_center = matrix @ (sum((v.co for v in rim_verts), Vector()) / max(1, len(rim_verts)))
-        body = matrix @ (sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts)))
-        info["open_side_up"] = body.z < rim_center.z - 1e-6
-        # Dich chuyen (0, 0, -depth) trong toa do WORLD, doi sang toa do local cua mesh
         try:
-            shift = matrix.to_3x3().inverted() @ Vector((0.0, 0.0, -depth))
+            inverse = matrix.inverted()
         except ValueError:
-            shift = Vector((0.0, 0.0, -depth))
-        new_verts = _extrude_loop(bm, base)
-        for vert in new_verts:
-            vert.co += shift
-        for loop in _loops_within(bm, new_verts):
-            cap_loop(bm, loop)
+            matrix = inverse = Matrix.Identity(4)
+        rim_world = [matrix @ v.co for base in bases for v in unique_loop_verts(base)]
+        main = unique_loop_verts(bases[0])
+        main_center = matrix @ (sum((v.co for v in main), Vector()) / max(1, len(main)))
+        body = matrix @ (sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts)))
+        info["open_side_up"] = body.z < main_center.z - 1e-6
+        floor_z = min(p.z for p in rim_world) - depth
+        info["floor_z"] = floor_z
+        for base in bases:
+            new_verts = _extrude_loop(bm, base)
+            for vert in new_verts:
+                world = matrix @ vert.co
+                world.z = floor_z                  # cung 1 mat phang Oxy
+                vert.co = inverse @ world
+            for loop in _loops_within(bm, new_verts):
+                cap_loop(bm, loop)
         info["extruded"] = True
+        rest = [e for e in bm.edges if e.is_boundary]
+        if rest:                                   # du phong: lap not cac lo con sot
+            try:
+                bmesh.ops.holes_fill(bm, edges=rest, sides=len(rest) + 2)
+            except Exception:
+                pass
+            rest = [e for e in bm.edges if e.is_valid and e.is_boundary]
+            if rest:
+                try:
+                    bmesh.ops.triangle_fill(bm, use_beauty=True, edges=rest)
+                except Exception:
+                    pass
         outward_solid(bm)
         bm.to_mesh(obj.data)
         obj.data.update()
     info["closed"] = not any(e.is_boundary for e in bm.edges)
+    info["manifold"] = (info["closed"] and not any(len(e.link_faces) > 2 for e in bm.edges)
+                        and all(v.is_manifold for v in bm.verts))
+    try:
+        info["intersections"] = count_self_intersections(bm)
+    except Exception:
+        info["intersections"] = 0
     bm.free()
     return info
 
@@ -1165,16 +1289,22 @@ class RMVB_OT_set_role(Operator):
                     self.report({'ERROR'}, "Khong chuan bi duoc Gingiva: %s" % exc)
                     return {'CANCELLED'}
                 obj["rmvb_gingiva_ready"] = True
-                message = " (fill %d lo mat tren, extrude de -%g mm theo Z world, %s)" % (
-                    info["filled"], GINGIVA_BASE_DEPTH,
-                    "khoi kin" if info["closed"] else "CHUA kin")
+                message = " (fill %d lo mat tren, de phang Z=%.2f cach diem thap nhat cua vanh ho %g mm, %s)" % (
+                    info["filled"], info["floor_z"] if info["floor_z"] is not None else 0.0,
+                    GINGIVA_BASE_DEPTH, "khoi kin + manifold" if info["manifold"] else "CHUA kin")
+                if info["repaired"] or info["islands"]:
+                    message += " [da don %d dinh/mat loi, bo %d manh roi]" % (
+                        info["repaired"], info["islands"])
+                if info["intersections"]:
+                    self.report({'INFO'}, "Gingiva con %d cap tam giac tu giao nhau (nep cuon o mep "
+                                "scan); khoi da kin, Boolean van chay" % info["intersections"])
                 if info["open_side_up"]:
                     self.report({'WARNING'},
-                                "Mat ho cua Gingiva quay LEN (+Z world): extrude -Z di xuyen vao "
+                                "Mat ho cua Gingiva quay LEN (+Z world): de keo xuong se di xuyen vao "
                                 "than mesh. Xoay Gingiva cho mat ho huong xuong roi Set lai")
-                if not info["closed"]:
+                if not info["manifold"]:
                     self.report({'WARNING'},
-                                "Gingiva van con ho - Boolean co the khong on dinh")
+                                "Gingiva chua thanh khoi kin manifold - Boolean co the khong on dinh")
         obj.name = ROLE_OBJECT_NAME[self.role]
         obj["rmvb_role"] = self.role
         set_display_color(obj, ROLE_COLOR[self.role])
@@ -1191,7 +1321,7 @@ def clear_placed_connections(context, remove_pillars=False):
     props = context.scene.rmvb
     for item in list(props.placed):
         for field in ("base_object", "visual_object", "analog_object",
-                      "screw_object", "scanbody_object"):
+                      "screw_object", "scanbody_object", "group_object"):
             remove_object(getattr(item, field))
     props.placed.clear()
     if remove_pillars:
@@ -1404,16 +1534,28 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
         for implant in implants:
             tooth = str(implant["tooth"])
             matrix = org @ implant["matrix"] if org is not None else implant["matrix"]
-            # Base da xu ly (extrude) chi dung lam khoi Boolean -> an
-            obj = object_from_mesh("Conn_%s_Base" % tooth, base_mesh, coll, matrix)
-            set_color(obj, (0.72, 0.74, 0.78, 1.0))
-            obj.hide_set(True)
+            # Moi implant = 1 nhom Plain Axes (giong cach Attachment duoc add): Base, ConnectionVisual,
+            # Analog, Screw, Scanbody la con cua Empty nay; keo Empty la di chuyen ca nhom
+            group = bpy.data.objects.new("%s_%s" % (OBJ_IMPLANT_GROUP, tooth), None)
+            group.empty_display_type = 'PLAIN_AXES'
+            group.empty_display_size = 4.0
+            group.show_in_front = True
+            coll.objects.link(group)
+            group.matrix_world = matrix
+            group["rmvb_role"] = "IMPLANT_GROUP"
+            group["rmvb_tooth"] = tooth
             item = props.placed.add()
             item.tooth = tooth
             item.lib_name = lib_name
+            item.group_object = group
+            # Base da xu ly (extrude) chi dung lam khoi Boolean -> an
+            obj = object_from_mesh("Conn_%s_Base" % tooth, base_mesh, coll)
+            attach_to(obj, group)
+            set_color(obj, (0.72, 0.74, 0.78, 1.0))
+            obj.hide_set(True)
             item.base_object = obj
-            visual = object_from_mesh("%s_%s" % (OBJ_CONN_VISUAL, tooth), visual_mesh,
-                                      coll, matrix)
+            visual = object_from_mesh("%s_%s" % (OBJ_CONN_VISUAL, tooth), visual_mesh, coll)
+            attach_to(visual, group)
             set_display_color(visual, COLOR_CONN_VISUAL)
             visual["rmvb_role"] = "CONNECTION_VISUAL"
             item.visual_object = visual
@@ -1423,8 +1565,8 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
                 mesh = part_meshes.get(slot)
                 if mesh is None:
                     continue
-                part = object_from_mesh("Conn_%s_%s" % (tooth, slot.capitalize()),
-                                        mesh, coll, matrix)
+                part = object_from_mesh("Conn_%s_%s" % (tooth, slot.capitalize()), mesh, coll)
+                attach_to(part, group)
                 rgba, hidden = part_style[slot]
                 set_display_color(part, rgba)
                 if hidden:
@@ -1562,7 +1704,10 @@ class RMVB_OT_create_bar_pillar(Operator):
                 continue
             obj = bpy.data.objects.new("BarPillar_%s" % item.tooth, mesh)
             coll.objects.link(obj)
-            obj.matrix_world = base.matrix_world.copy()
+            if valid_obj(item.group_object):
+                attach_to(obj, item.group_object)       # di chuyen implant thi Pillar di theo
+            else:
+                obj.matrix_world = base.matrix_world.copy()
             obj["rmvb_role"] = "PILLAR"
             obj["rmvb_tooth"] = item.tooth
             obj["rmvb_top_z"] = float(info["top_z"])
@@ -2317,14 +2462,15 @@ _MANIFOLD_CACHE = {}
 
 
 def mesh_is_manifold(mesh):
-    """Mesh kin (moi canh dung 2 mat) - du dieu kien cho solver Manifold."""
+    """Mesh kin: moi canh dung 2 mat va khong co dinh that nut - du dieu kien cho solver Manifold."""
     key = (mesh.name, len(mesh.vertices), len(mesh.polygons))
     cached = _MANIFOLD_CACHE.get(key)
     if cached is not None:
         return cached
     bm = bmesh.new()
     bm.from_mesh(mesh)
-    ok = bool(bm.faces) and all(edge.is_manifold for edge in bm.edges)
+    ok = (bool(bm.faces) and all(edge.is_manifold for edge in bm.edges)
+          and all(vert.is_manifold for vert in bm.verts))
     bm.free()
     if len(_MANIFOLD_CACHE) > 256:
         _MANIFOLD_CACHE.clear()
@@ -2558,8 +2704,14 @@ class RMVB_OT_cut_top_bar(Operator):
         seg["rmvb_cut"] = True
         count = rebuild_segment_modifiers(context)
         activate(context, seg)
-        self.report({'INFO'}, "Da them modifier Cut Top Bar (Bar Segment co %d modifier, "
-                    "chua apply)" % count)
+        # Pillar da Union vao Bar Segment, ConnectionVisual nam gon trong: an di (con mat).
+        # Boolean van dung Pillar lam operand binh thuong.
+        pillars = [r.object for r in props.pillars if valid_obj(r.object)]
+        visuals = [i.visual_object for i in props.placed if valid_obj(i.visual_object)]
+        for obj in pillars + visuals:
+            obj.hide_set(True)
+        self.report({'INFO'}, "Da them modifier Cut Top Bar (Bar Segment co %d modifier, chua apply); "
+                    "da an %d Bar Pillar + %d ConnectionVisual" % (count, len(pillars), len(visuals)))
         return {'FINISHED'}
 
 
@@ -3027,26 +3179,101 @@ def dilate_solid(source, distance, name, coll):
     return base
 
 
-def sleeve_shell(source, inner_gap, wall, name, coll):
-    """Vo Sleeve: mat trong cach bar `inner_gap`, day `wall` mm."""
-    inner = dilate_solid(source, inner_gap, name + ".inner", coll)
-    return _solidify(inner, wall, 1.0)
+def triangulate_object(obj):
+    """Tam giac hoa mesh cua obj (BEAUTY / EAR_CLIP). Boolean (Manifold) gop tam giac cung 1 polygon
+    goc thanh n-gon co ca mat xuyen thung; n-gon do bi tam giac hoa sai khi xuat STL (canh > 2 mat).
+    Vi vay dua tam giac vao Boolean de dau ra cung toan tam giac."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bmesh.ops.triangulate(bm, faces=bm.faces, quad_method='BEAUTY', ngon_method='EAR_CLIP')
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    return obj
+
+
+def remesh_object(obj, voxel):
+    """Apply Remesh (Voxel) len obj: be mat luoi deu, tu go cac nep gap / giao cat."""
+    mod = obj.modifiers.new(MOD_PREFIX + "Remesh", 'REMESH')
+    mod.mode = 'VOXEL'
+    mod.voxel_size = voxel
+    mod.adaptivity = 0.0
+    mod.use_smooth_shade = False
+    bpy.context.view_layer.update()
+    apply_modifiers_in_place(obj)
+    for leftover in list(obj.modifiers):
+        obj.modifiers.remove(leftover)
+    return obj
+
+
+def sleeve_shell(source, inner_gap, wall, name, coll, voxel=0.0):
+    """Vo Sleeve: mat trong cach bar `inner_gap`, day `wall` mm.
+
+    voxel > 0 (source da duoc Remesh): moi lan noi (inner_gap va inner_gap + wall) duoc Remesh
+    lai de go cac nep gap cua Solidify tai goc lom, roi Vo = khoi ngoai - khoi trong (hai khoi
+    sach nen vo khong con giao cat). voxel = 0: cach cu (noi bang Solidify theo phap tuyen).
+    """
+    if voxel <= 0.0:
+        inner = dilate_solid(source, inner_gap, name + ".inner", coll)
+        return _solidify(inner, wall, 1.0)
+    outer = remesh_object(dilate_solid(source, inner_gap + wall, name + ".outer", coll), voxel)
+    inner = remesh_object(dilate_solid(source, inner_gap, name + ".inner", coll), voxel)
+    boolean_objects(outer, [inner], 'DIFFERENCE')
+    remove_object(inner)
+    return outer
 
 
 # ---------------------------------------------------------------------------
 # Sleeve Design
 # ---------------------------------------------------------------------------
-def bar_source(context, coll):
-    """Ban sao (da ap modifier) cua Bar Segment, toa do world."""
-    seg = context.scene.rmvb.bar_segment
+def is_sleeve_source_modifier(mod):
+    """Modifier dung de dung be mat Bar cho Sleeve: Union cac Bar Pillar, Difference
+    PlaneCubeCut. KHONG gom Difference Gingiva (Sleeve duoc cat nuou SAU CUNG, tren be mat sach,
+    chu khong dung nguon da bi duong cat nuou lom chom cua scan lam hong), Difference Base va
+    Union/Difference Attachment."""
+    if not mod.name.startswith(MOD_PREFIX):
+        return True                        # modifier do nguoi dung tu them: giu nguyen
+    short = mod.name[len(MOD_PREFIX):]
+    return short == "CutPlane" or short.startswith("Union_")
+
+
+def bar_source(context, coll, voxel=None):
+    """Ban sao (toa do world) cua Bar Segment sau khi Boolean voi Bar Pillar, CHUA cat nuou va
+    CHUA ap Base / Attachment - be mat dung de tao Sleeve.
+
+    Danh gia tren 1 ban sao tam cua Bar Segment (chi giu Union Pillar + CutPlane) cong them 1 lop
+    Remesh (Voxel) dung RIENG cho Sleeve, nen Bar Segment that khong bi dong cham. Neu Bar Design
+    da Apply thi dung BarSegmentBackup (con nguyen modifier) vi Bar Segment da nuong luon phan cat.
+    voxel None = lay props.sleeve_voxel; 0 = khong Remesh."""
+    props = context.scene.rmvb
+    seg = props.bar_segment
     if not valid_obj(seg):
         return None
-    return evaluated_mesh_object(seg, "BarSegment.src", coll)
+    if voxel is None:
+        voxel = props.sleeve_voxel
+    origin = props.bar_backup if valid_obj(props.bar_backup) else seg
+    temp = origin.copy()
+    temp.name = "BarSegment.sleeve_tmp"
+    for mod in list(temp.modifiers):
+        if not is_sleeve_source_modifier(mod):
+            temp.modifiers.remove(mod)
+    if voxel > 0.0:
+        remesh = temp.modifiers.new(MOD_PREFIX + "SleeveRemesh", 'REMESH')
+        remesh.mode = 'VOXEL'
+        remesh.voxel_size = voxel
+        remesh.adaptivity = 0.0
+        remesh.use_smooth_shade = False
+    context.scene.collection.objects.link(temp)
+    temp.matrix_world = origin.matrix_world.copy()
+    try:
+        return evaluated_mesh_object(temp, "BarSegment.src", coll)
+    finally:
+        bpy.data.objects.remove(temp, do_unlink=True)
 
 
 class RMVB_OT_create_sleeve_design(Operator):
-    """Tao Sleeve: vo mong bao quanh bar voi offset + chieu day da chon, cat phan
-    tiep xuc voi nuou (Difference Gingiva)"""
+    """Tao Sleeve: vo mong bao quanh be mat Bar Segment (da Boolean voi Bar Pillar, chua ap
+    Base va Attachment) voi offset + chieu day da chon, cat phan tiep xuc voi nuou"""
     bl_idname = "rmvb.create_sleeve_design"
     bl_label = "Create Sleeve Design"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3065,9 +3292,16 @@ class RMVB_OT_create_sleeve_design(Operator):
         inner_gap = max(props.sleeve_offset, 0.0)
         wall = max(props.sleeve_thickness, 0.01)
         cut_gingiva = False
+        voxel = max(props.sleeve_voxel, 0.0)
         try:
-            source = bar_source(context, work)
-            sleeve = sleeve_shell(source, inner_gap, wall, "Sleeve", work)
+            source = bar_source(context, work, voxel)
+            if voxel > 0.0 and len(source.data.polygons) == 0:
+                # Remesh khong ra be mat (nguon khong kin?) -> quay ve cach cu
+                remove_object(source)
+                voxel = 0.0
+                source = bar_source(context, work, 0.0)
+                self.report({'WARNING'}, "Remesh khong dung duoc be mat bar - tao Sleeve bang cach cu")
+            sleeve = sleeve_shell(source, inner_gap, wall, "Sleeve", work, voxel)
             remove_object(source)
             sleeve.name = OBJ_SLEEVE
             sleeve.data.name = OBJ_SLEEVE
@@ -3090,7 +3324,11 @@ class RMVB_OT_create_sleeve_design(Operator):
             # Cat phan tiep xuc voi nuou
             gingiva = props.gingiva_object
             if valid_obj(gingiva) and gingiva.type == 'MESH':
-                boolean_objects(sleeve, [gingiva], 'DIFFERENCE')
+                # Ca Sleeve va Nuou deu duoc tam giac hoa truoc khi cat de STL xuat ra kin (khong n-gon thung)
+                triangulate_object(sleeve)
+                gingiva_tri = triangulate_object(world_copy(gingiva, "Gingiva.tri", work))
+                boolean_objects(sleeve, [gingiva_tri], 'DIFFERENCE')
+                remove_object(gingiva_tri)
                 cut_gingiva = True
         except Exception as exc:
             purge_collection(work)
@@ -3106,11 +3344,16 @@ class RMVB_OT_create_sleeve_design(Operator):
         set_display_color(sleeve, lib_slot_color(
             current_attachment_name(props) or "", "part_sleeve"))
         sleeve["rmvb_role"] = "SLEEVE"
+        if voxel > 0.0:
+            sleeve.data.polygons.foreach_set("use_smooth", [True] * len(sleeve.data.polygons))
+            sleeve.data.update()
         props.sleeve_object = sleeve
         activate(context, sleeve)
         purge_unused_meshes()
-        self.report({'INFO'}, "Da tao Sleeve (offset %g mm, day %g mm%s)"
-                    % (inner_gap, wall, ", da cat Gingiva" if cut_gingiva else ""))
+        self.report({'INFO'}, "Da tao Sleeve tu be mat Bar sau Union Pillar (chua cat nuou, chua ap Base / "
+                    "Attachment%s) roi cat nuou (offset %g mm, day %g mm%s)"
+                    % (", Remesh %g mm" % voxel if voxel > 0.0 else "", inner_gap, wall,
+                       ", da cat Gingiva" if cut_gingiva else ""))
         return {'FINISHED'}
 
 
@@ -3453,6 +3696,7 @@ class RMVB_PT_panel(Panel):
         box.label(text="6. Sleeve Design", icon=_ic('MOD_SOLIDIFY'))
         box.prop(props, "sleeve_offset")
         box.prop(props, "sleeve_thickness")
+        box.prop(props, "sleeve_voxel")
         box.prop(props, "apply_attachment_sleeve")
         box.operator(RMVB_OT_create_sleeve_design.bl_idname,
                      text="Create Sleeve Design", icon=_ic('MOD_SOLIDIFY'))
