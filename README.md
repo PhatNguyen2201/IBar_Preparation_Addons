@@ -251,7 +251,7 @@ Matrix = [[X, Y, Z, AveragePoint], [...], [...], [...], [0, 0, 0, 1]]
 ## 🏷️ Thông tin
 
 - **Tác giả**: Phat Nguyen
-- **Tên**: Custom Ibar Preparation Panel
+- **Tên**: Custom Preparation Panel (tab **ScansPrep**)
 - **Category**: iBar Preparation Panel
 - **Vị trí**: View3D Panel (sidebar)
 

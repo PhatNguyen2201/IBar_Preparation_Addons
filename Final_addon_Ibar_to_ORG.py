@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "Custom Ibar Preparation Panel",
+    "name": "Custom Preparation Panel",
     "author": "Phat Nguyen",
-    "version": (2, 9, 1),
+    "version": (2, 9, 2),
     "blender": (4, 5, 3),
     "location": "View3D Panel",
     "description": "iBar Custom Panel",
@@ -2549,7 +2549,7 @@ class buttonOperator_CreateOpaqueLayer(bpy.types.Operator):
         return {'FINISHED'}
 
 class IbarPrepPanel(bpy.types.Panel):
-    bl_label = "IBar Function Prepare"
+    bl_label = "Function Prepare"
     bl_idname = "OBJECT_PT_Ibar_Transform"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2593,7 +2593,7 @@ class OcclusalAlignment(bpy.types.Panel):
         row6.operator(buttonOperator_TransformToCurrentDesign.bl_idname, text = "Apply Saved Transform", icon = 'GIZMO')
 
 class IbarAddCustomPanel(bpy.types.Panel):
-    bl_label = "IBar Custom Function"
+    bl_label = "Custom Function"
     bl_idname = "OBJECT_PT_Ibar_AddCustom"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2668,7 +2668,7 @@ class IbarMeshControlPanel(bpy.types.Panel):
         row11.operator(buttonOperator_BevelExtrude.bl_idname, text = "Bevel extrude area", icon = 'MOD_BEVEL')
 
 class IbarRetentionPanel(bpy.types.Panel):
-    bl_label = "IBar Retention"
+    bl_label = "Retention"
     bl_idname = "OBJECT_PT_Ibar_Retention"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2697,7 +2697,7 @@ class AddOpaqueLayerPanel(bpy.types.Panel):
                         text="Create Opaque Layer", icon='MOD_SOLIDIFY')
 
 class SaveSTLIPSPanel(bpy.types.Panel):
-    bl_label = "IBar Save STL"
+    bl_label = "Save STL"
     bl_idname = "OBJECT_PT_SaveSTL"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
