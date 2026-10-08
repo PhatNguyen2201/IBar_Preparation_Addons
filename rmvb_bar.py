@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 7, 0),
+    "version": (0, 8, 1),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -2111,18 +2111,55 @@ def selected_pillars(context):
     return objs
 
 
+def scene_pillars(context):
+    """Cac Bar Pillar co trong scene (props.pillars) dang HIEN trong viewport.
+
+    Object dang an (Preview cat Top Bar dang bat) khong vao duoc Edit Mode nen bi bo qua.
+    """
+    objs = []
+    for ref in context.scene.rmvb.pillars:
+        obj = ref.object
+        if not valid_obj(obj) or obj.type != 'MESH' or obj.get("rmvb_role") != "PILLAR":
+            continue
+        if obj in objs or obj.hide_get():
+            continue
+        objs.append(obj)
+    return objs
+
+
+def pillar_top_verts(bm, top_z):
+    """Cac dinh o dinh mui extrude cua Bar Pillar.
+
+    Uu tien mat phang `rmvb_top_z` luu luc tao Pillar (dinh mui extrude); mat phang nay lai
+    thanh cu khi nguoi dung da sua dinh (keo dinh xuong thap hon) nen neu no khong con dinh nao
+    thi lay cac dinh cao nhat hien tai - moi Pillar luon co it nhat mot dinh duoc chon.
+    """
+    verts = []
+    if isinstance(top_z, (int, float)):
+        verts = [v for v in bm.verts if v.co.z >= top_z - TOP_EPS]
+    if not verts:
+        top_z = max(v.co.z for v in bm.verts)
+        verts = [v for v in bm.verts if v.co.z >= top_z - TOP_EPS]
+    return verts
+
+
 class RMVB_OT_select_pillar_top(Operator):
     """Sua dinh tru bar: chon object Bar Pillar trong viewport roi bam - vao Edit Mode va CHI chon cac dinh
-    o dinh mui extrude cua (cac) Bar Pillar dang chon"""
+    o dinh mui extrude cua (cac) Bar Pillar dang chon. Khong chon Pillar nao thi sua TAT CA Bar Pillar
+    dang hien trong scene"""
     bl_idname = "rmvb.select_pillar_top"
     bl_label = "Sửa đỉnh trụ bar"
 
     def execute(self, context):
         pillars = selected_pillars(context)
+        all_pillars = False
         if not pillars:
-            self.report({'ERROR'}, "Chon object Bar Pillar trong viewport truoc roi bam Sua dinh tru bar "
-                        "(Pillar dang an thi bam Disable Preview cat Top Bar de hien lai)")
-            return {'CANCELLED'}
+            pillars = scene_pillars(context)            # khong chon gi -> sua tat ca Bar Pillar dang hien
+            all_pillars = True
+            if not pillars:
+                self.report({'ERROR'}, "Khong co Bar Pillar nao dang hien de sua - bam Create/Reset bar pillar "
+                            "truoc (Pillar dang an thi bam Disable Preview cat Top Bar de hien lai)")
+                return {'CANCELLED'}
         active = context.active_object if context.active_object in pillars else pillars[0]
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -2148,17 +2185,14 @@ class RMVB_OT_select_pillar_top(Operator):
             bm = bmesh.from_edit_mesh(obj.data)
             for elem in list(bm.verts) + list(bm.edges) + list(bm.faces):
                 elem.select_set(False)
-            top_z = obj.get("rmvb_top_z")
-            if not isinstance(top_z, (int, float)):
-                top_z = max(v.co.z for v in bm.verts)
-            for vert in bm.verts:
-                if vert.co.z >= top_z - TOP_EPS:
-                    vert.select_set(True)
-                    total += 1
+            for vert in pillar_top_verts(bm, obj.get("rmvb_top_z")):
+                vert.select_set(True)
+                total += 1
             bm.select_flush_mode()
             bmesh.update_edit_mesh(obj.data, destructive=False)
-        self.report({'INFO'}, "Da chon %d dinh o dinh mui extrude cua %d Bar Pillar (%s)"
-                    % (total, len(pillars), ", ".join(str(o.get("rmvb_tooth", o.name)) for o in pillars)))
+        self.report({'INFO'}, "Da chon %d dinh o dinh mui extrude cua %d Bar Pillar (%s)%s"
+                    % (total, len(pillars), ", ".join(str(o.get("rmvb_tooth", o.name)) for o in pillars),
+                       " - chua chon Pillar nao nen sua tat ca Pillar dang hien" if all_pillars else ""))
         return {'FINISHED'}
 
 
