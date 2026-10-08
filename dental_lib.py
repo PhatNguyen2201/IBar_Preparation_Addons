@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 2, 1),
+    "version": (0, 3, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -15,7 +15,8 @@ bl_info = {
 Quan ly thu vien dung chung cho cac add-on nha khoa:
 
 1. Implant Connection (Connection Base): Library Name, Base, Implant-Analog,
-   Screw, Scanbody (moi slot 1 file STL/PLY).
+   Screw (moi slot 1 file STL/PLY), Scanbody (NHIEU file STL/PLY, ke ca
+   cua nhom lan cua tung Connection).
 2. Attachment: Attachment Name, Apply Part Bar (hang tren) + toggle
    Add/Remove on Bar cung hang voi nut 'Gan file', tuong tu cho Apply Part
    Sleeve (Add = Union, Remove = Difference khi Rmvb-Bar ap vao Bar / Sleeve),
@@ -234,17 +235,29 @@ def _same_entry(a, b):
     return a is not None and b is not None and a.as_pointer() == b.as_pointer()
 
 
+# Stem cua file danh so tu dong (nhieu file cung loai): '<ten>_NN' - Visual Object cua Attachment, Scanbody cua Connection
+AUTO_VISUAL = "visual#"
+AUTO_SCANBODY = "scanbody#"
+
+
+def _auto_family(stem):
+    """'visual' | 'scanbody' neu `stem` la stem danh so tu dong, nguoc lai None (slot co ten co dinh)."""
+    return stem[:-1] if stem and stem.endswith("#") else None
+
+
 def _entry_asset_refs(kind, entry):
-    """[(stem, rel hien tai, setter)] moi file 3D cua entry. stem None = Visual Object (ten tu cap)."""
+    """[(stem, rel hien tai, setter)] moi file 3D cua entry. stem AUTO_* = file danh so tu dong (ten tu cap)."""
     refs = []
     if kind == "connections":
         for slot, field in CONNECTION_SLOT_FIELD.items():
             refs.append((slot, getattr(entry, field), lambda v, f=field: setattr(entry, f, v)))
+        for row in entry.scanbodies:
+            refs.append((AUTO_SCANBODY, row.asset, lambda v, r=row: setattr(r, "asset", v)))
     else:
         for field in ("part_bar", "part_sleeve"):
             refs.append((field, getattr(entry, field), lambda v, f=field: setattr(entry, f, v)))
         for row in entry.visuals:
-            refs.append((None, row.asset, lambda v, r=row: setattr(r, "asset", v)))
+            refs.append((AUTO_VISUAL, row.asset, lambda v, r=row: setattr(r, "asset", v)))
     return refs
 
 
@@ -267,8 +280,9 @@ def unique_folder(kind, name, entries, exclude=None):
     raise RuntimeError("Khong tao duoc ten thu muc cho '%s'" % name)
 
 
-def _free_visual_stem(folder_abs, entry, prefix="", taken=()):
-    """'visual_NN' chua dung trong thu muc (ten file co tien to `prefix`) va chua nam trong `taken`."""
+def _free_auto_stem(folder_abs, entry, family, prefix="", taken=()):
+    """'<family>_NN' (visual | scanbody) chua dung trong thu muc (ten file co tien to `prefix`) va chua nam
+    trong `taken`."""
     used = set(taken)
     try:
         for name in os.listdir(folder_abs):
@@ -277,15 +291,15 @@ def _free_visual_stem(folder_abs, entry, prefix="", taken=()):
                 used.add(base[len(prefix):])
     except OSError:
         pass
-    for row in entry.visuals:
+    for row in (entry.visuals if family == "visual" else entry.scanbodies):
         if row.asset:
             base = os.path.splitext(os.path.basename(row.asset.replace("\\", "/")))[0]
             if base.startswith(prefix):
                 used.add(base[len(prefix):])
     index = 0
-    while "visual_%02d" % index in used:
+    while "%s_%02d" % (family, index) in used:
         index += 1
-    return "visual_%02d" % index
+    return "%s_%02d" % (family, index)
 
 
 def _group_def_of(entry, library):
@@ -316,23 +330,24 @@ def _location(kind, entry, library=None):
 
 def _is_own_file(kind, entry, stem, rel):
     """`rel` la file RIENG cua entry: nam trong thu muc rieng cua entry, hoac la file '<thu muc entry>_<stem>'
-    (Visual Object: '<thu muc entry>_visual_NN') trong thu muc nhom."""
+    (Visual Object / Scanbody: '<thu muc entry>_visual_NN' / '_scanbody_NN') trong thu muc nhom."""
     found = _rel_folder(rel)
     if not found or found[0] != kind or not entry.folder:
         return False
     if _norm(found[1]) == _norm(entry.folder):
         return True
     base = os.path.splitext(os.path.basename(rel.replace("\\", "/")))[0]
-    if stem is None:
-        return re.fullmatch(re.escape(entry.folder) + r"_visual_\d+", base) is not None
+    family = _auto_family(stem)
+    if family:
+        return re.fullmatch(re.escape(entry.folder) + "_" + family + r"_\d+", base) is not None
     return base == entry.folder + "_" + stem
 
 
 def _place_file(kind, entry, folder, source, stem, current_rel, prefix=""):
     """Copy `source` vao <lib>/<kind>/<folder>/<prefix><stem><ext> (ghi de neu da co) va tra ve rel.
 
-    stem None = Visual Object: dung lai ten file hien tai neu no da nam trong thu muc cua entry, khong thi
-    lay 'visual_NN' chua dung. File cu cua cung slot (khac duoi file) cua entry bi xoa."""
+    stem AUTO_* (Visual Object / Scanbody): dung lai ten file hien tai neu no da nam trong thu muc cua entry,
+    khong thi lay '<visual|scanbody>_NN' chua dung. File cu cua cung slot (khac duoi file) cua entry bi xoa."""
     folder_abs = os.path.join(library_dir(), kind, folder)
     os.makedirs(folder_abs, exist_ok=True)
     ext = os.path.splitext(source)[1].lower()
@@ -342,11 +357,12 @@ def _place_file(kind, entry, folder, source, stem, current_rel, prefix=""):
     inside = bool(current) and current[0] == kind and _norm(current[1]) == _norm(folder)
     if inside and prefix:
         inside = os.path.basename(current_rel.replace("\\", "/")).startswith(prefix)
-    if stem is None:
+    family = _auto_family(stem)
+    if family:
         if inside:
             stem = os.path.splitext(os.path.basename(current_rel.replace("\\", "/")))[0][len(prefix):]
         else:
-            stem = _free_visual_stem(folder_abs, entry, prefix)
+            stem = _free_auto_stem(folder_abs, entry, family, prefix)
     name = prefix + stem
     dest = os.path.join(folder_abs, name + ext)
     if not (os.path.exists(dest) and os.path.samefile(source, dest)):
@@ -436,7 +452,7 @@ def rename_entry_folder(kind, entry, entries, library=None, extra=()):
                 src = _library_path(rel)
                 if os.path.isfile(src):
                     base = os.path.splitext(os.path.basename(src))[0]
-                    tail = stem if stem is not None else base[len(old) + 1:]
+                    tail = base[len(old) + 1:] if _auto_family(stem) else stem
                     dest_rel = "/".join((kind, folder, new + "_" + tail + os.path.splitext(src)[1]))
                     plan.append((src, _library_path(dest_rel), dest_rel, setter))
         try:
@@ -463,7 +479,7 @@ def rename_entry_folder(kind, entry, entries, library=None, extra=()):
 
 
 def relocate_entry_files(kind, entry, library):
-    """Dua file RIENG cua entry (ke ca Visual Object) ve dung cho theo nhom hien tai: entry thuoc nhom -> thu muc cua
+    """Dua file RIENG cua entry (ke ca Visual Object / Scanbody) ve dung cho theo nhom hien tai: entry thuoc nhom -> thu muc cua
     nhom (ten file co tien to '<thu muc entry>_'), khong thuoc nhom -> thu muc rieng. File cua chinh entry thi DI
     CHUYEN (thu muc cu rong thi go), file tu noi khac (cu / ngoai thu vien) thi COPY. Tra ve so file da dua ve cho."""
     refs = [(stem, rel, setter) for stem, rel, setter in _entry_asset_refs(kind, entry) if rel]
@@ -476,17 +492,18 @@ def relocate_entry_files(kind, entry, library):
     folder_abs = os.path.join(library_dir(), kind, folder)
     done = 0
     old_dirs = set()
-    taken = set()                                # ten (khong duoi file) da dung cho Visual Object trong luot nay
+    taken = set()                                # ten (khong duoi file) da dung cho Visual Object / Scanbody trong luot nay
     for stem, rel, setter in refs:
         source = resolve_asset(rel)
         if not source or not os.path.isfile(source):
             continue
         ext = os.path.splitext(source)[1].lower() or ".stl"
-        if stem is None:
-            found = re.search(r"(visual_\d+)$", os.path.splitext(os.path.basename(source))[0])
+        family = _auto_family(stem)
+        if family:
+            found = re.search(r"(%s_\d+)$" % family, os.path.splitext(os.path.basename(source))[0])
             use = found.group(1) if found else None
             if use is None or use in taken:
-                use = _free_visual_stem(folder_abs, entry, prefix, taken)
+                use = _free_auto_stem(folder_abs, entry, family, prefix, taken)
             taken.add(use)
         else:
             use = stem
@@ -583,9 +600,37 @@ def connection_group(name):
     return str(entry.get("group", "") or "").strip() if entry else ""
 
 
+def _scanbody_refs(item):
+    """Danh sach duong dan Scanbody luu trong 1 muc JSON (Connection / nhom). Thu vien cu chi co khoa
+    'scanbody' (1 file) thi coi la danh sach 1 phan tu."""
+    refs = item.get("scanbodies")
+    if not isinstance(refs, list):
+        refs = [item.get("scanbody", "")]
+    return [str(ref) for ref in refs if ref]
+
+
+def connection_scanbodies(name):
+    """[duong dan tuyet doi, ...] cac file Scanbody cua Connection: danh sach rieng neu co, khong thi danh sach
+    chung cua nhom (ke thua). Phan tu co the tro toi file khong con tren dia."""
+    entry = get_connection(name)
+    if not entry:
+        return []
+    refs = _scanbody_refs(entry)
+    group = str(entry.get("group", "") or "").strip()
+    if not refs and group:
+        for item in read_index().get("connection_groups", []):
+            if item.get("name") == group:
+                refs = _scanbody_refs(item)
+    return [resolve_asset(ref) for ref in refs]
+
+
 def connection_asset(name, slot):
     """File mesh cua mot thanh phan (base|analog|screw|scanbody): file rieng cua Connection neu co, khong
-    thi file chung cua nhom ma Connection thuoc ve (ke thua)."""
+    thi file chung cua nhom ma Connection thuoc ve (ke thua). Scanbody co nhieu file: slot "scanbody" tra ve
+    file dau tien, day du xem connection_scanbodies()."""
+    if slot == "scanbody":
+        found = connection_scanbodies(name)
+        return found[0] if found else ""
     entry = get_connection(name)
     if not entry:
         return ""
@@ -900,13 +945,17 @@ CONNECTION_SLOT_LABELS = [
     ("base", "Base (STL/PLY)", 'MESH_CYLINDER'),
     ("analog", "Implant-Analog (STL/PLY)", 'MESH_CONE'),
     ("screw", "Screw (STL/PLY)", 'MESH_UVSPHERE'),
-    ("scanbody", "Scanbody (STL/PLY)", 'MESH_PLANE'),
 ]
 
 ATTACHMENT_SLOT_LABELS = [
     ("part_bar", "Apply Part Bar (STL/PLY)", 'MESH_CUBE'),
     ("part_sleeve", "Apply Part Sleeve (STL/PLY)", 'MESH_TORUS'),
 ]
+
+
+class DLIB_PG_ScanbodyFile(PropertyGroup):
+    """Mot file Scanbody (STL/PLY) cua Connection hoac nhom Connection."""
+    asset: StringProperty(name="File", subtype='FILE_PATH', default="")
 
 
 class DLIB_PG_AttachmentGroup(PropertyGroup):
@@ -918,7 +967,7 @@ class DLIB_PG_AttachmentGroup(PropertyGroup):
 
 
 class DLIB_PG_ConnectionGroup(PropertyGroup):
-    """Nhom Implant Connection: bo file chung (Base / Analog / Screw / Scanbody) cho cac Connection trong
+    """Nhom Implant Connection: bo file chung (Base / Analog / Screw + danh sach Scanbody) cho cac Connection trong
     nhom ke thua; file nam trong thu muc rieng cua nhom (connections/<thu muc>/)."""
     entry_name: StringProperty(name="Ten nhom", default="Group", update=_conn_group_name_update)
     prev_name: StringProperty(default="")
@@ -928,7 +977,7 @@ class DLIB_PG_ConnectionGroup(PropertyGroup):
     slot_base: StringProperty(name="Base", subtype='FILE_PATH', default="")
     slot_analog: StringProperty(name="Implant-Analog", subtype='FILE_PATH', default="")
     slot_screw: StringProperty(name="Screw", subtype='FILE_PATH', default="")
-    slot_scanbody: StringProperty(name="Scanbody", subtype='FILE_PATH', default="")
+    scanbodies: CollectionProperty(type=DLIB_PG_ScanbodyFile)
 
 
 class DLIB_PG_ConnectionEntry(PropertyGroup):
@@ -941,13 +990,14 @@ class DLIB_PG_ConnectionEntry(PropertyGroup):
     group: StringProperty(
         name="Nhom", default="", update=_conn_member_group_update,
         description="Nhom Implant Connection chua muc nay. De trong = chua nhom. Thanh phan nao khong co "
-                    "file rieng thi dung file chung cua nhom (ke thua); gan file rieng de ghi de")
+                    "file rieng thi dung file chung cua nhom (ke thua); gan file rieng de ghi de. Scanbody: "
+                    "Connection co file Scanbody rieng thi dung danh sach cua minh, khong thi dung danh sach cua nhom")
     open: BoolProperty(name="Mo rong", default=True,
                        description="Thu/mo danh sach slot file cua entry nay")
     slot_base: StringProperty(name="Base", subtype='FILE_PATH', default="")
     slot_analog: StringProperty(name="Implant-Analog", subtype='FILE_PATH', default="")
     slot_screw: StringProperty(name="Screw", subtype='FILE_PATH', default="")
-    slot_scanbody: StringProperty(name="Scanbody", subtype='FILE_PATH', default="")
+    scanbodies: CollectionProperty(type=DLIB_PG_ScanbodyFile)
 
 
 class DLIB_PG_AttachmentEntry(PropertyGroup):
@@ -1014,7 +1064,6 @@ CONNECTION_SLOT_FIELD = {
     "base": "slot_base",
     "analog": "slot_analog",
     "screw": "slot_screw",
-    "scanbody": "slot_scanbody",
 }
 
 
@@ -1033,11 +1082,13 @@ def index_from_scene(context):
         item = {"name": entry.entry_name, "folder": entry.folder}
         for slot, field in CONNECTION_SLOT_FIELD.items():
             item[slot] = getattr(entry, field)
+        item["scanbodies"] = [row.asset for row in entry.scanbodies]
         data["connection_groups"].append(item)
     for entry in group.connections:
         item = {"name": entry.entry_name, "folder": entry.folder, "group": entry.group.strip()}
         for slot, field in CONNECTION_SLOT_FIELD.items():
             item[slot] = getattr(entry, field)
+        item["scanbodies"] = [row.asset for row in entry.scanbodies]
         data["connections"].append(item)
     for entry in group.attachments:
         item = {
@@ -1085,6 +1136,8 @@ def _fill_group(group, data):
         gdef.folder = str(item.get("folder", "") or "")
         for slot, field in CONNECTION_SLOT_FIELD.items():
             setattr(gdef, field, item.get(slot, ""))
+        for ref in _scanbody_refs(item):
+            gdef.scanbodies.add().asset = ref
     for item in data.get("connections", []):
         entry = group.connections.add()
         entry.entry_name = item.get("name", "Connection")
@@ -1092,6 +1145,8 @@ def _fill_group(group, data):
         entry.group = str(item.get("group", "") or "").strip()
         for slot, field in CONNECTION_SLOT_FIELD.items():
             setattr(entry, field, item.get(slot, ""))
+        for ref in _scanbody_refs(item):
+            entry.scanbodies.add().asset = ref
     for entry in group.connections:         # nhom duoc tham chieu nhung chua co dinh nghia (json sua tay)
         if entry.group and _find_connection_group(group, entry.group) is None:
             new_connection_group(group, entry.group)
@@ -1640,6 +1695,81 @@ class DLIB_OT_clear_asset(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Operator: Scanbody (nhieu file cho moi Connection / nhom Connection)
+# ---------------------------------------------------------------------------
+class DLIB_OT_add_scanbody(Operator, ImportHelper):
+    """Chon mot hoac nhieu file STL/PLY Scanbody va them vao Connection / nhom Connection"""
+    bl_idname = "dental_lib.add_scanbody"
+    bl_label = "Add Scanbody (STL/PLY)"
+
+    filepath: StringProperty(subtype='FILE_PATH', default="")
+    filter_glob: StringProperty(default="*.stl;*.ply;*.STL;*.PLY", options={'HIDDEN'})
+    files: CollectionProperty(type=bpy.types.OperatorFileListElement, options={'HIDDEN', 'SKIP_SAVE'})
+    directory: StringProperty(subtype='DIR_PATH', options={'HIDDEN', 'SKIP_SAVE'})
+
+    kind: StringProperty(default="connection")
+    index: IntProperty(default=-1)
+
+    def execute(self, context):
+        library = ensure_loaded(context)
+        entry = _entry_by_index(context, self.kind, self.index)
+        if entry is None:
+            self.report({'ERROR'}, "Khong tim thay entry trong thu vien")
+            return {'CANCELLED'}
+        names = [item.name for item in self.files] or [os.path.basename(self.filepath)]
+        folder = bpy.path.abspath(self.directory) if self.directory else os.path.dirname(bpy.path.abspath(self.filepath))
+        added = 0
+        for name in names:
+            source = os.path.join(folder, name)
+            if not name or not os.path.isfile(source):
+                self.report({'WARNING'}, "Khong tim thay file: %s" % source)
+                continue
+            try:
+                rel = store_entry_asset("connections", entry, _connection_entries(library), source, AUTO_SCANBODY,
+                                        lambda: "", library)
+            except Exception as exc:
+                self.report({'ERROR'}, "Khong copy duoc '%s' vao thu vien: %s" % (name, exc))
+                continue
+            entry.scanbodies.add().asset = rel
+            added += 1
+        if not added:
+            return {'CANCELLED'}
+        _save_all(context)
+        self.report({'INFO'}, "Da them %d Scanbody vao '%s'" % (added, entry.entry_name))
+        return {'FINISHED'}
+
+
+class DLIB_OT_remove_scanbody(Operator):
+    """Bo mot file Scanbody khoi Connection / nhom Connection (file trong thu vien duoc giu lai)"""
+    bl_idname = "dental_lib.remove_scanbody"
+    bl_label = "Remove Scanbody"
+    bl_options = set()
+
+    kind: StringProperty(default="connection")
+    index: IntProperty(default=-1)
+    scan_index: IntProperty(default=-1)
+
+    def invoke(self, context, event):
+        ensure_loaded(context)
+        entry = _entry_by_index(context, self.kind, self.index)
+        if entry is None or not 0 <= self.scan_index < len(entry.scanbodies):
+            return {'CANCELLED'}
+        name = _short(entry.scanbodies[self.scan_index].asset, 40) or "Scanbody %d" % (self.scan_index + 1)
+        return _confirm_delete(self, context, event, "Bỏ Scanbody '%s'?" % name,
+                               "Bỏ Scanbody '%s' khỏi '%s'. File mesh gốc vẫn được giữ trong thư mục thư viện."
+                               % (name, entry.entry_name), confirm_text="Bỏ")
+
+    def execute(self, context):
+        ensure_loaded(context)
+        entry = _entry_by_index(context, self.kind, self.index)
+        if entry is None or not 0 <= self.scan_index < len(entry.scanbodies):
+            return {'CANCELLED'}
+        entry.scanbodies.remove(self.scan_index)
+        _save_all(context)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Operator: Visual Object (khong gioi han so luong, dat duoc ten)
 # ---------------------------------------------------------------------------
 class DLIB_OT_add_visual(Operator):
@@ -1715,7 +1845,7 @@ class DLIB_OT_import_visual(Operator, ImportHelper):
             return {'CANCELLED'}
         row = entry.visuals[self.visual_index]
         try:
-            rel = store_entry_asset("attachments", entry, _attachment_entries(library), source, None,
+            rel = store_entry_asset("attachments", entry, _attachment_entries(library), source, AUTO_VISUAL,
                                     lambda: row.asset, library)
         except Exception as exc:
             self.report({'ERROR'}, "Khong copy duoc file vao thu vien: %s" % exc)
@@ -1851,6 +1981,16 @@ def _effective_slot(library, entry, slot):
     return getattr(gdef, CONNECTION_SLOT_FIELD[slot]) if gdef is not None else ""
 
 
+def _effective_scanbodies(library, entry):
+    """Danh sach duong dan (rel) Scanbody cua Connection: danh sach rieng, khong co thi cua nhom."""
+    own = [row.asset for row in entry.scanbodies if row.asset]
+    if own:
+        return own
+    name = entry.group.strip()
+    gdef = _find_connection_group(library, name) if name else None
+    return [row.asset for row in gdef.scanbodies if row.asset] if gdef is not None else []
+
+
 class DLIB_OT_insert_connection(Operator):
     """Dat toan bo mesh cua Connection vao scene (kiem tra thu vien)"""
     bl_idname = "dental_lib.insert_connection"
@@ -1875,6 +2015,15 @@ class DLIB_OT_insert_connection(Operator):
                 count += 1
             except Exception as exc:
                 self.report({'WARNING'}, "%s: %s" % (label, exc))
+        for number, rel in enumerate(_effective_scanbodies(group, entry), 1):
+            path = resolve_asset(rel)
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                import_mesh_file(path, "%s_Scanbody_%d" % (entry.entry_name, number), coll)
+                count += 1
+            except Exception as exc:
+                self.report({'WARNING'}, "Scanbody %d: %s" % (number, exc))
         self.report({'INFO'}, "Da insert %d mesh cua %s" % (count, entry.entry_name))
         return {'FINISHED'}
 
@@ -1987,6 +2136,29 @@ def _draw_slot(layout, kind, index, slot, label, icon, value, toggle=None, inher
     _slot_buttons(act, kind, index, slot, value)
 
 
+def _draw_scanbodies(layout, kind, index, entry, inherited=()):
+    """Danh sach file Scanbody (khong gioi han so luong) cua Connection / nhom + nut them. `inherited` = Scanbody cua
+    nhom, chi hien (chi doc) khi Connection chua co file rieng."""
+    layout.label(text="Scanbody (nhiều file):", icon=_ic('MESH_PLANE'))
+    for j, row in enumerate(entry.scanbodies):
+        srow = layout.row(align=True)
+        text, state_icon = _slot_state(row.asset)
+        srow.label(text=text, icon=state_icon)
+        op = srow.operator(DLIB_OT_remove_scanbody.bl_idname, text="", icon=_ic('X'))
+        op.kind = kind
+        op.index = index
+        op.scan_index = j
+    if not len(entry.scanbodies):
+        for ref in inherited:
+            text, state_icon = _slot_state("", ref)
+            layout.label(text=text, icon=state_icon)
+        if not inherited:
+            layout.label(text="(chua co file)", icon=_ic('BLANK1'))
+    op = layout.operator(DLIB_OT_add_scanbody.bl_idname, text="+ Add Scanbody", icon=_ic('ADD'))
+    op.kind = kind
+    op.index = index
+
+
 def _draw_connection_entry(box, i, entry, library):
     sub = box.box()
     row = sub.row(align=True)
@@ -2010,6 +2182,8 @@ def _draw_connection_entry(box, i, entry, library):
         own = getattr(entry, field)
         inherited = getattr(gdef, field) if gdef is not None and not own else ""
         _draw_slot(sub, "connection", i, slot, label, icon, own, inherited=inherited)
+    _draw_scanbodies(sub, "connection", i, entry,
+                     [row.asset for row in gdef.scanbodies if row.asset] if gdef is not None else ())
     sub.operator(DLIB_OT_insert_connection.bl_idname,
                  text="Insert vao scene", icon=_ic('IMPORT')).index = i
 
@@ -2045,6 +2219,7 @@ def _draw_connection_list(box, library):
         folder.operator(DLIB_OT_gather_groups.bl_idname, text="Gom file nhóm", icon=_ic('FILE_FOLDER'))
         for slot, label, icon in CONNECTION_SLOT_LABELS:
             _draw_slot(folder, "connection_group", gi, slot, label, icon, getattr(gdef, CONNECTION_SLOT_FIELD[slot]))
+        _draw_scanbodies(folder, "connection_group", gi, gdef)
         for i in members.get(gdef.entry_name, []):
             _draw_connection_entry(folder, i, library.connections[i], library)
     loose = members.get("", [])
@@ -2194,6 +2369,7 @@ class DLibPreferences(AddonPreferences):
 
 _classes = (
     DLIB_PG_VisualObject,
+    DLIB_PG_ScanbodyFile,
     DLIB_PG_AttachmentGroup,
     DLIB_PG_ConnectionGroup,
     DLIB_PG_ConnectionEntry,
@@ -2216,6 +2392,8 @@ _classes = (
     DLIB_OT_pick_attachment_group,
     DLIB_OT_import_asset,
     DLIB_OT_clear_asset,
+    DLIB_OT_add_scanbody,
+    DLIB_OT_remove_scanbody,
     DLIB_OT_add_visual,
     DLIB_OT_remove_visual,
     DLIB_OT_import_visual,

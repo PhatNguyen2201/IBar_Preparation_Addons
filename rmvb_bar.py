@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -960,7 +960,7 @@ class RMVB_PG_PlacedConnection(PropertyGroup):
     visual_object: PointerProperty(name="ConnectionVisual", type=bpy.types.Object)
     analog_object: PointerProperty(name="Analog", type=bpy.types.Object)
     screw_object: PointerProperty(name="Screw", type=bpy.types.Object)
-    scanbody_object: PointerProperty(name="Scanbody", type=bpy.types.Object)
+    scanbody_object: PointerProperty(name="Scanbody (file cu)", type=bpy.types.Object)   # chi de don file .blend cu
 
 
 class RMVB_PG_PartRef(PropertyGroup):
@@ -1569,18 +1569,17 @@ def org_matrix_from_props(props):
     return Matrix([flat[i * 4:(i + 1) * 4] for i in range(4)])
 
 
-# Mau / an-hien cua tung phan Connection (analog, screw, scanbody)
+# Mau / an-hien cua tung phan Connection (analog, screw). Scanbody (nhieu file trong Dental-Lib) KHONG duoc dat vao scene.
 CONN_PART_STYLE = {
     "analog": (COLOR_CONN_ANALOG, False),
     "screw": (COLOR_CONN_SCREW, False),
-    "scanbody": (FALLBACK_VISUAL_COLOR, True),     # Scanbody: an
 }
-CONN_PART_FIELD = (("analog", "analog_object"), ("screw", "screw_object"), ("scanbody", "scanbody_object"))
+CONN_PART_FIELD = (("analog", "analog_object"), ("screw", "screw_object"))
 
 
 def make_connection_kit(lib_name):
     """Bo mesh cua 1 Connection Base trong thu vien (dung chung cho nhieu implant):
-    Base da extrude (khoi Boolean), hinh hien thi cua Base goc, Analog / Screw / Scanbody.
+    Base da extrude (khoi Boolean), hinh hien thi cua Base goc, Analog / Screw.
     Raise FileNotFoundError neu thu vien chua co mesh Base."""
     base_path = lib_connection_asset(lib_name, "base")
     if not base_path or not os.path.exists(base_path):
@@ -1598,7 +1597,7 @@ def make_connection_kit(lib_name):
     bm.free()
     visual_mesh.update()
 
-    # Analog / Screw / Scanbody: luon dat vao scene (moi loai 1 ban copy dung chung)
+    # Analog / Screw: luon dat vao scene (moi loai 1 ban copy dung chung)
     parts = {}
     warnings = []
     for slot, _field in CONN_PART_FIELD:
@@ -1614,7 +1613,7 @@ def make_connection_kit(lib_name):
 
 
 def populate_implant(item, group, kit, coll):
-    """Tao Base / ConnectionVisual / Analog / Screw / Scanbody cua `kit` lam con cua Empty `group`
+    """Tao Base / ConnectionVisual / Analog / Screw cua `kit` lam con cua Empty `group`
     va ghi vao `item` (RMVB_PG_PlacedConnection)."""
     tooth = item.tooth
     item.lib_name = kit["lib_name"]
@@ -1716,7 +1715,7 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             tooth = str(implant["tooth"])
             matrix = org @ implant["matrix"] if org is not None else implant["matrix"]
             # Moi implant = 1 nhom Plain Axes (giong cach Attachment duoc add): Base, ConnectionVisual,
-            # Analog, Screw, Scanbody la con cua Empty nay; keo Empty la di chuyen ca nhom
+            # Analog, Screw la con cua Empty nay; keo Empty la di chuyen ca nhom
             group = bpy.data.objects.new("%s_%s" % (OBJ_IMPLANT_GROUP, tooth), None)
             group.empty_display_type = 'PLAIN_AXES'
             group.empty_display_size = GROUP_AXES_SIZE
@@ -1792,7 +1791,7 @@ class RMVB_OT_choose_implant_connection(Operator):
 
 
 class RMVB_OT_set_implant_connection(Operator):
-    """Doi Connection Base cua MOT implant: thay Base / ConnectionVisual / Analog / Screw / Scanbody
+    """Doi Connection Base cua MOT implant: thay Base / ConnectionVisual / Analog / Screw
     bang bo mesh cua Connection da chon (giu nguyen vi tri implant va cac implant khac)"""
     bl_idname = "rmvb.set_implant_connection"
     bl_label = "Doi Connection Base cua implant"
