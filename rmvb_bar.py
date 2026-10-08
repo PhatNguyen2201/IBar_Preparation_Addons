@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 14),
+    "version": (0, 5, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -18,7 +18,7 @@ Dental-Lib. Quy trinh:
     Set Gingiva / Denture / Antagonist (chon object san co trong scene)
       -> Select Connection Base + Place Connection (doc .constructionInfo)
       -> Bar Pillar -> Create Top Bar Plane -> Draw Line Bar (snap Plane) -> Bar Segment
-         tu cap nhat -> Cut Top Bar (chi them modifier)
+         tu cap nhat -> Enable / Disable Preview cat Top Bar (modifier them san)
       -> Attachment (moi lan Add = 1 group)
       -> Sleeve Design
       -> Apply / Delete Bar Design -> Save Bar & Sleeve Design (STL)
@@ -33,6 +33,7 @@ Mau hien thi lay tu thu vien Dental-Lib:
 
 import bpy
 import bmesh
+import contextlib
 import math
 import os
 import re
@@ -689,7 +690,7 @@ def export_stl(objects, filepath, context):
 # View / transform orientation
 # ---------------------------------------------------------------------------
 def use_local_orientation(context):
-    """Dat transform orientation = Local (dung khi Edit Bar Pillar/Segment).
+    """Dat transform orientation = Local (dung khi sua dinh Bar Pillar / Segment).
 
     Blender 4.x: tool_settings.transform_orientation
     Blender 5.x: scene.transform_orientation_slots[0].type
@@ -1832,15 +1833,15 @@ class RMVB_OT_set_implant_connection(Operator):
         old_name = item.lib_name
         remove_implant_parts(item)
         populate_implant(item, item.group_object, kit, ensure_collection(COL_CONNECTION))
-        if valid_obj(seg) and seg.get("rmvb_cut"):
-            item.visual_object.hide_set(True)       # Cut Top Bar da an ConnectionVisual cua cac implant
+        if valid_obj(seg) and cut_preview_enabled(seg):
+            item.visual_object.hide_set(True)       # Preview cat Top Bar dang an ConnectionVisual cua cac implant
         rebuild_segment_modifiers(context)           # CutBase tro vao Base moi
         purge_unused_meshes()
         stale = any(ref.tooth == item.tooth for ref in props.pillars)
         self.report({'INFO'}, "Rang %s: Connection '%s' -> '%s'" % (item.tooth, old_name, self.connection))
         if stale:
-            self.report({'WARNING'}, "Bar Pillar rang %s dang tao tu Base cu - bam Create Bar Pillar de "
-                        "tao lai theo Base moi" % item.tooth)
+            self.report({'WARNING'}, "Bar Pillar rang %s dang tao tu Base cu - chon implant (Plain Axes) hoac "
+                        "Pillar cua rang nay roi bam Create/Reset bar pillar de dung lai theo Base moi" % item.tooth)
         for area in context.screen.areas:
             area.tag_redraw()
         return {'FINISHED'}
@@ -1927,26 +1928,69 @@ def build_pillar_mesh(base_obj, lift):
     return mesh, info
 
 
+def selected_teeth(context):
+    """So rang (chuoi) cua cac object dang chon thuoc ve mot implant: Bar Pillar, Plain Axes Implant_<rang>,
+    hoac bat ky phan nao cua implant (ConnectionVisual, Base...)."""
+    teeth = set()
+    for obj in context.selected_objects:
+        role = obj.get("rmvb_role")
+        if role in ("PILLAR", "IMPLANT_GROUP") and obj.get("rmvb_tooth") is not None:
+            teeth.add(str(obj["rmvb_tooth"]))
+        elif obj.parent is not None and obj.parent.get("rmvb_role") == "IMPLANT_GROUP":
+            teeth.add(str(obj.parent.get("rmvb_tooth")))
+    return teeth
+
+
+def pillar_targets(context):
+    """(cac implant can tao / reset Bar Pillar, cac rang da co Pillar trong do).
+
+    Co chon Pillar / implant trong viewport -> chi cac rang do (Reset neu da co Pillar, tao moi neu chua);
+    khong chon gi -> chi tao cac rang CHUA co Pillar."""
+    props = context.scene.rmvb
+    have = {ref.tooth for ref in props.pillars if valid_obj(ref.object)}
+    chosen = selected_teeth(context)
+    if chosen:
+        items = [item for item in props.placed if item.tooth in chosen]
+    else:
+        items = [item for item in props.placed if item.tooth not in have]
+    return items, [item.tooth for item in items if item.tooth in have]
+
+
 class RMVB_OT_create_bar_pillar(Operator):
-    """Tao Bar Pillar: sao chep vung ho day (Connection) cua tung Base, extrude len
-    theo local Z va fill kin"""
+    """Tao / Reset Bar Pillar tu vung ho day (Connection) cua Base, extrude len theo local Z va fill kin.
+    Chua chon gi: tao Pillar cho cac rang chua co. Chon Pillar hoac implant (Plain Axes) trong viewport:
+    chi dung lai (Reset) cac rang do, rang khac giu nguyen; rang da co Pillar thi hoi xac nhan"""
     bl_idname = "rmvb.create_bar_pillar"
-    bl_label = "Create Bar Pillar"
+    bl_label = "Create/Reset bar pillar"
     bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        _items, replaced = pillar_targets(context)
+        if replaced:
+            return context.window_manager.invoke_confirm(
+                self, event, title="Reset Bar Pillar?",
+                message="Dựng lại Bar Pillar răng %s theo Base hiện tại. Mọi chỉnh sửa trên các Pillar này "
+                        "(sửa đỉnh, di chuyển...) sẽ mất; các răng khác giữ nguyên." % ", ".join(replaced),
+                confirm_text="Reset", icon='WARNING')
+        return self.execute(context)
 
     def execute(self, context):
         props = context.scene.rmvb
         if not props.placed:
             self.report({'ERROR'}, "Chua dat Connection nao (bam Place Connection)")
             return {'CANCELLED'}
+        items, _replaced = pillar_targets(context)
+        if not items:
+            self.report({'ERROR'}, "Moi rang deu da co Bar Pillar - chon Pillar (hoac implant Plain Axes) can "
+                        "Reset trong viewport roi bam lai")
+            return {'CANCELLED'}
         coll = ensure_collection(COL_PILLAR)
-        for ref in list(props.pillars):
-            remove_object(ref.object)
-        props.pillars.clear()
+        refs = {ref.tooth: ref for ref in props.pillars}
 
-        made = 0
+        created = []
+        reset = []
         notes = []
-        for item in props.placed:
+        for item in items:
             base = item.base_object
             if base is None or base.type != 'MESH':
                 continue
@@ -1958,6 +2002,12 @@ class RMVB_OT_create_bar_pillar(Operator):
             if mesh is None:
                 notes.append("rang %s khong co vung ho day" % item.tooth)
                 continue
+            ref = refs.get(item.tooth)
+            if ref is not None and valid_obj(ref.object):
+                remove_object(ref.object)               # chi xoa Pillar cu sau khi Pillar moi dung thanh cong
+                reset.append(item.tooth)
+            else:
+                created.append(item.tooth)
             obj = bpy.data.objects.new("BarPillar_%s" % item.tooth, mesh)
             coll.objects.link(obj)
             if valid_obj(item.group_object):
@@ -1968,54 +2018,28 @@ class RMVB_OT_create_bar_pillar(Operator):
             obj["rmvb_tooth"] = item.tooth
             obj["rmvb_top_z"] = float(info["top_z"])
             set_color(obj, (0.85, 0.65, 0.25, 1.0))
-            ref = props.pillars.add()
+            if ref is None:
+                ref = props.pillars.add()
+                ref.tooth = item.tooth
             ref.object = obj
-            ref.tooth = item.tooth
-            made += 1
+            if valid_obj(props.bar_segment) and cut_preview_enabled(props.bar_segment):
+                obj.hide_set(True)                      # Preview cat Top Bar dang bat: Pillar nam gon trong ket qua
             if not info["closed"]:
                 notes.append("rang %s pillar chua kin" % item.tooth)
-        if not made:
+        if not (created or reset):
             self.report({'ERROR'}, "Khong tao duoc Bar Pillar nao")
             return {'CANCELLED'}
         rebuild_segment_modifiers(context)
         purge_unused_meshes()
         if notes:
             self.report({'WARNING'}, "; ".join(notes))
-        self.report({'INFO'}, "Da tao %d Bar Pillar (extrude len %g mm, solid kin)"
-                    % (made, props.pillar_lift))
+        parts = []
+        if created:
+            parts.append("tao moi %d (rang %s)" % (len(created), ", ".join(created)))
+        if reset:
+            parts.append("reset %d (rang %s)" % (len(reset), ", ".join(reset)))
+        self.report({'INFO'}, "Bar Pillar: %s - extrude len %g mm, solid kin" % ("; ".join(parts), props.pillar_lift))
         return {'FINISHED'}
-
-
-class RMVB_OT_edit_bar_pillar(Operator):
-    """Vao Edit Mode (transform orientation Local) de chinh Bar Pillar"""
-    bl_idname = "rmvb.edit_bar_pillar"
-    bl_label = "Edit Bar Pillar"
-
-    def execute(self, context):
-        pillars = _enter_pillar_edit(context)
-        if not pillars:
-            self.report({'ERROR'}, "Chua co Bar Pillar. Bam Create Bar Pillar truoc")
-            return {'CANCELLED'}
-        self.report({'INFO'}, "Edit Bar Pillar - Transform Orientation: Local")
-        return {'FINISHED'}
-
-
-def _enter_pillar_edit(context):
-    props = context.scene.rmvb
-    pillars = [r.object for r in props.pillars
-               if r.object is not None and r.object.name in bpy.data.objects]
-    if not pillars:
-        return []
-    if context.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-    bpy.ops.object.select_all(action='DESELECT')
-    for obj in pillars:
-        obj.hide_set(False)
-        obj.select_set(True)
-    context.view_layer.objects.active = pillars[0]
-    bpy.ops.object.mode_set(mode='EDIT')
-    use_local_orientation(context)
-    return pillars
 
 
 def selected_pillars(context):
@@ -2028,15 +2052,16 @@ def selected_pillars(context):
 
 
 class RMVB_OT_select_pillar_top(Operator):
-    """Chon object Bar Pillar trong viewport roi bam: vao Edit Mode va CHI chon cac dinh
+    """Sua dinh tru bar: chon object Bar Pillar trong viewport roi bam - vao Edit Mode va CHI chon cac dinh
     o dinh mui extrude cua (cac) Bar Pillar dang chon"""
     bl_idname = "rmvb.select_pillar_top"
-    bl_label = "Select Top"
+    bl_label = "Sửa đỉnh trụ bar"
 
     def execute(self, context):
         pillars = selected_pillars(context)
         if not pillars:
-            self.report({'ERROR'}, "Chon object Bar Pillar trong viewport truoc roi bam Select Top")
+            self.report({'ERROR'}, "Chon object Bar Pillar trong viewport truoc roi bam Sua dinh tru bar "
+                        "(Pillar dang an thi bam Disable Preview cat Top Bar de hien lai)")
             return {'CANCELLED'}
         active = context.active_object if context.active_object in pillars else pillars[0]
         if context.mode != 'OBJECT':
@@ -2938,7 +2963,8 @@ def add_boolean_modifier(target, operand, operation, name):
 
 ATT_PREFIX = MOD_PREFIX + "Att_"
 CUTBASE_PREFIX = MOD_PREFIX + "CutBase_"
-PREVIEW_PREFIXES = (ATT_PREFIX,)    # modifier do Enable / Disable Preview dieu khien (CutBase KHONG gom)
+PREVIEW_PREFIXES = (ATT_PREFIX,)    # modifier do Enable / Disable Preview cua Attachment dieu khien
+CUT_OPERAND_COLLECTIONS = {"pillar": "Rmvb Pillar Operands", "base": "Rmvb Base Operands"}
 
 
 def preview_enabled(seg):
@@ -2947,22 +2973,96 @@ def preview_enabled(seg):
     return bool(seg.get("rmvb_attach", False))
 
 
+def cut_preview_enabled(seg):
+    """Preview cat Top Bar (Gingiva, Pillar, PlaneCubeCut, Base hien trong Viewport). Mac dinh TAT: cac Boolean
+    nang chi tinh khi can xem; Apply / Save / Sleeve luon tinh du phan cat. File cu (co `rmvb_cut`, chua co
+    co moi) coi la dang bat."""
+    if "rmvb_cut_preview" in seg.keys():
+        return bool(seg["rmvb_cut_preview"])
+    return bool(seg.get("rmvb_cut", False))
+
+
+def is_cut_modifier(mod):
+    """Modifier thuoc nhom Preview cat Top Bar: CutGingiva, Union Pillar, CutPlane, CutBase."""
+    if not mod.name.startswith(MOD_PREFIX):
+        return False
+    short = mod.name[len(MOD_PREFIX):]
+    return short in ("CutGingiva", "CutPlane") or short.startswith(("Union", "CutBase"))
+
+
+@contextlib.contextmanager
+def forced_cut_modifiers(seg):
+    """Tam bat Realtime Display cua cac modifier cat Top Bar de Apply / Save / tao Sleeve luon thay du phan cat
+    du Preview dang tat; khoi phuc trang thai cu khi xong."""
+    saved = []
+    if valid_obj(seg):
+        saved = [(mod, mod.show_viewport) for mod in seg.modifiers if is_cut_modifier(mod)]
+        for mod, _state in saved:
+            mod.show_viewport = True
+        bpy.context.view_layer.update()
+    try:
+        yield
+    finally:
+        for mod, state in saved:
+            try:
+                mod.show_viewport = state
+            except (ReferenceError, RuntimeError):
+                pass            # modifier da bi go (Apply)
+
+
 def preview_target_count(props, seg):
     """So modifier Attachment ma Bar Segment phai co."""
     return sum(1 for g in props.groups if valid_obj(g.part_bar))
 
 
+def operand_collection(key, objects):
+    """Collection an (khong gan vao scene) giu cac operand cua 1 modifier Boolean kieu Collection."""
+    name = CUT_OPERAND_COLLECTIONS[key]
+    coll = bpy.data.collections.get(name)
+    if coll is None:
+        coll = bpy.data.collections.new(name)
+        coll.use_fake_user = True
+    for obj in list(coll.objects):
+        coll.objects.unlink(obj)
+    for obj in objects:
+        coll.objects.link(obj)
+    return coll
+
+
+def add_group_boolean(seg, entries, operation, all_name, one_prefix, key):
+    """Them Boolean cho nhieu operand `entries` = [(ten, object)] cung 1 phep (Union / Difference).
+
+    Moi operand dong (Manifold) -> 1 modifier kieu COLLECTION (tinh mot luot, nhanh gap ~2-3 lan nhieu modifier
+    lien tiep); co operand khong kin -> moi operand 1 modifier nhu cu (Exact cho operand ho). Tra ve cac modifier."""
+    if not entries:
+        return []
+    if all(obj.type == 'MESH' and mesh_is_manifold(obj.data) for _name, obj in entries):
+        mod = seg.modifiers.new(name=MOD_PREFIX + all_name, type='BOOLEAN')
+        mod.operation = operation
+        mod.operand_type = 'COLLECTION'
+        mod.collection = operand_collection(key, [obj for _name, obj in entries])
+        try:
+            mod.solver = 'MANIFOLD'
+        except TypeError:
+            seg.modifiers.remove(mod)
+        else:
+            mod.show_expanded = False
+            return [mod]
+    return [add_boolean_modifier(seg, obj, operation, MOD_PREFIX + one_prefix + name) for name, obj in entries]
+
+
 def rebuild_segment_modifiers(context):
     """Dung lai toan bo modifier cua Bar Segment theo thu tu co dinh:
 
-        Difference Gingiva
-        -> [Cut Top Bar]   Union tung Bar Pillar -> Difference PlaneCubeCut
-                           -> Difference tung Base
-        -> Union / Difference tung Part Bar (them ngay khi Add Attachment)
-        (Enable / Disable Preview chi bat / tat Realtime Display in Viewport cua modifier Attachment;
-         CutBase luon bat)
+        [Preview cat Top Bar]  Difference Gingiva
+                               -> Union cac Bar Pillar (1 modifier Collection neu tat ca kin)
+                               -> Difference PlaneCubeCut
+                               -> Difference cac Base (1 modifier Collection neu tat ca kin)
+        [Preview Attachment]   Union / Difference tung Part Bar (them ngay khi Add Attachment)
 
-    Chi them modifier; Segment da Apply thi bo qua.
+    Modifier luon duoc them san; Enable / Disable Preview chi bat / tat Realtime Display in Viewport cua tung
+    nhom (mac dinh tat de Viewport nhe). Apply / Save / tao Sleeve luon tinh du phan cat Top Bar.
+    Segment da Apply thi bo qua.
     """
     props = context.scene.rmvb
     seg = props.bar_segment
@@ -2971,29 +3071,29 @@ def rebuild_segment_modifiers(context):
     for mod in list(seg.modifiers):
         if mod.name.startswith(MOD_PREFIX):
             seg.modifiers.remove(mod)
-    preview = preview_enabled(seg)
+    preview_att = preview_enabled(seg)
+    preview_cut = cut_preview_enabled(seg)
+    cut_mods = []
     gingiva = props.gingiva_object
     if valid_obj(gingiva):
-        add_boolean_modifier(seg, gingiva, 'DIFFERENCE', MOD_PREFIX + "CutGingiva")
-    if seg.get("rmvb_cut"):
-        for ref in props.pillars:
-            if valid_obj(ref.object):
-                add_boolean_modifier(seg, ref.object, 'UNION',
-                                     MOD_PREFIX + "Union_" + ref.tooth)
-        if valid_obj(props.top_cutter):
-            add_boolean_modifier(seg, props.top_cutter, 'DIFFERENCE',
-                                 MOD_PREFIX + "CutPlane")
-        for item in props.placed:
-            if valid_obj(item.base_object):
-                add_boolean_modifier(seg, item.base_object, 'DIFFERENCE',
-                                     CUTBASE_PREFIX + item.tooth)
+        cut_mods.append(add_boolean_modifier(seg, gingiva, 'DIFFERENCE', MOD_PREFIX + "CutGingiva"))
+    cut_mods += add_group_boolean(
+        seg, [(ref.tooth, ref.object) for ref in props.pillars if valid_obj(ref.object)],
+        'UNION', "UnionAll", "Union_", "pillar")
+    if valid_obj(props.top_cutter):
+        cut_mods.append(add_boolean_modifier(seg, props.top_cutter, 'DIFFERENCE', MOD_PREFIX + "CutPlane"))
+    cut_mods += add_group_boolean(
+        seg, [(item.tooth, item.base_object) for item in props.placed if valid_obj(item.base_object)],
+        'DIFFERENCE', "CutBaseAll", "CutBase_", "base")
+    for mod in cut_mods:
+        mod.show_viewport = preview_cut
     for index, group in enumerate(props.groups):
         if valid_obj(group.part_bar):
             mod = add_boolean_modifier(
                 seg, group.part_bar,
                 'UNION' if group.on_bar else 'DIFFERENCE',
                 "%sAtt_%d_%s" % (MOD_PREFIX, index, group.name[:30]))
-            mod.show_viewport = preview
+            mod.show_viewport = preview_att
     return len([m for m in seg.modifiers if m.name.startswith(MOD_PREFIX)])
 
 
@@ -3119,6 +3219,8 @@ class RMVB_OT_create_top_bar_plane(Operator):
         resized = False if created else fit_plane_size(plane, cutter)
         context.view_layer.update()
         ensure_arrow(context, plane.matrix_world.translation)
+        if valid_obj(props.bar_segment):
+            rebuild_segment_modifiers(context)           # them modifier CutPlane (tat Preview)
         for group in props.groups:
             if group.lock_topbar or group.lock_rot_topbar or group.center_bar or group.align_x_bar:
                 apply_group_locks(group, props)
@@ -3136,11 +3238,30 @@ class RMVB_OT_create_top_bar_plane(Operator):
         return {'FINISHED'}
 
 
-class RMVB_OT_cut_top_bar(Operator):
-    """Them modifier: Union Bar Segment voi tat ca Bar Pillar, Difference PlaneCubeCut
-    (Manifold), Difference Base. Chi them modifier, khong apply"""
-    bl_idname = "rmvb.cut_top_bar"
-    bl_label = "Cut Top Bar"
+def set_cut_preview(context, enabled):
+    """Bat / tat Preview cat Top Bar: Realtime Display in Viewport (show_viewport) cua cac modifier Gingiva, Pillar,
+    PlaneCubeCut, Base tren Bar Segment, va an / hien Bar Pillar + ConnectionVisual (da nam gon trong ket qua cat).
+    Tra ve so modifier cat."""
+    props = context.scene.rmvb
+    seg = props.bar_segment
+    seg["rmvb_cut_preview"] = enabled
+    rebuild_segment_modifiers(context)       # Pillar / Plane / Base / Gingiva co the vua doi; rebuild ap trang thai moi
+    count = sum(1 for mod in seg.modifiers if is_cut_modifier(mod))
+    for obj in ([r.object for r in props.pillars] + [i.visual_object for i in props.placed]):
+        if valid_obj(obj):
+            try:
+                obj.hide_set(enabled)
+            except RuntimeError:             # object khong nam trong View Layer
+                pass
+    return count
+
+
+class RMVB_OT_enable_cut_preview(Operator):
+    """Enable Preview: BAT Realtime Display in Viewport cua cac modifier cat Top Bar (Difference Gingiva, Union Bar
+    Pillar, Difference PlaneCubeCut, Difference Base) tren Bar Segment, dong thoi AN Bar Pillar + ConnectionVisual.
+    Modifier da duoc them san; nut nay khong apply"""
+    bl_idname = "rmvb.enable_cut_preview"
+    bl_label = "Enable Preview"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -3155,18 +3276,35 @@ class RMVB_OT_cut_top_bar(Operator):
         if not valid_obj(props.top_cutter):
             self.report({'ERROR'}, "Chua co PlaneCubeCut - bam Create Top Bar Plane truoc")
             return {'CANCELLED'}
-        ensure_object_mode(context)     # dang Edit Line Bar -> chot diem line truoc khi dung modifier
-        seg["rmvb_cut"] = True
-        count = rebuild_segment_modifiers(context)
+        ensure_object_mode(context)     # dang Edit Line Bar -> chot diem line truoc khi tinh Boolean
+        count = set_cut_preview(context, True)
         activate(context, seg)
-        # Pillar da Union vao Bar Segment, ConnectionVisual nam gon trong: an di (con mat).
-        # Boolean van dung Pillar lam operand binh thuong.
-        pillars = [r.object for r in props.pillars if valid_obj(r.object)]
-        visuals = [i.visual_object for i in props.placed if valid_obj(i.visual_object)]
-        for obj in pillars + visuals:
-            obj.hide_set(True)
-        self.report({'INFO'}, "Da them modifier Cut Top Bar (Bar Segment co %d modifier, chua apply); "
-                    "da an %d Bar Pillar + %d ConnectionVisual" % (count, len(pillars), len(visuals)))
+        self.report({'INFO'}, "Enable Preview cat Top Bar: bat hien thi %d modifier, da an Bar Pillar + "
+                    "ConnectionVisual (Boolean tinh lai moi khi doi line / Plane / Pillar - bam Disable Preview "
+                    "khi chinh sua cho nhe)" % count)
+        return {'FINISHED'}
+
+
+class RMVB_OT_disable_cut_preview(Operator):
+    """Disable Preview: TAT Realtime Display in Viewport cua cac modifier cat Top Bar (modifier van giu nguyen, Apply /
+    Save / Sleeve van tinh du phan cat) va HIEN LAI Bar Pillar + ConnectionVisual de chinh sua"""
+    bl_idname = "rmvb.disable_cut_preview"
+    bl_label = "Disable Preview"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        seg = props.bar_segment
+        if not valid_obj(seg):
+            self.report({'ERROR'}, "Chua co Bar Segment")
+            return {'CANCELLED'}
+        if seg.get("rmvb_applied"):
+            self.report({'ERROR'}, "Bar Segment da Apply - bam Delete Bar Design de sua tiep")
+            return {'CANCELLED'}
+        ensure_object_mode(context)
+        count = set_cut_preview(context, False)
+        self.report({'INFO'}, "Disable Preview cat Top Bar: tat hien thi %d modifier, da hien lai Bar Pillar + "
+                    "ConnectionVisual" % count)
         return {'FINISHED'}
 
 
@@ -3780,7 +3918,7 @@ def is_sleeve_source_modifier(mod, bar_parts=()):
     if not mod.name.startswith(MOD_PREFIX):
         return True                        # modifier do nguoi dung tu them: giu nguyen
     short = mod.name[len(MOD_PREFIX):]
-    if short == "CutPlane" or short.startswith("Union_"):
+    if short == "CutPlane" or short.startswith("Union"):
         return True
     return (short.startswith("Att_") and mod.type == 'BOOLEAN'
             and mod.object is not None and mod.object.name in bar_parts)
@@ -3809,8 +3947,8 @@ def bar_source(context, coll, voxel=None):
     for mod in list(temp.modifiers):
         if not is_sleeve_source_modifier(mod, bar_parts):
             temp.modifiers.remove(mod)
-        elif mod.name.startswith(ATT_PREFIX):
-            mod.show_viewport = True        # Disable Preview tat modifier Attachment: van phai ap len Bar
+        elif mod.name.startswith(MOD_PREFIX):
+            mod.show_viewport = True        # Preview tat modifier cat / Attachment: Sleeve van phai theo day du
             mod.show_render = True
     if voxel > 0.0:
         remesh = temp.modifiers.new(MOD_PREFIX + "SleeveRemesh", 'REMESH')
@@ -3936,9 +4074,10 @@ class RMVB_OT_apply_bar_design(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        context.view_layer.update()
-        depsgraph = context.evaluated_depsgraph_get()
-        baked = _mesh_from_evaluated(seg.evaluated_get(depsgraph))
+        with forced_cut_modifiers(seg):          # phan cat Top Bar luon duoc nuong du Preview dang tat
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
+            baked = _mesh_from_evaluated(seg.evaluated_get(depsgraph))
         if len(baked.polygons) == 0:
             bpy.data.meshes.remove(baked)
             self.report({'ERROR'}, "Ket qua modifier rong - kiem tra lai cac Boolean")
@@ -4053,6 +4192,10 @@ class RMVB_OT_save_design(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        with forced_cut_modifiers(context.scene.rmvb.bar_segment):      # Bar xuat ra luon co du phan cat Top Bar
+            return self._save(context)
+
+    def _save(self, context):
         props = context.scene.rmvb
         items = []
         if valid_obj(props.bar_segment):
@@ -4192,13 +4335,11 @@ class RMVB_PT_panel(Panel):
         box.prop(props, "pillar_lift")
         col = box.column(align=True)
         col.operator(RMVB_OT_create_bar_pillar.bl_idname,
-                     text="Create Bar Pillar", icon=_ic('MOD_SCREW'))
-        sub = col.column(align=True)
-        sub.operator(RMVB_OT_edit_bar_pillar.bl_idname,
-                     text="Edit Bar Pillar (Local)", icon=_ic('EDITMODE_HLT'))
-        sub.operator(RMVB_OT_select_pillar_top.bl_idname,
-                     text="Select Top (chọn Bar Pillar trước)", icon=_ic('VERTEXSEL'))
-        sub.operator(RMVB_OT_exit_edit.bl_idname, text="Exit Edit Bar Pillar",
+                     text="Create/Reset bar pillar", icon=_ic('MOD_SCREW'))
+        row = col.row(align=True)
+        row.operator(RMVB_OT_select_pillar_top.bl_idname,
+                     text="Sửa đỉnh trụ bar", icon=_ic('VERTEXSEL'))
+        row.operator(RMVB_OT_exit_edit.bl_idname, text="Thoát chỉnh sửa trụ",
                      icon=_ic('OBJECT_DATA'))
         box.label(text="Bar Pillar: %d" % len(props.pillars), icon=_ic('INFO'))
 
@@ -4228,8 +4369,15 @@ class RMVB_PT_panel(Panel):
         if plane_ok:
             box.label(text="Sửa line / dời-xoay Plane / mũi tên: Bar Segment tự cập nhật",
                       icon=_ic('INFO'))
-        box.operator(RMVB_OT_cut_top_bar.bl_idname, text="Cut Top Bar",
-                     icon=_ic('MOD_BOOLEAN'))
+        box.label(text="Preview cắt Top Bar (Gingiva, Pillar, Plane, Base):", icon=_ic('MOD_BOOLEAN'))
+        seg = props.bar_segment
+        cut_on = (valid_obj(seg) and cut_preview_enabled(seg)
+                  and any(is_cut_modifier(m) and m.show_viewport for m in seg.modifiers))
+        row = box.row(align=True)
+        row.operator(RMVB_OT_enable_cut_preview.bl_idname, text="Enable Preview",
+                     icon=_ic('HIDE_OFF'), depress=cut_on)
+        row.operator(RMVB_OT_disable_cut_preview.bl_idname, text="Disable Preview",
+                     icon=_ic('HIDE_ON'))
 
         # ---- Attachment ----------------------------------------------------
         box = layout.box()
@@ -4316,7 +4464,6 @@ _classes = (
     RMVB_OT_set_implant_connection,
     RMVB_OT_clear_connection,
     RMVB_OT_create_bar_pillar,
-    RMVB_OT_edit_bar_pillar,
     RMVB_OT_select_pillar_top,
     RMVB_OT_exit_edit,
     RMVB_OT_create_top_bar_plane,
@@ -4324,7 +4471,8 @@ _classes = (
     RMVB_OT_draw_bar_line,
     RMVB_OT_edit_bar_line,
     RMVB_OT_update_bar_segment,
-    RMVB_OT_cut_top_bar,
+    RMVB_OT_enable_cut_preview,
+    RMVB_OT_disable_cut_preview,
     RMVB_OT_add_attachment,
     RMVB_OT_select_attachment_group,
     RMVB_OT_remove_attachment_group,

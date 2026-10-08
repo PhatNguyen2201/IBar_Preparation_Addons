@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -143,7 +143,8 @@ def ensure_library_dir():
 
 
 def empty_index():
-    return {"version": 1, "connections": [], "connection_groups": [], "attachments": []}
+    return {"version": 1, "connections": [], "connection_groups": [], "attachments": [],
+            "attachment_groups": []}
 
 
 def invalidate_cache():
@@ -176,6 +177,7 @@ def read_index(use_cache=True):
     data.setdefault("version", 1)
     data.setdefault("connections", [])
     data.setdefault("connection_groups", [])
+    data.setdefault("attachment_groups", [])
     data.setdefault("attachments", [])
     _INDEX_CACHE.update(path=path, mtime=mtime, data=data)
     return data
@@ -265,24 +267,72 @@ def unique_folder(kind, name, entries, exclude=None):
     raise RuntimeError("Khong tao duoc ten thu muc cho '%s'" % name)
 
 
-def _free_visual_stem(folder_abs, entry):
-    used = set()
+def _free_visual_stem(folder_abs, entry, prefix="", taken=()):
+    """'visual_NN' chua dung trong thu muc (ten file co tien to `prefix`) va chua nam trong `taken`."""
+    used = set(taken)
     try:
-        used.update(os.path.splitext(f)[0] for f in os.listdir(folder_abs))
+        for name in os.listdir(folder_abs):
+            base = os.path.splitext(name)[0]
+            if base.startswith(prefix):
+                used.add(base[len(prefix):])
     except OSError:
         pass
-    used.update(os.path.splitext(os.path.basename(row.asset))[0] for row in entry.visuals if row.asset)
+    for row in entry.visuals:
+        if row.asset:
+            base = os.path.splitext(os.path.basename(row.asset.replace("\\", "/")))[0]
+            if base.startswith(prefix):
+                used.add(base[len(prefix):])
     index = 0
     while "visual_%02d" % index in used:
         index += 1
     return "visual_%02d" % index
 
 
-def _place_file(kind, entry, folder, source, stem, current_rel):
-    """Copy `source` vao <lib>/<kind>/<folder>/<stem><ext> (ghi de neu da co) va tra ve rel.
+def _group_def_of(entry, library):
+    """Nhom chua `entry` (Connection -> nhom Implant Connection, Attachment -> nhom Attachment); None neu
+    chua nhom. Moi nhom co thu muc chung trong thu vien, file cua cac thanh vien nam phang trong do."""
+    if library is None or not hasattr(entry, "group"):
+        return None
+    name = entry.group.strip()
+    if not name:
+        return None
+    if hasattr(entry, "slot_base"):
+        return _find_connection_group(library, name)
+    if hasattr(entry, "visuals"):
+        return _find_attachment_group(library, name)
+    return None
+
+
+def _location(kind, entry, library=None):
+    """(thu muc, tien to ten file) noi chua file RIENG cua entry.
+
+    Entry thuoc nhom -> thu muc cua nhom (phang), ten file co tien to '<thu muc cua entry>_';
+    nguoc lai thu muc rieng cua entry, khong tien to."""
+    gdef = _group_def_of(entry, library)
+    if gdef is not None and gdef.folder and entry.folder:
+        return gdef.folder, entry.folder + "_"
+    return entry.folder, ""
+
+
+def _is_own_file(kind, entry, stem, rel):
+    """`rel` la file RIENG cua entry: nam trong thu muc rieng cua entry, hoac la file '<thu muc entry>_<stem>'
+    (Visual Object: '<thu muc entry>_visual_NN') trong thu muc nhom."""
+    found = _rel_folder(rel)
+    if not found or found[0] != kind or not entry.folder:
+        return False
+    if _norm(found[1]) == _norm(entry.folder):
+        return True
+    base = os.path.splitext(os.path.basename(rel.replace("\\", "/")))[0]
+    if stem is None:
+        return re.fullmatch(re.escape(entry.folder) + r"_visual_\d+", base) is not None
+    return base == entry.folder + "_" + stem
+
+
+def _place_file(kind, entry, folder, source, stem, current_rel, prefix=""):
+    """Copy `source` vao <lib>/<kind>/<folder>/<prefix><stem><ext> (ghi de neu da co) va tra ve rel.
 
     stem None = Visual Object: dung lai ten file hien tai neu no da nam trong thu muc cua entry, khong thi
-    lay 'visual_NN' chua dung. File cu cua cung slot (khac duoi file) trong thu muc cua entry bi xoa."""
+    lay 'visual_NN' chua dung. File cu cua cung slot (khac duoi file) cua entry bi xoa."""
     folder_abs = os.path.join(library_dir(), kind, folder)
     os.makedirs(folder_abs, exist_ok=True)
     ext = os.path.splitext(source)[1].lower()
@@ -290,9 +340,15 @@ def _place_file(kind, entry, folder, source, stem, current_rel):
         ext = ".stl"
     current = _rel_folder(current_rel)
     inside = bool(current) and current[0] == kind and _norm(current[1]) == _norm(folder)
+    if inside and prefix:
+        inside = os.path.basename(current_rel.replace("\\", "/")).startswith(prefix)
     if stem is None:
-        stem = os.path.splitext(os.path.basename(current_rel))[0] if inside else _free_visual_stem(folder_abs, entry)
-    dest = os.path.join(folder_abs, stem + ext)
+        if inside:
+            stem = os.path.splitext(os.path.basename(current_rel.replace("\\", "/")))[0][len(prefix):]
+        else:
+            stem = _free_visual_stem(folder_abs, entry, prefix)
+    name = prefix + stem
+    dest = os.path.join(folder_abs, name + ext)
     if not (os.path.exists(dest) and os.path.samefile(source, dest)):
         shutil.copy2(source, dest)
     if inside:
@@ -302,20 +358,22 @@ def _place_file(kind, entry, folder, source, stem, current_rel):
                 os.remove(old)
             except OSError as exc:
                 print(f"[Dental-Lib] Khong xoa duoc file cu {old}: {exc}")
-    return "/".join((kind, folder, stem + ext))
+    return "/".join((kind, folder, name + ext))
 
 
-def ensure_entry_folder(kind, entry, entries, skip_rel=""):
-    """Thu muc rieng cua entry (chua co thi chon ten; chua tao thu muc tren dia cho den khi co file).
+def ensure_entry_folder(kind, entry, entries, skip_rel="", library=None):
+    """Ten thu muc rieng cua entry (chua co thi chon ten; chua tao thu muc tren dia cho den khi co file).
+    Connection thuoc nhom thi `folder` chi la ten dinh danh / tien to ten file (file nam trong thu muc nhom).
 
     Entry cu (khong co folder): neu moi file da nam chung 1 thu muc trong thu vien va chua entry nao
-    nhan thu muc do thi nhan luon (khong copy); nguoc lai chon thu muc moi va COPY cac file con lai vao
-    do (file cu giu nguyen). `skip_rel` = file sap bi thay nen khong can copy."""
+    nhan thu muc do thi nhan luon (khong copy; khong ap dung cho entry thuoc nhom); nguoc lai chon ten
+    moi va COPY cac file con lai vao do (file cu giu nguyen). `skip_rel` = file sap bi thay nen khong can copy."""
     if entry.folder:
         return entry.folder
     refs = [(stem, rel, setter) for stem, rel, setter in _entry_asset_refs(kind, entry) if rel]
+    grouped = _group_def_of(entry, library) is not None
     found = {_rel_folder(rel) for _stem, rel, _set in refs}
-    if len(found) == 1:
+    if not grouped and len(found) == 1:
         only = next(iter(found))
         if only and only[0] == kind and not any(
                 other.folder and _norm(other.folder) == _norm(only[1])
@@ -323,29 +381,43 @@ def ensure_entry_folder(kind, entry, entries, skip_rel=""):
             entry.folder = only[1]
             return entry.folder
     entry.folder = unique_folder(kind, entry.entry_name, entries, exclude=entry)
+    folder, prefix = _location(kind, entry, library)
     for stem, rel, setter in refs:
         if rel == skip_rel:
             continue
         current = _rel_folder(rel)
-        if current and current[0] == kind and _norm(current[1]) == _norm(entry.folder):
+        if _is_own_file(kind, entry, stem, rel) or (
+                current and current[0] == kind and _norm(current[1]) == _norm(folder) and not prefix):
             continue
         source = resolve_asset(rel)
         if source and os.path.isfile(source):
-            setter(_place_file(kind, entry, entry.folder, source, stem, ""))
+            setter(_place_file(kind, entry, folder, source, stem, "", prefix))
     return entry.folder
 
 
-def store_entry_asset(kind, entry, entries, source, stem, get_current):
-    """Gan file mesh `source` vao slot cua entry: file luon nam trong thu muc rieng cua entry, tra ve rel.
-    stem = ten slot (vd. 'base', 'part_bar') hoac None cho Visual Object; get_current() = rel dang gan."""
+def store_entry_asset(kind, entry, entries, source, stem, get_current, library=None):
+    """Gan file mesh `source` vao slot cua entry: file luon nam trong thu muc rieng cua entry (hoac thu muc nhom
+    neu Connection thuoc nhom), tra ve rel. stem = ten slot (vd. 'base', 'part_bar') hoac None cho Visual
+    Object; get_current() = rel dang gan."""
     ensure_library_dir()
-    folder = ensure_entry_folder(kind, entry, entries, skip_rel=get_current())
-    return _place_file(kind, entry, folder, source, stem, get_current())
+    ensure_entry_folder(kind, entry, entries, skip_rel=get_current(), library=library)
+    folder, prefix = _location(kind, entry, library)
+    return _place_file(kind, entry, folder, source, stem, get_current(), prefix)
 
 
-def rename_entry_folder(kind, entry, entries):
-    """Entry doi ten -> doi ten thu muc theo va sua moi duong dan file. That bai thi giu thu muc cu
-    (file van cung mot cho)."""
+def _rewrite_folder_refs(kind, owner, old, new):
+    """Sua moi duong dan cua `owner` dang tro vao <kind>/<old>/... thanh <kind>/<new>/..."""
+    for _stem, rel, setter in _entry_asset_refs(kind, owner):
+        found = _rel_folder(rel)
+        if found and found[0] == kind and _norm(found[1]) == _norm(old):
+            rest = rel.replace("\\", "/").split("/")[2:]
+            setter("/".join([kind, new] + rest))
+
+
+def rename_entry_folder(kind, entry, entries, library=None, extra=()):
+    """Entry doi ten -> doi ten thu muc theo va sua moi duong dan file (ke ca cua cac owner trong `extra`, vd.
+    cac Connection trong nhom khi nhom doi ten). Connection thuoc nhom khong co thu muc rieng: doi tien to ten
+    file trong thu muc nhom. That bai thi giu nguyen (file van cung mot cho)."""
     old = entry.folder
     if not old:
         return False
@@ -356,6 +428,27 @@ def rename_entry_folder(kind, entry, entries):
         new = base
     else:
         new = unique_folder(kind, entry.entry_name, entries, exclude=entry)
+    folder, prefix = _location(kind, entry, library)
+    if prefix:
+        plan = []
+        for stem, rel, setter in _entry_asset_refs(kind, entry):
+            if rel and _is_own_file(kind, entry, stem, rel):
+                src = _library_path(rel)
+                if os.path.isfile(src):
+                    base = os.path.splitext(os.path.basename(src))[0]
+                    tail = stem if stem is not None else base[len(old) + 1:]
+                    dest_rel = "/".join((kind, folder, new + "_" + tail + os.path.splitext(src)[1]))
+                    plan.append((src, _library_path(dest_rel), dest_rel, setter))
+        try:
+            for src, dest, _rel, _set in plan:
+                os.replace(src, dest)
+        except OSError as exc:
+            print(f"[Dental-Lib] Khong doi ten file cua '{old}' -> '{new}': {exc}")
+            return False
+        entry.folder = new
+        for _src, _dest, dest_rel, setter in plan:
+            setter(dest_rel)
+        return True
     old_abs, new_abs = (os.path.join(library_dir(), kind, f) for f in (old, new))
     try:
         if os.path.isdir(old_abs):
@@ -364,12 +457,97 @@ def rename_entry_folder(kind, entry, entries):
         print(f"[Dental-Lib] Khong doi ten thu muc '{old}' -> '{new}': {exc}")
         return False
     entry.folder = new
-    for _stem, rel, setter in _entry_asset_refs(kind, entry):
-        found = _rel_folder(rel)
-        if found and found[0] == kind and _norm(found[1]) == _norm(old):
-            rest = rel.replace("\\", "/").split("/")[2:]
-            setter("/".join([kind, new] + rest))
+    for owner in (entry,) + tuple(extra):
+        _rewrite_folder_refs(kind, owner, old, new)
     return True
+
+
+def relocate_entry_files(kind, entry, library):
+    """Dua file RIENG cua entry (ke ca Visual Object) ve dung cho theo nhom hien tai: entry thuoc nhom -> thu muc cua
+    nhom (ten file co tien to '<thu muc entry>_'), khong thuoc nhom -> thu muc rieng. File cua chinh entry thi DI
+    CHUYEN (thu muc cu rong thi go), file tu noi khac (cu / ngoai thu vien) thi COPY. Tra ve so file da dua ve cho."""
+    refs = [(stem, rel, setter) for stem, rel, setter in _entry_asset_refs(kind, entry) if rel]
+    if not refs:
+        return 0
+    if not entry.folder:
+        entries = _connection_entries(library) if kind == "connections" else _attachment_entries(library)
+        entry.folder = unique_folder(kind, entry.entry_name, entries, exclude=entry)
+    folder, prefix = _location(kind, entry, library)
+    folder_abs = os.path.join(library_dir(), kind, folder)
+    done = 0
+    old_dirs = set()
+    taken = set()                                # ten (khong duoi file) da dung cho Visual Object trong luot nay
+    for stem, rel, setter in refs:
+        source = resolve_asset(rel)
+        if not source or not os.path.isfile(source):
+            continue
+        ext = os.path.splitext(source)[1].lower() or ".stl"
+        if stem is None:
+            found = re.search(r"(visual_\d+)$", os.path.splitext(os.path.basename(source))[0])
+            use = found.group(1) if found else None
+            if use is None or use in taken:
+                use = _free_visual_stem(folder_abs, entry, prefix, taken)
+            taken.add(use)
+        else:
+            use = stem
+        dest_rel = "/".join((kind, folder, prefix + use + ext))
+        dest = _library_path(dest_rel)
+        if _norm(dest) == _norm(source):
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if _is_own_file(kind, entry, stem, rel):
+                try:
+                    os.replace(source, dest)
+                except OSError:
+                    shutil.copy2(source, dest)
+                    os.remove(source)
+                old_dirs.add(os.path.dirname(source))
+            else:
+                shutil.copy2(source, dest)
+        except OSError as exc:
+            print(f"[Dental-Lib] Khong dua duoc file '{rel}' ve '{dest_rel}': {exc}")
+            continue
+        setter(dest_rel)
+        done += 1
+    for directory in old_dirs:
+        try:
+            os.rmdir(directory)              # chi go duoc khi da rong
+        except OSError:
+            pass
+    return done
+
+
+def gather_connection_group_files(context):
+    """Gom file rieng cua moi Connection thuoc nhom vao thu muc cua nhom (di chuyen, sua duong dan, ghi
+    library.json). Chay lai nhieu lan khong doi gi them. Tra ve so file da gom."""
+    library = _lib_group(context)
+    moved = 0
+    for entry in library.connections:
+        if entry.group.strip():
+            moved += relocate_entry_files("connections", entry, library)
+    if moved:
+        _save_all(context)
+    return moved
+
+
+def gather_attachment_group_files(context):
+    """Nhu gather_connection_group_files nhung cho Attachment (ke ca Visual Object); bo nhom Attachment khong con
+    thanh vien. Tra ve so file da gom."""
+    library = _lib_group(context)
+    moved = 0
+    for entry in library.attachments:
+        if entry.group.strip():
+            moved += relocate_entry_files("attachments", entry, library)
+    pruned = prune_attachment_groups(library)
+    if moved or pruned:
+        _save_all(context)
+    return moved
+
+
+def gather_group_files(context):
+    """Gom file cua Connection va Attachment thuoc nhom vao thu muc cua nhom. Tra ve tong so file da gom."""
+    return gather_connection_group_files(context) + gather_attachment_group_files(context)
 
 
 def resolve_asset(ref):
@@ -584,6 +762,61 @@ def new_connection_group(library, name):
     return item
 
 
+def _attachment_entries(library):
+    """Moi muc co thu muc trong attachments/: Attachment + nhom Attachment (de ten thu muc khong trung nhau)."""
+    return list(library.attachments) + list(library.attachment_groups)
+
+
+def _find_attachment_group(library, name):
+    for item in library.attachment_groups:
+        if item.entry_name == name:
+            return item
+    return None
+
+
+def new_attachment_group(library, name):
+    """Them nhom Attachment (chi giu ten thu muc chung); chon san ten thu muc, chua tao tren dia."""
+    item = library.attachment_groups.add()
+    item.entry_name = name
+    item.folder = unique_folder("attachments", name, _attachment_entries(library), exclude=item)
+    return item
+
+
+def prune_attachment_groups(library):
+    """Bo nhom Attachment khong con thanh vien (go thu muc nhom neu da rong). Tra ve so nhom da bo."""
+    used = {e.group.strip() for e in library.attachments if e.group.strip()}
+    removed = 0
+    for index in reversed(range(len(library.attachment_groups))):
+        item = library.attachment_groups[index]
+        if item.entry_name not in used:
+            try:
+                os.rmdir(os.path.join(library_dir(), "attachments", item.folder))
+            except OSError:
+                pass
+            library.attachment_groups.remove(index)
+            removed += 1
+    return removed
+
+
+def _att_member_group_update(self, context):
+    """Doi nhom cua mot Attachment: go ten nhom chua co thi tu tao nhom (thu muc chung), file di chuyen theo."""
+    if _SUPPRESS_AUTOSAVE[0] or _GROUP_BUSY[0]:
+        return
+    name = self.group.strip()
+    if name != self.group:
+        self.group = name
+        return
+    library = bpy.context.scene.dental_lib
+    if name and _find_attachment_group(library, name) is None:
+        new_attachment_group(library, name)
+    try:
+        relocate_entry_files("attachments", self, library)
+    except Exception as exc:
+        print(f"[Dental-Lib] Khong gom file cua '{self.entry_name}' theo nhom: {exc}")
+    prune_attachment_groups(library)
+    _autosave(context)
+
+
 def _conn_member_group_update(self, context):
     """Doi nhom cua mot Connection: go ten nhom chua co thi tu tao nhom (de gan bo file chung)."""
     if _SUPPRESS_AUTOSAVE[0] or _GROUP_BUSY[0]:
@@ -592,10 +825,13 @@ def _conn_member_group_update(self, context):
     if name != self.group:
         self.group = name           # goi lai update voi ten da cat khoang trang
         return
-    if name:
-        library = bpy.context.scene.dental_lib
-        if _find_connection_group(library, name) is None:
-            new_connection_group(library, name)
+    library = bpy.context.scene.dental_lib
+    if name and _find_connection_group(library, name) is None:
+        new_connection_group(library, name)
+    try:
+        relocate_entry_files("connections", self, library)       # vao / ra khoi nhom: file di chuyen theo
+    except Exception as exc:
+        print(f"[Dental-Lib] Khong gom file cua '{self.entry_name}' theo nhom: {exc}")
     _autosave(context)
 
 
@@ -623,7 +859,8 @@ def _conn_group_name_update(self, context):
                 entry.group = new
         self.prev_name = new
         try:
-            rename_entry_folder("connections", self, _connection_entries(library))
+            members = [e for e in library.connections if e.group == new]
+            rename_entry_folder("connections", self, _connection_entries(library), library, extra=members)
         except Exception as exc:
             print(f"[Dental-Lib] Khong doi ten thu muc nhom: {exc}")
     finally:
@@ -638,9 +875,9 @@ def _entry_name_updater(kind):
             return
         try:
             library = bpy.context.scene.dental_lib
-            entries = _connection_entries(library) if kind == "connections" else library.attachments
+            entries = _connection_entries(library) if kind == "connections" else _attachment_entries(library)
             if self.folder:
-                rename_entry_folder(kind, self, entries)
+                rename_entry_folder(kind, self, entries, library)
         except Exception as exc:
             print(f"[Dental-Lib] Khong doi ten thu muc theo ten moi: {exc}")
         _autosave(context)
@@ -670,6 +907,14 @@ ATTACHMENT_SLOT_LABELS = [
     ("part_bar", "Apply Part Bar (STL/PLY)", 'MESH_CUBE'),
     ("part_sleeve", "Apply Part Sleeve (STL/PLY)", 'MESH_TORUS'),
 ]
+
+
+class DLIB_PG_AttachmentGroup(PropertyGroup):
+    """Nhom Attachment: chi giu ten thu muc chung (attachments/<thu muc>/) chua file cua cac Attachment trong nhom."""
+    entry_name: StringProperty(name="Ten nhom", default="Group")
+    folder: StringProperty(
+        name="Thu muc", default="",
+        description="Thu muc chung cua nhom trong thu vien (attachments/<thu muc>)")
 
 
 class DLIB_PG_ConnectionGroup(PropertyGroup):
@@ -715,8 +960,9 @@ class DLIB_PG_AttachmentEntry(PropertyGroup):
     group: StringProperty(
         name="Nhom", default="",
         description="Ten nhom (thu muc) chua Attachment nay. De trong = chua nhom. Panel Dental-Lib "
-                    "va menu Select Attachment ben Rmvb-Bar gom cac Attachment theo nhom",
-        update=_update_color)
+                    "va menu Select Attachment ben Rmvb-Bar gom cac Attachment theo nhom; file cua cac "
+                    "Attachment trong nhom nam chung trong thu muc cua nhom",
+        update=_att_member_group_update)
     open: BoolProperty(name="Mo rong", default=True,
                        description="Thu/mo danh sach slot file cua entry nay")
     on_bar: BoolProperty(
@@ -758,6 +1004,7 @@ class DLIB_PG_Library(PropertyGroup):
     connections: CollectionProperty(type=DLIB_PG_ConnectionEntry)
     connection_groups: CollectionProperty(type=DLIB_PG_ConnectionGroup)
     attachments: CollectionProperty(type=DLIB_PG_AttachmentEntry)
+    attachment_groups: CollectionProperty(type=DLIB_PG_AttachmentGroup)
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +1025,10 @@ def _lib_group(context):
 def index_from_scene(context):
     """Chuyen buffer tren scene ve dict JSON."""
     group = _lib_group(context)
-    data = {"version": 1, "connections": [], "connection_groups": [], "attachments": []}
+    data = {"version": 1, "connections": [], "connection_groups": [], "attachments": [],
+            "attachment_groups": []}
+    for entry in group.attachment_groups:
+        data["attachment_groups"].append({"name": entry.entry_name, "folder": entry.folder})
     for entry in group.connection_groups:
         item = {"name": entry.entry_name, "folder": entry.folder}
         for slot, field in CONNECTION_SLOT_FIELD.items():
@@ -823,6 +1073,11 @@ def _fill_group(group, data):
     group.connections.clear()
     group.connection_groups.clear()
     group.attachments.clear()
+    group.attachment_groups.clear()
+    for item in data.get("attachment_groups", []):
+        adef = group.attachment_groups.add()
+        adef.entry_name = item.get("name", "Group")
+        adef.folder = str(item.get("folder", "") or "")
     for item in data.get("connection_groups", []):
         gdef = group.connection_groups.add()
         gdef.entry_name = item.get("name", "Group")
@@ -840,6 +1095,9 @@ def _fill_group(group, data):
     for entry in group.connections:         # nhom duoc tham chieu nhung chua co dinh nghia (json sua tay)
         if entry.group and _find_connection_group(group, entry.group) is None:
             new_connection_group(group, entry.group)
+    for gdef in group.connection_groups:
+        if not gdef.folder:
+            gdef.folder = unique_folder("connections", gdef.entry_name, _connection_entries(group), exclude=gdef)
     for item in data.get("attachments", []):
         entry = group.attachments.add()
         entry.entry_name = item.get("name", "Attachment")
@@ -859,6 +1117,12 @@ def _fill_group(group, data):
             row.label = visual.get("label", "Visual")
             row.asset = visual.get("asset", "")
             row.color = read_color(visual.get("color"), DEFAULT_VISUAL_COLOR)
+    for entry in group.attachments:         # nhom Attachment chua co dinh nghia (thu vien cu / json sua tay)
+        if entry.group and _find_attachment_group(group, entry.group) is None:
+            new_attachment_group(group, entry.group)
+    for adef in group.attachment_groups:
+        if not adef.folder:
+            adef.folder = unique_folder("attachments", adef.entry_name, _attachment_entries(group), exclude=adef)
     return group
 
 
@@ -899,10 +1163,12 @@ class DLIB_OT_load_library(Operator):
     def execute(self, context):
         ensure_library_dir()
         sync_scene(context)
+        moved = gather_group_files(context)
         data = read_index()
-        self.report({'INFO'}, "Da nap %d Connection, %d Attachment tu %s"
+        self.report({'INFO'}, "Da nap %d Connection, %d Attachment tu %s%s"
                     % (len(data["connections"]), len(data["attachments"]),
-                       index_path()))
+                       index_path(),
+                       " (gom %d file vao thu muc nhom)" % moved if moved else ""))
         return {'FINISHED'}
 
 
@@ -1044,9 +1310,10 @@ class DLIB_OT_remove_connection_group(Operator):
         name = library.connection_groups[self.index].entry_name
         count = sum(1 for e in library.connections if e.group == name)
         return _confirm_delete(self, context, event, "Xóa nhóm '%s'?" % name,
-                               "Xóa nhóm '%s'. %d Connection trong nhóm thành chưa nhóm và mất file kế thừa từ nhóm "
-                               "(thành phần nào chưa có file riêng sẽ trống). File mesh vẫn được giữ trong thư mục "
-                               "thư viện." % (name, count))
+                               "Xóa nhóm '%s'. %d Connection trong nhóm thành chưa nhóm: file riêng của chúng được "
+                               "chuyển ra thư mục riêng, còn phần kế thừa từ nhóm mất (thành phần nào chưa có file "
+                               "riêng sẽ trống). File chung của nhóm vẫn được giữ trong thư mục nhóm."
+                               % (name, count))
 
     def execute(self, context):
         library = ensure_loaded(context)
@@ -1058,11 +1325,31 @@ class DLIB_OT_remove_connection_group(Operator):
             for entry in library.connections:
                 if entry.group == name:
                     entry.group = ""
+                    try:
+                        relocate_entry_files("connections", entry, library)      # file ve lai thu muc rieng
+                    except Exception as exc:
+                        print(f"[Dental-Lib] Khong dua file cua '{entry.entry_name}' ra khoi nhom: {exc}")
             library.connection_groups.remove(self.index)
         finally:
             _GROUP_BUSY[0] = False
         _save_all(context)
         self.report({'INFO'}, "Da xoa nhom '%s'" % name)
+        return {'FINISHED'}
+
+
+class DLIB_OT_gather_groups(Operator):
+    """Gom file cua cac muc trong nhom (Implant Connection va Attachment) vao thu muc cua nhom"""
+    bl_idname = "dental_lib.gather_groups"
+    bl_label = "Gom file nhom"
+    bl_options = set()
+
+    def execute(self, context):
+        ensure_loaded(context)
+        moved = gather_group_files(context)
+        self.report({'INFO'}, "Da gom %d file vao thu muc nhom" % moved if moved else
+                    "Moi file cua cac nhom da nam trong thu muc nhom")
+        for area in context.screen.areas:
+            area.tag_redraw()
         return {'FINISHED'}
 
 
@@ -1134,7 +1421,7 @@ class DLIB_OT_add_attachment(Operator):
         group = ensure_loaded(context)
         entry = group.attachments.add()
         entry.entry_name = _unique_entry_name(group.attachments, "Attachment")
-        entry.folder = unique_folder("attachments", entry.entry_name, group.attachments, exclude=entry)
+        entry.folder = unique_folder("attachments", entry.entry_name, _attachment_entries(group), exclude=entry)
         _save_all(context)
         self.report({'INFO'}, "Da tao '%s'" % entry.entry_name)
         return {'FINISHED'}
@@ -1304,11 +1591,11 @@ class DLIB_OT_import_asset(Operator, ImportHelper):
             if self.kind in ("connection", "connection_group"):
                 field = CONNECTION_SLOT_FIELD[self.slot]
                 rel = store_entry_asset("connections", entry, _connection_entries(library), source, self.slot,
-                                        lambda: getattr(entry, field))
+                                        lambda: getattr(entry, field), library)
                 setattr(entry, field, rel)
             else:
-                rel = store_entry_asset("attachments", entry, library.attachments, source, self.slot,
-                                        lambda: getattr(entry, self.slot))
+                rel = store_entry_asset("attachments", entry, _attachment_entries(library), source, self.slot,
+                                        lambda: getattr(entry, self.slot), library)
                 setattr(entry, self.slot, rel)
         except Exception as exc:
             self.report({'ERROR'}, "Khong copy duoc file vao thu vien: %s" % exc)
@@ -1428,8 +1715,8 @@ class DLIB_OT_import_visual(Operator, ImportHelper):
             return {'CANCELLED'}
         row = entry.visuals[self.visual_index]
         try:
-            rel = store_entry_asset("attachments", entry, library.attachments, source, None,
-                                    lambda: row.asset)
+            rel = store_entry_asset("attachments", entry, _attachment_entries(library), source, None,
+                                    lambda: row.asset, library)
         except Exception as exc:
             self.report({'ERROR'}, "Khong copy duoc file vao thu vien: %s" % exc)
             return {'CANCELLED'}
@@ -1668,8 +1955,11 @@ def _slot_buttons(row, kind, index, slot, value):
         op.slot = slot
 
 
-def _folder_text(kind, entry):
+def _folder_text(kind, entry, library=None):
     if entry.folder:
+        folder, prefix = _location(kind, entry, library)
+        if prefix:
+            return "Thư mục nhóm: %s/%s (file riêng: %s*)" % (kind, folder, prefix)
         return "Thư mục: %s/%s" % (kind, entry.folder)
     return "Thư mục: (mục cũ - tạo khi gắn file)"
 
@@ -1708,7 +1998,7 @@ def _draw_connection_entry(box, i, entry, library):
     op.index = i
     if not entry.open:
         return
-    sub.label(text=_folder_text("connections", entry), icon=_ic('FILE_FOLDER'))
+    sub.label(text=_folder_text("connections", entry, library), icon=_ic('FILE_FOLDER'))
     if len(library.connection_groups):
         grow = sub.row(align=True)
         grow.prop(entry, "group", text="Nhóm", icon=_ic('FILE_FOLDER'))
@@ -1752,6 +2042,7 @@ def _draw_connection_list(box, library):
         folder.label(text=_folder_text("connections", gdef), icon=_ic('FILE_FOLDER'))
         folder.label(text="File chung của nhóm (Connection trong nhóm kế thừa, gắn file riêng để ghi đè):",
                      icon=_ic('LINKED'))
+        folder.operator(DLIB_OT_gather_groups.bl_idname, text="Gom file nhóm", icon=_ic('FILE_FOLDER'))
         for slot, label, icon in CONNECTION_SLOT_LABELS:
             _draw_slot(folder, "connection_group", gi, slot, label, icon, getattr(gdef, CONNECTION_SLOT_FIELD[slot]))
         for i in members.get(gdef.entry_name, []):
@@ -1825,12 +2116,18 @@ class DLIB_PT_panel(Panel):
                 head.label(text=str(len(indices)), icon=_ic('FILE_FOLDER'))
                 if closed:
                     continue
+                if group_name:
+                    adef = _find_attachment_group(group, group_name)
+                    if adef is not None:
+                        folder.label(text=_folder_text("attachments", adef), icon=_ic('FILE_FOLDER'))
+                        folder.operator(DLIB_OT_gather_groups.bl_idname, text="Gom file nhóm",
+                                        icon=_ic('FILE_FOLDER'))
                 holder = folder
             for i in indices:
-                _draw_attachment_entry(holder, i, group.attachments[i])
+                _draw_attachment_entry(holder, i, group.attachments[i], group)
 
 
-def _draw_attachment_entry(box, i, entry):
+def _draw_attachment_entry(box, i, entry, library=None):
     sub = box.box()
     row = sub.row(align=True)
     row.prop(entry, "open", text="",
@@ -1841,7 +2138,7 @@ def _draw_attachment_entry(box, i, entry):
     op.index = i
     if not entry.open:
         return
-    sub.label(text=_folder_text("attachments", entry), icon=_ic('FILE_FOLDER'))
+    sub.label(text=_folder_text("attachments", entry, library), icon=_ic('FILE_FOLDER'))
     grow = sub.row(align=True)
     grow.prop(entry, "group", text="Nhóm", icon=_ic('FILE_FOLDER'))
     grow.operator(DLIB_OT_pick_attachment_group.bl_idname, text="",
@@ -1897,6 +2194,7 @@ class DLibPreferences(AddonPreferences):
 
 _classes = (
     DLIB_PG_VisualObject,
+    DLIB_PG_AttachmentGroup,
     DLIB_PG_ConnectionGroup,
     DLIB_PG_ConnectionEntry,
     DLIB_PG_AttachmentEntry,
@@ -1910,6 +2208,7 @@ _classes = (
     DLIB_OT_remove_connection_group,
     DLIB_OT_set_connection_group,
     DLIB_OT_pick_connection_group,
+    DLIB_OT_gather_groups,
     DLIB_OT_add_attachment,
     DLIB_OT_remove_attachment,
     DLIB_OT_toggle_attachment_group,
@@ -1939,8 +2238,20 @@ def _load_handler(dummy):
         if bpy.context.scene is None:
             return
         sync_scene(bpy.context)
+        gather_group_files(bpy.context)
     except Exception as exc:
         print(f"[Dental-Lib] Auto-load that bai: {exc}")
+
+
+def _startup_load():
+    """Mot lan sau khi bat add-on: nap thu vien va gom file nhom (khong lam trong draw())."""
+    try:
+        if bpy.context.scene is not None:
+            ensure_loaded(bpy.context)
+            gather_group_files(bpy.context)
+    except Exception as exc:
+        print(f"[Dental-Lib] Nap thu vien luc khoi dong that bai: {exc}")
+    return None
 
 
 def register():
@@ -1950,9 +2261,13 @@ def register():
     if _load_handler not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_load_handler)
     ensure_library_dir()
+    if not bpy.app.background and not bpy.app.timers.is_registered(_startup_load):
+        bpy.app.timers.register(_startup_load, first_interval=1.0)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_startup_load):
+        bpy.app.timers.unregister(_startup_load)
     if _load_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_handler)
     del bpy.types.Scene.dental_lib
