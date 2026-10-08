@@ -2553,7 +2553,7 @@ class IbarPrepPanel(bpy.types.Panel):
     bl_idname = "OBJECT_PT_Ibar_Transform"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
 
     def draw(self, context):
         layout = self.layout
@@ -2575,7 +2575,7 @@ class OcclusalAlignment(bpy.types.Panel):
     bl_idname = "OBJECT_PT_OcclusalAlign"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
     
     def draw(self, context):
         layout = self.layout
@@ -2597,7 +2597,7 @@ class IbarAddCustomPanel(bpy.types.Panel):
     bl_idname = "OBJECT_PT_Ibar_AddCustom"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
 
     def draw(self, context):
         layout = self.layout
@@ -2620,7 +2620,7 @@ class IbarMeshControlPanel(bpy.types.Panel):
     bl_idname = "OBJECT_PT_Ibar_MeshControl"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
 
     def draw(self, context):
         layout = self.layout
@@ -2672,7 +2672,7 @@ class IbarRetentionPanel(bpy.types.Panel):
     bl_idname = "OBJECT_PT_Ibar_Retention"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
 
     def draw(self, context):
         layout = self.layout
@@ -2687,7 +2687,7 @@ class AddOpaqueLayerPanel(bpy.types.Panel):
     bl_idname = "OBJECT_PT_AddOpaqueLayer"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
 
     def draw(self, context):
         layout = self.layout
@@ -2701,7 +2701,7 @@ class SaveSTLIPSPanel(bpy.types.Panel):
     bl_idname = "OBJECT_PT_SaveSTL"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "IBAR Prep"
+    bl_category = "ScansPrep"
 
     def draw(self, context):
         layout = self.layout
