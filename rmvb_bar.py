@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 10),
+    "version": (0, 4, 11),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -84,7 +84,11 @@ MOD_PREFIX = "RMVB_"
 # Ngung dung (mm) khi xac dinh cac dinh nam cung mot cao do dinh mui extrude.
 TOP_EPS = 1e-4
 
-CENTER_GUIDE_WIDTH = 0.001      # mm: be rong dai dan huong "Can giua be mat Bar" (sai so toi da 0.0005 mm)
+GROUP_AXES_SIZE = 1.0               # mm: size Plain Axes (Empty) cua nhom Implant / Attachment
+CENTER_GUIDE_WIDTH = 0.001         # mm: be rong khoi dan huong "Can giua be mat Bar" (sai so ngang toi da 0.0005 mm)
+CENTER_GUIDE_HALF_HEIGHT = 100.0    # mm: nua chieu cao khoi dan huong (doc phap tuyen Plane)
+CENTER_GUIDE_VERSION = 3            # 1 = dai phang tren Plane (khoa luon Z), 2 = tuong dung ho (khong dung duoc voi
+                                    # Snap Mode Inside), 3 = khoi hop mong KIN doc tam bar
 
 CST_ON_PLANE = "RMVB_on_plane"
 CST_CENTER = "RMVB_center_bar"
@@ -874,6 +878,12 @@ def _group_lock_update(self, context):
     apply_group_locks(self, context.scene.rmvb)
 
 
+def _group_align_update(self, context):
+    """Doi trang thai Dao 180 do: xoay lai group ngay (handler depsgraph chi chay khi co thay doi khac)."""
+    if self.align_x_bar and valid_obj(self.empty):
+        align_group_x(self, context.scene.rmvb)
+
+
 def _bar_param_update(self, context):
     """Doi Be rong / Chieu cao bar: Bar Segment cap nhat ngay."""
     try:
@@ -944,8 +954,9 @@ class RMVB_PG_AttachmentGroup(PropertyGroup):
     center_bar: BoolProperty(
         name="Căn giữa bề mặt Bar",
         description="Tam group luon nam NGAY GIUA be mat Bar Segment theo be rong bar (tren duong "
-                    "tam line, tren mat Plane): keo group doc theo Bar thi group truot theo tam, "
-                    "khong lech sang hai ben. Khong anh huong huong xoay",
+                    "tam line): keo group doc theo Bar thi group truot theo tam, khong lech sang hai "
+                    "ben. CHI doi vi tri ngang - chieu cao so voi Plane van tu do (tick Lock Z de giu "
+                    "group tren Plane). Khong anh huong huong xoay",
         default=False, update=_group_lock_update)
     align_x_bar: BoolProperty(
         name="Trục X theo dọc Bar",
@@ -953,6 +964,11 @@ class RMVB_PG_AttachmentGroup(PropertyGroup):
                     "ve line, tren mat Plane): doi vi tri doc Bar thi group xoay theo cho cong cua "
                     "bar. Tu giu truc Z vuong goc Plane nhu Lock Rotation; xoay tay quanh Z bi ghi de",
         default=False, update=_group_lock_update)
+    align_x_flip: BoolProperty(
+        name="Đảo 180°",
+        description="Xoay group them 180 do quanh Z (quanh phap tuyen Plane) de huong Attachment di "
+                    "nguoc chieu ve line. Chi co tac dung khi tick 'Truc X theo doc Bar'",
+        default=False, update=_group_align_update)
     lock_topbar: BoolProperty(
         name="Lock Z với Top Bar",
         description="Tam group luon nam tren mat phang PlaneVisual (chi khoa Z local "
@@ -1608,7 +1624,7 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             # Analog, Screw, Scanbody la con cua Empty nay; keo Empty la di chuyen ca nhom
             group = bpy.data.objects.new("%s_%s" % (OBJ_IMPLANT_GROUP, tooth), None)
             group.empty_display_type = 'PLAIN_AXES'
-            group.empty_display_size = 4.0
+            group.empty_display_size = GROUP_AXES_SIZE
             group.show_in_front = True
             coll.objects.link(group)
             group.matrix_world = matrix
@@ -2072,22 +2088,22 @@ def parallelogram_rings(points, normal, drop, width):
 
 
 # ---------------------------------------------------------------------------
-# Dai dan huong "Can giua be mat Bar": Shrinkwrap constraint KHONG bam duoc vao line chi co
-# canh (khong co mat) nen tao 1 dai rat mong (an) doc tam bar tren Plane lam muc tieu.
+# Khoi dan huong "Can giua be mat Bar": Shrinkwrap constraint KHONG bam duoc vao line chi co canh
+# (khong co mat) nen tao 1 khoi hop mong (an) dung vuong goc Plane doc tam bar lam muc tieu. Phai DUNG
+# (khong phai dai phang tren Plane: diem gan nhat tren dai phang se khoa luon chieu Z) va phai KIN
+# (Snap Mode Inside chi bam dung voi khoi kin; mat ho chi snap duoc cac diem o mot phia).
 # ---------------------------------------------------------------------------
 def update_center_guide(props, flat, normal):
-    """Dung lai dai tam bar (mesh toa do world) tu cac diem tam da chieu len Plane."""
+    """Dung lai khoi dan huong (mesh toa do world): hop mong KIN doc tam bar, rong CENTER_GUIDE_WIDTH,
+    cao +-CENTER_GUIDE_HALF_HEIGHT quanh Plane. Constraint Shrinkwrap dung Snap Mode Inside nen muc tieu
+    phai la khoi kin, phap tuyen huong ra ngoai. Diem gan nhat tren khoi chi doi vi tri NGANG (vao
+    tam bar), con chieu cao so voi Plane giu nguyen - muon group nam tren Plane thi tick them Lock Z."""
     _CENTERLINE["flat"], _CENTERLINE["normal"] = list(flat), normal.copy()
-    rings = parallelogram_rings(flat, normal, Vector((0.0, 0.0, 0.0)), CENTER_GUIDE_WIDTH)
+    lift = normal * CENTER_GUIDE_HALF_HEIGHT
+    rings = parallelogram_rings([point - lift for point in flat], normal, lift * 2.0, CENTER_GUIDE_WIDTH)
     if rings is None:
         return None
-    bm = bmesh.new()
-    pairs = [(bm.verts.new(ring[0]), bm.verts.new(ring[1])) for ring in rings]
-    for (left0, right0), (left1, right1) in zip(pairs, pairs[1:]):
-        try:
-            bm.faces.new((left0, right0, right1, left1))
-        except ValueError:
-            pass
+    bm = bmesh_from_rings(rings)
     guide = props.bar_center
     if not valid_obj(guide):
         guide = bpy.data.objects.new(OBJ_CENTER, bpy.data.meshes.new(OBJ_CENTER))
@@ -2103,6 +2119,7 @@ def update_center_guide(props, flat, normal):
     bm.to_mesh(guide.data)
     bm.free()
     guide.data.update()
+    guide["rmvb_guide_ver"] = CENTER_GUIDE_VERSION
     return guide
 
 
@@ -2125,10 +2142,13 @@ def flat_centerline(props, depsgraph=None):
 def ensure_center_guide(props):
     """Dai tam bar hien co, hoac dung tu line + Plane neu chua co (None neu line < 2 diem)."""
     guide = props.bar_center
-    if valid_obj(guide) and len(guide.data.polygons):
+    if (valid_obj(guide) and len(guide.data.polygons)
+            and guide.get("rmvb_guide_ver") == CENTER_GUIDE_VERSION):
         return guide
     data = flat_centerline(props)
-    return update_center_guide(props, *data) if data else None
+    if data:
+        return update_center_guide(props, *data)
+    return guide if valid_obj(guide) and len(guide.data.polygons) else None
 
 
 # Tam bar (cac diem da chieu len Plane) lan cuoi Bar Segment cap nhat - "Truc X theo doc Bar" doc o
@@ -2162,7 +2182,8 @@ def polyline_tangent(flat, point):
 
 
 def align_group_x(group, props, depsgraph=None):
-    """Xoay Empty cua group quanh phap tuyen Plane de truc X trung huong tam bar tai vi tri group.
+    """Xoay Empty cua group quanh phap tuyen Plane de truc X trung huong tam bar tai vi tri group
+    (them 180 do neu group.align_x_flip).
 
     Lock Rotation (COPY_ROTATION BEFORE Plane) coi rotation_euler.z la goc quanh phap tuyen Plane, do
     tu truc X cua Plane -> chi can dat z = goc cua huong bar trong he truc Plane. Tra ve True neu doi."""
@@ -2178,7 +2199,7 @@ def align_group_x(group, props, depsgraph=None):
     local = plane_rot.inverted() @ tangent
     if math.hypot(local.x, local.y) < 1e-6:
         return False                      # huong bar vuong goc Plane (khong xay ra khi line nam tren Plane)
-    angle = math.atan2(local.y, local.x)
+    angle = math.atan2(local.y, local.x) + (math.pi if group.align_x_flip else 0.0)
     if empty.rotation_mode != 'XYZ':
         empty.rotation_mode = 'XYZ'
     current = empty.rotation_euler.z
@@ -2190,13 +2211,15 @@ def align_group_x(group, props, depsgraph=None):
 
 
 def add_center_constraint(empty, guide):
-    """Shrinkwrap (Nearest Surface Point) cua Empty vao dai tam bar: vi tri luon nam tren tam bar."""
+    """Shrinkwrap (Nearest Surface Point, Snap Mode Inside) cua Empty vao khoi tam bar: vi tri ngang
+    luon nam tren tam bar."""
     constraint = empty.constraints.get(CST_CENTER)
     if constraint is None:
         constraint = empty.constraints.new('SHRINKWRAP')
         constraint.name = CST_CENTER
     constraint.target = guide
     constraint.shrinkwrap_type = 'NEAREST_SURFACE'
+    constraint.wrap_mode = 'INSIDE'        # Snap Mode: Inside (muc tieu la khoi kin; ben trong khoi thi giu nguyen)
     constraint.distance = 0.0
     return constraint
 
@@ -2290,10 +2313,24 @@ def rmvb_load_post(_dummy=None):
     """Mo file: group da bat Lock Rotation tu ban cu (copy ca 3 truc) duoc dung lai
     constraint kieu moi (chi khoa X/Y). Xoa cache tam bar cua file truoc."""
     _CENTERLINE["flat"] = _CENTERLINE["normal"] = None
+    for obj in bpy.data.objects:        # file cu: Plain Axes cua nhom Implant / Attachment to 4 mm -> 1 mm
+        if (obj.type == 'EMPTY' and obj.empty_display_type == 'PLAIN_AXES'
+                and obj.get("rmvb_role") in ("IMPLANT_GROUP", "ATTACHMENT_GROUP")
+                and obj.empty_display_size != GROUP_AXES_SIZE):
+            obj.empty_display_size = GROUP_AXES_SIZE
     for scene in bpy.data.scenes:
         props = getattr(scene, "rmvb", None)
         if props is None:
             continue
+        if valid_obj(props.bar_center) and props.bar_center.get("rmvb_guide_ver") != CENTER_GUIDE_VERSION:
+            try:
+                guide = ensure_center_guide(props)     # dai phang / tuong ho kieu cu -> thay bang khoi kin
+                if guide is not None:
+                    for group in props.groups:
+                        if group.center_bar and valid_obj(group.empty):
+                            add_center_constraint(group.empty, guide)   # dat lai Snap Mode Inside
+            except Exception as exc:
+                print("[Rmvb-Bar] Khong nang cap duoc dai tam bar: %s" % exc)
         for group in props.groups:
             if (group.lock_rot_topbar and valid_obj(group.empty)
                     and CST_ROT_LIMIT not in group.empty.constraints):
@@ -3040,10 +3077,12 @@ LOCK_CONSTRAINTS = (CST_CENTER, CST_ON_PLANE, CST_ROT_LIMIT, CST_ROT_PLANE, CST_
 def apply_group_locks(group, props):
     """Dung lai cac constraint khoa tren Empty cua group:
 
-    - Can giua be mat Bar       : SHRINKWRAP (Nearest Surface Point) vao dai tam bar - vi tri luon nam
-                                  tren duong tam line, tren mat Plane (khong anh huong huong xoay)
+    - Can giua be mat Bar       : SHRINKWRAP (Nearest Surface Point, Snap Mode Inside) vao khoi hop
+                                  mong kin doc tam bar - vi tri ngang luon nam tren duong tam line,
+                                  chieu cao (Z) tu do (khong anh huong huong xoay)
     - Lock Z voi Top Bar        : LIMIT_LOCATION z = 0 trong he truc cua PlaneVisual
     - Truc X theo doc Bar       : giu Z vuong goc Plane (nhu Lock Rotation) + align_group_x dat goc
+                                  (nut Dao 180 do them pi vao goc do)
                                   xoay quanh Z theo huong tam bar (handler depsgraph giu cap nhat)
     - Lock Rotation voi Top Bar : khoa nghieng X/Y theo PlaneVisual, Z tu do. LIMIT_ROTATION
                                   dua X/Y rieng cua group ve 0, roi COPY_ROTATION (Before
@@ -3218,7 +3257,7 @@ class RMVB_OT_add_attachment(Operator):
         gname = unique_group_name(props, name)
         empty = bpy.data.objects.new("Att_" + gname, None)
         empty.empty_display_type = 'PLAIN_AXES'
-        empty.empty_display_size = 4.0
+        empty.empty_display_size = GROUP_AXES_SIZE
         empty.show_in_front = True
         coll.objects.link(empty)
         empty.matrix_world = matrix
@@ -4023,7 +4062,11 @@ class RMVB_PT_panel(Panel):
                 box.prop(group, "name", text="Tên Attachment")
                 box.prop(group, "bar_in_sleeve")
                 box.prop(group, "center_bar")
-                box.prop(group, "align_x_bar")
+                row = box.row(align=True)
+                row.prop(group, "align_x_bar")
+                sub = row.row(align=True)
+                sub.enabled = group.align_x_bar
+                sub.prop(group, "align_x_flip", toggle=True, icon=_ic('LOOP_BACK'))
                 if (group.center_bar or group.align_x_bar) and not valid_obj(props.bar_center):
                     box.label(text="Chưa có Line Bar (≥ 2 điểm): vẽ line để căn giữa / canh trục X",
                               icon=_ic('INFO'))
