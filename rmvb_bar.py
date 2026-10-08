@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 13),
+    "version": (0, 4, 14),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -829,12 +829,41 @@ def _draw_library_menu(layout, kind, names, icon):
         op.index = index
 
 
+def lib_connection_groups(names):
+    """[(ten nhom, [ten Connection, ...]), ...] theo Dental-Lib; thu vien cu khong co nhom -> 1 nhom ""."""
+    lib = dlib()
+    if lib is not None and hasattr(lib, "connection_groups"):
+        groups = lib.connection_groups()
+        if groups:
+            return groups
+    return [("", list(names))]
+
+
+def _draw_grouped_pick(layout, kind, names, groups, icon):
+    """Menu chon muc thu vien gom theo nhom (tieu de thu muc + cac muc); chua co nhom nao thi danh sach phang.
+    Chi so gui cho operator la vi tri trong danh sach thu vien."""
+    if not any(group for group, _members in groups):
+        _draw_library_menu(layout, kind, names, icon)
+        return
+    index_of = {name: index for index, name in enumerate(names)}
+    for position, (group, members) in enumerate(groups):
+        if position:
+            layout.separator()
+        layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
+        for name in members:
+            if name not in index_of:
+                continue
+            op = layout.operator(RMVB_OT_pick_library_item.bl_idname, text=name, icon=icon)
+            op.kind = kind
+            op.index = index_of[name]
+
+
 class RMVB_MT_pick_connection(Menu):
     bl_label = "Select Connection Base"
 
     def draw(self, context):
-        _draw_library_menu(self.layout, 'CONNECTION', get_connection_items(),
-                           'MESH_CYLINDER')
+        names = get_connection_items()
+        _draw_grouped_pick(self.layout, 'CONNECTION', names, lib_connection_groups(names), 'MESH_CYLINDER')
 
 
 def lib_attachment_groups(names):
@@ -852,21 +881,7 @@ class RMVB_MT_pick_attachment(Menu):
 
     def draw(self, context):
         names = get_attachment_items()
-        groups = lib_attachment_groups(names)
-        if not any(group for group, _members in groups):
-            _draw_library_menu(self.layout, 'ATTACHMENT', names, 'MESH_CUBE')       # chua co nhom: danh sach phang
-            return
-        index_of = {name: index for index, name in enumerate(names)}
-        for position, (group, members) in enumerate(groups):
-            if position:
-                self.layout.separator()
-            self.layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
-            for name in members:
-                if name not in index_of:
-                    continue
-                op = self.layout.operator(RMVB_OT_pick_library_item.bl_idname, text=name, icon='MESH_CUBE')
-                op.kind = 'ATTACHMENT'
-                op.index = index_of[name]
+        _draw_grouped_pick(self.layout, 'ATTACHMENT', names, lib_attachment_groups(names), 'MESH_CUBE')
 
 
 def _save_dir_get(self):
@@ -1732,17 +1747,25 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
 
 
 def draw_implant_connection_choices(layout, props, index):
-    """Danh sach Connection Base trong thu vien de doi cho implant `index` (muc dang dung co dau tick)."""
+    """Danh sach Connection Base trong thu vien de doi cho implant `index` (muc dang dung co dau tick);
+    gom theo nhom Implant Connection cua Dental-Lib neu co."""
     names = get_connection_items()
     if not names:
         layout.label(text="(Trống - thêm mục trong Dental-Lib)", icon='ERROR')
         return
     current = props.placed[index].lib_name if 0 <= index < len(props.placed) else ""
-    for name in names:
-        op = layout.operator(RMVB_OT_set_implant_connection.bl_idname, text=name,
-                             icon='CHECKMARK' if name == current else 'MESH_CYLINDER')
-        op.index = index
-        op.connection = name
+    groups = lib_connection_groups(names)
+    named = any(group for group, _members in groups)
+    for position, (group, members) in enumerate(groups):
+        if named:
+            if position:
+                layout.separator()
+            layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
+        for name in members:
+            op = layout.operator(RMVB_OT_set_implant_connection.bl_idname, text=name,
+                                 icon='CHECKMARK' if name == current else 'MESH_CYLINDER')
+            op.index = index
+            op.connection = name
 
 
 class RMVB_OT_choose_implant_connection(Operator):
