@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 8),
+    "version": (0, 1, 9),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -289,6 +289,25 @@ def attachment_names():
     return [a.get("name", "") for a in read_index()["attachments"] if a.get("name")]
 
 
+def attachment_group(name):
+    """Ten nhom cua Attachment ("" = chua nhom)."""
+    entry = get_attachment(name)
+    return str(entry.get("group", "") or "").strip() if entry else ""
+
+
+def attachment_groups():
+    """[(ten nhom, [ten Attachment, ...]), ...]: nhom dat ten theo thu tu ABC, nhom "" (chua nhom)
+    o cuoi; trong moi nhom giu thu tu trong thu vien. Chua co nhom nao -> [("", tat ca)]."""
+    buckets = {}
+    for entry in read_index()["attachments"]:
+        if entry.get("name"):
+            buckets.setdefault(str(entry.get("group", "") or "").strip(), []).append(entry["name"])
+    out = [(key, buckets[key]) for key in sorted((k for k in buckets if k), key=str.casefold)]
+    if "" in buckets:
+        out.append(("", buckets[""]))
+    return out
+
+
 def get_attachment(name):
     for entry in read_index()["attachments"]:
         if entry.get("name") == name:
@@ -431,6 +450,11 @@ class DLIB_PG_ConnectionEntry(PropertyGroup):
 
 class DLIB_PG_AttachmentEntry(PropertyGroup):
     entry_name: StringProperty(name="Attachment Name", default="New Attachment")
+    group: StringProperty(
+        name="Nhom", default="",
+        description="Ten nhom (thu muc) chua Attachment nay. De trong = chua nhom. Panel Dental-Lib "
+                    "va menu Select Attachment ben Rmvb-Bar gom cac Attachment theo nhom",
+        update=_update_color)
     open: BoolProperty(name="Mo rong", default=True,
                        description="Thu/mo danh sach slot file cua entry nay")
     on_bar: BoolProperty(
@@ -500,6 +524,7 @@ def index_from_scene(context):
     for entry in group.attachments:
         item = {
             "name": entry.entry_name,
+            "group": entry.group.strip(),
             "on_bar": bool(entry.on_bar),
             "bar_in_sleeve": bool(entry.bar_in_sleeve),
             "part_bar": entry.part_bar,
@@ -536,6 +561,7 @@ def _fill_group(group, data):
     for item in data.get("attachments", []):
         entry = group.attachments.add()
         entry.entry_name = item.get("name", "Attachment")
+        entry.group = str(item.get("group", "") or "").strip()
         entry.on_bar = bool(item.get("on_bar", True))
         entry.bar_in_sleeve = bool(item.get("bar_in_sleeve", False))
         entry.part_bar = item.get("part_bar", "")
@@ -721,6 +747,98 @@ class DLIB_OT_remove_attachment(Operator):
             self.report({'INFO'}, "Da xoa '%s'" % name)
             return {'FINISHED'}
         return {'CANCELLED'}
+
+
+# Trang thai thu/mo cua tung nhom Attachment tren panel (chi la UI, khong luu vao thu vien)
+_GROUP_CLOSED = set()
+
+
+def grouped_indices(entries):
+    """[(ten nhom, [chi so entry, ...]), ...] cung quy tac thu tu voi attachment_groups()."""
+    buckets = {}
+    for index, entry in enumerate(entries):
+        buckets.setdefault(entry.group.strip(), []).append(index)
+    out = [(key, buckets[key]) for key in sorted((k for k in buckets if k), key=str.casefold)]
+    if "" in buckets:
+        out.append(("", buckets[""]))
+    return out
+
+
+class DLIB_OT_toggle_attachment_group(Operator):
+    """Thu / mo mot nhom Attachment tren panel"""
+    bl_idname = "dental_lib.toggle_attachment_group"
+    bl_label = "Thu / mo nhom"
+    bl_options = {'INTERNAL'}
+
+    group: StringProperty(default="")
+
+    def execute(self, context):
+        if self.group in _GROUP_CLOSED:
+            _GROUP_CLOSED.discard(self.group)
+        else:
+            _GROUP_CLOSED.add(self.group)
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {'FINISHED'}
+
+
+class DLIB_OT_set_attachment_group(Operator):
+    """Dat nhom cho Attachment"""
+    bl_idname = "dental_lib.set_attachment_group"
+    bl_label = "Dat nhom"
+    bl_options = set()
+
+    index: IntProperty(default=-1)
+    group: StringProperty(default="")
+
+    def execute(self, context):
+        library = ensure_loaded(context)
+        if not 0 <= self.index < len(library.attachments):
+            return {'CANCELLED'}
+        library.attachments[self.index].group = self.group.strip()      # update -> autosave
+        _GROUP_CLOSED.discard(self.group.strip())                        # mo nhom vua chuyen vao
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {'FINISHED'}
+
+
+def draw_group_choices(layout, library, index):
+    """Danh sach nhom hien co de gan nhanh cho Attachment `index` (+ bo nhom)."""
+    names = sorted({e.group.strip() for e in library.attachments if e.group.strip()}, key=str.casefold)
+    current = library.attachments[index].group.strip() if 0 <= index < len(library.attachments) else ""
+    for name in names:
+        op = layout.operator(DLIB_OT_set_attachment_group.bl_idname, text=name,
+                             icon=_ic('CHECKMARK' if name == current else 'FILE_FOLDER'))
+        op.index = index
+        op.group = name
+    if names:
+        layout.separator()
+    op = layout.operator(DLIB_OT_set_attachment_group.bl_idname, text="(Chưa nhóm)",
+                         icon=_ic('X' if current else 'CHECKMARK'))
+    op.index = index
+    op.group = ""
+    if not names:
+        layout.label(text="Gõ tên vào ô Nhóm để tạo nhóm mới", icon=_ic('INFO'))
+
+
+class DLIB_OT_pick_attachment_group(Operator):
+    """Chon mot nhom da co cho Attachment nay (hoac go ten nhom moi vao o Nhom)"""
+    bl_idname = "dental_lib.pick_attachment_group"
+    bl_label = "Chon nhom"
+    bl_options = {'INTERNAL'}
+
+    index: IntProperty(default=-1)
+
+    def invoke(self, context, event):
+        if not 0 <= self.index < len(context.scene.dental_lib.attachments):
+            return {'CANCELLED'}
+        index = self.index
+
+        def draw(menu, menu_context):
+            draw_group_choices(menu.layout, menu_context.scene.dental_lib, index)
+
+        context.window_manager.popup_menu(draw, title="Nhóm Attachment", icon='FILE_FOLDER')
+        return {'INTERFACE'}
 
 
 # ---------------------------------------------------------------------------
@@ -1166,45 +1284,68 @@ class DLIB_PT_panel(Panel):
         head.label(text=str(len(group.attachments)))
         box.operator(DLIB_OT_add_attachment.bl_idname,
                      text="+ Add Attachment", icon=_ic('ADD'))
-        for i, entry in enumerate(group.attachments):
-            sub = box.box()
-            row = sub.row(align=True)
-            row.prop(entry, "open", text="",
-                     icon=_ic('TRIA_DOWN' if entry.open else 'TRIA_RIGHT'))
-            row.prop(entry, "entry_name", text="")
-            op = row.operator(DLIB_OT_remove_attachment.bl_idname,
-                              text="", icon=_ic('TRASH'))
-            op.index = i
-            if not entry.open:
-                continue
-            _draw_slot(sub, "attachment", i, "part_bar", "Apply Part Bar",
-                       'MESH_CUBE', entry.part_bar, toggle=(entry, "on_bar"))
-            sub.prop(entry, "bar_in_sleeve")
-            _draw_slot(sub, "attachment", i, "part_sleeve", "Apply Part Sleeve",
-                       'MESH_TORUS', entry.part_sleeve,
-                       toggle=(entry, "on_sleeve"))
-            sub.label(text="Visual Objects (khong gioi han so luong):",
-                      icon=_ic('OUTLINER_OB_MESH'))
-            for j, visual in enumerate(entry.visuals):
-                vrow = sub.row(align=True)
-                vrow.prop(visual, "label", text="", icon=_ic('MESH_DATA'))
-                vrow.prop(visual, "color", text="")
-                state_text, state_icon = _slot_state(visual.asset)
-                vrow.label(text=state_text, icon=state_icon)
-                op = vrow.operator(DLIB_OT_import_visual.bl_idname,
-                                   text="Gan file", icon=_ic('FILEBROWSER'))
-                op.index = i
-                op.visual_index = j
-                op = vrow.operator(DLIB_OT_remove_visual.bl_idname,
-                                   text="", icon=_ic('TRASH'))
-                op.index = i
-                op.visual_index = j
-            sub.operator(DLIB_OT_add_visual.bl_idname,
-                         text="+ Add Visual Object",
-                         icon=_ic('ADD')).index = i
-            sub.operator(DLIB_OT_insert_attachment.bl_idname,
-                         text="Insert vao scene",
-                         icon=_ic('IMPORT')).index = i
+        named = any(entry.group.strip() for entry in group.attachments)
+        for group_name, indices in grouped_indices(group.attachments):
+            holder = box
+            if named:   # co it nhat 1 nhom: gom theo thu muc (thu / mo); chua co nhom nao thi giu danh sach phang
+                folder = box.box()
+                closed = group_name in _GROUP_CLOSED
+                head = folder.row(align=True)
+                toggle = head.operator(DLIB_OT_toggle_attachment_group.bl_idname,
+                                       text=group_name or "(Chưa nhóm)", emboss=False,
+                                       icon=_ic('TRIA_RIGHT' if closed else 'TRIA_DOWN'))
+                toggle.group = group_name
+                head.label(text=str(len(indices)), icon=_ic('FILE_FOLDER'))
+                if closed:
+                    continue
+                holder = folder
+            for i in indices:
+                _draw_attachment_entry(holder, i, group.attachments[i])
+
+
+def _draw_attachment_entry(box, i, entry):
+    sub = box.box()
+    row = sub.row(align=True)
+    row.prop(entry, "open", text="",
+             icon=_ic('TRIA_DOWN' if entry.open else 'TRIA_RIGHT'))
+    row.prop(entry, "entry_name", text="")
+    op = row.operator(DLIB_OT_remove_attachment.bl_idname,
+                      text="", icon=_ic('TRASH'))
+    op.index = i
+    if not entry.open:
+        return
+    grow = sub.row(align=True)
+    grow.prop(entry, "group", text="Nhóm", icon=_ic('FILE_FOLDER'))
+    grow.operator(DLIB_OT_pick_attachment_group.bl_idname, text="",
+                  icon=_ic('DOWNARROW_HLT')).index = i
+    _draw_slot(sub, "attachment", i, "part_bar", "Apply Part Bar",
+               'MESH_CUBE', entry.part_bar, toggle=(entry, "on_bar"))
+    sub.prop(entry, "bar_in_sleeve")
+    _draw_slot(sub, "attachment", i, "part_sleeve", "Apply Part Sleeve",
+               'MESH_TORUS', entry.part_sleeve,
+               toggle=(entry, "on_sleeve"))
+    sub.label(text="Visual Objects (khong gioi han so luong):",
+              icon=_ic('OUTLINER_OB_MESH'))
+    for j, visual in enumerate(entry.visuals):
+        vrow = sub.row(align=True)
+        vrow.prop(visual, "label", text="", icon=_ic('MESH_DATA'))
+        vrow.prop(visual, "color", text="")
+        state_text, state_icon = _slot_state(visual.asset)
+        vrow.label(text=state_text, icon=state_icon)
+        op = vrow.operator(DLIB_OT_import_visual.bl_idname,
+                           text="Gan file", icon=_ic('FILEBROWSER'))
+        op.index = i
+        op.visual_index = j
+        op = vrow.operator(DLIB_OT_remove_visual.bl_idname,
+                           text="", icon=_ic('TRASH'))
+        op.index = i
+        op.visual_index = j
+    sub.operator(DLIB_OT_add_visual.bl_idname,
+                 text="+ Add Visual Object",
+                 icon=_ic('ADD')).index = i
+    sub.operator(DLIB_OT_insert_attachment.bl_idname,
+                 text="Insert vao scene",
+                 icon=_ic('IMPORT')).index = i
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1379,9 @@ _classes = (
     DLIB_OT_remove_connection,
     DLIB_OT_add_attachment,
     DLIB_OT_remove_attachment,
+    DLIB_OT_toggle_attachment_group,
+    DLIB_OT_set_attachment_group,
+    DLIB_OT_pick_attachment_group,
     DLIB_OT_import_asset,
     DLIB_OT_clear_asset,
     DLIB_OT_add_visual,

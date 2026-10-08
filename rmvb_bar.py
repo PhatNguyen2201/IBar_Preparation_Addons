@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 12),
+    "version": (0, 4, 13),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -837,12 +837,36 @@ class RMVB_MT_pick_connection(Menu):
                            'MESH_CYLINDER')
 
 
+def lib_attachment_groups(names):
+    """[(ten nhom, [ten Attachment, ...]), ...] theo Dental-Lib; thu vien cu khong co nhom -> 1 nhom ""."""
+    lib = dlib()
+    if lib is not None and hasattr(lib, "attachment_groups"):
+        groups = lib.attachment_groups()
+        if groups:
+            return groups
+    return [("", list(names))]
+
+
 class RMVB_MT_pick_attachment(Menu):
     bl_label = "Select Attachment"
 
     def draw(self, context):
-        _draw_library_menu(self.layout, 'ATTACHMENT', get_attachment_items(),
-                           'MESH_CUBE')
+        names = get_attachment_items()
+        groups = lib_attachment_groups(names)
+        if not any(group for group, _members in groups):
+            _draw_library_menu(self.layout, 'ATTACHMENT', names, 'MESH_CUBE')       # chua co nhom: danh sach phang
+            return
+        index_of = {name: index for index, name in enumerate(names)}
+        for position, (group, members) in enumerate(groups):
+            if position:
+                self.layout.separator()
+            self.layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
+            for name in members:
+                if name not in index_of:
+                    continue
+                op = self.layout.operator(RMVB_OT_pick_library_item.bl_idname, text=name, icon='MESH_CUBE')
+                op.kind = 'ATTACHMENT'
+                op.index = index_of[name]
 
 
 def _save_dir_get(self):
@@ -1529,6 +1553,85 @@ def org_matrix_from_props(props):
     return Matrix([flat[i * 4:(i + 1) * 4] for i in range(4)])
 
 
+# Mau / an-hien cua tung phan Connection (analog, screw, scanbody)
+CONN_PART_STYLE = {
+    "analog": (COLOR_CONN_ANALOG, False),
+    "screw": (COLOR_CONN_SCREW, False),
+    "scanbody": (FALLBACK_VISUAL_COLOR, True),     # Scanbody: an
+}
+CONN_PART_FIELD = (("analog", "analog_object"), ("screw", "screw_object"), ("scanbody", "scanbody_object"))
+
+
+def make_connection_kit(lib_name):
+    """Bo mesh cua 1 Connection Base trong thu vien (dung chung cho nhieu implant):
+    Base da extrude (khoi Boolean), hinh hien thi cua Base goc, Analog / Screw / Scanbody.
+    Raise FileNotFoundError neu thu vien chua co mesh Base."""
+    base_path = lib_connection_asset(lib_name, "base")
+    if not base_path or not os.path.exists(base_path):
+        raise FileNotFoundError("Connection '%s' chua co mesh Base" % lib_name)
+    source_mesh = mesh_from_file(base_path)
+    base_mesh, base_info = prepare_connection_mesh(source_mesh)
+
+    # Hinh hien thi cua Base GOC (chua extrude/nap kin), normal huong ra ngoai
+    visual_mesh = source_mesh.copy()
+    visual_mesh.name = "Rmvb_ConnVisual"
+    bm = bmesh.new()
+    bm.from_mesh(visual_mesh)
+    outward_solid(bm)
+    bm.to_mesh(visual_mesh)
+    bm.free()
+    visual_mesh.update()
+
+    # Analog / Screw / Scanbody: luon dat vao scene (moi loai 1 ban copy dung chung)
+    parts = {}
+    warnings = []
+    for slot, _field in CONN_PART_FIELD:
+        asset = lib_connection_asset(lib_name, slot)
+        if asset and os.path.exists(asset):
+            try:
+                parts[slot] = mesh_from_file(asset).copy()
+                parts[slot].name = "Rmvb_Conn_" + slot
+            except Exception as exc:
+                warnings.append("%s: %s" % (slot, exc))
+    return {"lib_name": lib_name, "base": base_mesh, "info": base_info,
+            "visual": visual_mesh, "parts": parts, "warnings": warnings}
+
+
+def populate_implant(item, group, kit, coll):
+    """Tao Base / ConnectionVisual / Analog / Screw / Scanbody cua `kit` lam con cua Empty `group`
+    va ghi vao `item` (RMVB_PG_PlacedConnection)."""
+    tooth = item.tooth
+    item.lib_name = kit["lib_name"]
+    # Base da xu ly (extrude) chi dung lam khoi Boolean -> an
+    obj = object_from_mesh("Conn_%s_Base" % tooth, kit["base"], coll)
+    attach_to(obj, group)
+    set_color(obj, (0.72, 0.74, 0.78, 1.0))
+    obj.hide_set(True)
+    item.base_object = obj
+    visual = object_from_mesh("%s_%s" % (OBJ_CONN_VISUAL, tooth), kit["visual"], coll)
+    attach_to(visual, group)
+    set_display_color(visual, COLOR_CONN_VISUAL)
+    visual["rmvb_role"] = "CONNECTION_VISUAL"
+    item.visual_object = visual
+    for slot, field in CONN_PART_FIELD:
+        mesh = kit["parts"].get(slot)
+        if mesh is None:
+            continue
+        part = object_from_mesh("Conn_%s_%s" % (tooth, slot.capitalize()), mesh, coll)
+        attach_to(part, group)
+        rgba, hidden = CONN_PART_STYLE[slot]
+        set_display_color(part, rgba)
+        if hidden:
+            part.hide_set(True)
+        setattr(item, field, part)
+
+
+def remove_implant_parts(item):
+    """Xoa cac phan Connection cua 1 implant (giu Empty nhom, Bar Pillar va toa do)."""
+    for field in ("base_object", "visual_object", "analog_object", "screw_object", "scanbody_object"):
+        remove_object(getattr(item, field))
+
+
 class RMVB_OT_place_connection(Operator, ImportHelper):
     """Doc file constructionInfo va dat Implant Connection theo dung toa do XML"""
     bl_idname = "rmvb.place_connection"
@@ -1568,11 +1671,13 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
-            source_mesh = mesh_from_file(base_path)
-            base_mesh, base_info = prepare_connection_mesh(source_mesh)
+            kit = make_connection_kit(lib_name)
         except Exception as exc:
             self.report({'ERROR'}, "Loi doc mesh Base: %s" % exc)
             return {'CANCELLED'}
+        for warning in kit["warnings"]:
+            self.report({'WARNING'}, warning)
+        base_info = kit["info"]
 
         org = None
         org_folder = ""
@@ -1588,32 +1693,6 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
                     self.report({'WARNING'}, "Khong thay du before.txt + transform.txt%s trong '%s' "
                                 "(va thu muc .blend) - dat theo toa do file"
                                 % (" (moi co 1 file)" if org_folder else "", where))
-
-        # Hinh hien thi cua Base GOC (chua extrude/nap kin), normal huong ra ngoai
-        visual_mesh = source_mesh.copy()
-        visual_mesh.name = "Rmvb_ConnVisual"
-        bm = bmesh.new()
-        bm.from_mesh(visual_mesh)
-        outward_solid(bm)
-        bm.to_mesh(visual_mesh)
-        bm.free()
-        visual_mesh.update()
-
-        # Analog / Screw / Scanbody: luon dat vao scene (moi loai 1 ban copy dung chung)
-        part_meshes = {}
-        for slot in ("analog", "screw", "scanbody"):
-            asset = lib_connection_asset(lib_name, slot)
-            if asset and os.path.exists(asset):
-                try:
-                    part_meshes[slot] = mesh_from_file(asset).copy()
-                    part_meshes[slot].name = "Rmvb_Conn_" + slot
-                except Exception as exc:
-                    self.report({'WARNING'}, "%s: %s" % (slot, exc))
-        part_style = {
-            "analog": (COLOR_CONN_ANALOG, False),
-            "screw": (COLOR_CONN_SCREW, False),
-            "scanbody": (FALLBACK_VISUAL_COLOR, True),     # Scanbody: an
-        }
 
         clear_placed_connections(context, remove_pillars=True)
         coll = ensure_collection(COL_CONNECTION)
@@ -1632,32 +1711,8 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             group["rmvb_tooth"] = tooth
             item = props.placed.add()
             item.tooth = tooth
-            item.lib_name = lib_name
             item.group_object = group
-            # Base da xu ly (extrude) chi dung lam khoi Boolean -> an
-            obj = object_from_mesh("Conn_%s_Base" % tooth, base_mesh, coll)
-            attach_to(obj, group)
-            set_color(obj, (0.72, 0.74, 0.78, 1.0))
-            obj.hide_set(True)
-            item.base_object = obj
-            visual = object_from_mesh("%s_%s" % (OBJ_CONN_VISUAL, tooth), visual_mesh, coll)
-            attach_to(visual, group)
-            set_display_color(visual, COLOR_CONN_VISUAL)
-            visual["rmvb_role"] = "CONNECTION_VISUAL"
-            item.visual_object = visual
-            for slot, field in (("analog", "analog_object"),
-                                ("screw", "screw_object"),
-                                ("scanbody", "scanbody_object")):
-                mesh = part_meshes.get(slot)
-                if mesh is None:
-                    continue
-                part = object_from_mesh("Conn_%s_%s" % (tooth, slot.capitalize()), mesh, coll)
-                attach_to(part, group)
-                rgba, hidden = part_style[slot]
-                set_display_color(part, rgba)
-                if hidden:
-                    part.hide_set(True)
-                setattr(item, field, part)
+            populate_implant(item, group, kit, coll)
 
         props.construction_file = path
         props.connection_name = lib_name
@@ -1673,6 +1728,98 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
                     % (len(implants), lib_name, os.path.basename(path),
                        " + transform theo before/transform.txt" if org is not None else "",
                        "" if base_info["closed"] else " (Base chua kin)"))
+        return {'FINISHED'}
+
+
+def draw_implant_connection_choices(layout, props, index):
+    """Danh sach Connection Base trong thu vien de doi cho implant `index` (muc dang dung co dau tick)."""
+    names = get_connection_items()
+    if not names:
+        layout.label(text="(Trống - thêm mục trong Dental-Lib)", icon='ERROR')
+        return
+    current = props.placed[index].lib_name if 0 <= index < len(props.placed) else ""
+    for name in names:
+        op = layout.operator(RMVB_OT_set_implant_connection.bl_idname, text=name,
+                             icon='CHECKMARK' if name == current else 'MESH_CYLINDER')
+        op.index = index
+        op.connection = name
+
+
+class RMVB_OT_choose_implant_connection(Operator):
+    """Mo danh sach chon Connection Base rieng cho mot implant"""
+    bl_idname = "rmvb.choose_implant_connection"
+    bl_label = "Chon Connection Base cho implant"
+    bl_options = {'INTERNAL'}
+
+    index: IntProperty(default=0, min=0)
+
+    def invoke(self, context, event):
+        props = context.scene.rmvb
+        if not 0 <= self.index < len(props.placed):
+            return {'CANCELLED'}
+        index = self.index
+
+        def draw(menu, menu_context):
+            draw_implant_connection_choices(menu.layout, menu_context.scene.rmvb, index)
+
+        context.window_manager.popup_menu(
+            draw, title="Connection Base - răng %s" % props.placed[index].tooth, icon='MESH_CYLINDER')
+        return {'INTERFACE'}
+
+
+class RMVB_OT_set_implant_connection(Operator):
+    """Doi Connection Base cua MOT implant: thay Base / ConnectionVisual / Analog / Screw / Scanbody
+    bang bo mesh cua Connection da chon (giu nguyen vi tri implant va cac implant khac)"""
+    bl_idname = "rmvb.set_implant_connection"
+    bl_label = "Doi Connection Base cua implant"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(default=0, min=0)
+    connection: StringProperty(default="")
+
+    def execute(self, context):
+        props = context.scene.rmvb
+        if not 0 <= self.index < len(props.placed):
+            self.report({'ERROR'}, "Khong co implant nao ung voi muc nay")
+            return {'CANCELLED'}
+        item = props.placed[self.index]
+        seg = props.bar_segment
+        if valid_obj(seg) and seg.get("rmvb_applied"):
+            self.report({'ERROR'}, "Bar Segment da Apply - bam Delete Bar Design de sua tiep")
+            return {'CANCELLED'}
+        if not valid_obj(item.group_object):
+            self.report({'ERROR'}, "Implant %s mat nhom Plain Axes - bam Place Connection lai" % item.tooth)
+            return {'CANCELLED'}
+        if self.connection not in get_connection_items():
+            self.report({'ERROR'}, "Connection '%s' khong co trong thu vien Dental-Lib" % self.connection)
+            return {'CANCELLED'}
+        if item.lib_name == self.connection and valid_obj(item.base_object):
+            self.report({'INFO'}, "Rang %s da dung Connection '%s'" % (item.tooth, self.connection))
+            return {'CANCELLED'}
+        try:
+            kit = make_connection_kit(self.connection)
+        except Exception as exc:
+            self.report({'ERROR'}, "Loi doc mesh Base cua '%s': %s" % (self.connection, exc))
+            return {'CANCELLED'}
+        for warning in kit["warnings"]:
+            self.report({'WARNING'}, warning)
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        old_name = item.lib_name
+        remove_implant_parts(item)
+        populate_implant(item, item.group_object, kit, ensure_collection(COL_CONNECTION))
+        if valid_obj(seg) and seg.get("rmvb_cut"):
+            item.visual_object.hide_set(True)       # Cut Top Bar da an ConnectionVisual cua cac implant
+        rebuild_segment_modifiers(context)           # CutBase tro vao Base moi
+        purge_unused_meshes()
+        stale = any(ref.tooth == item.tooth for ref in props.pillars)
+        self.report({'INFO'}, "Rang %s: Connection '%s' -> '%s'" % (item.tooth, old_name, self.connection))
+        if stale:
+            self.report({'WARNING'}, "Bar Pillar rang %s dang tao tu Base cu - bam Create Bar Pillar de "
+                        "tao lai theo Base moi" % item.tooth)
+        for area in context.screen.areas:
+            area.tag_redraw()
         return {'FINISHED'}
 
 
@@ -3876,7 +4023,8 @@ def write_construction_info(stl_path, source_ci):
 
 
 class RMVB_OT_save_design(Operator):
-    """Xuat STL cho Bar Design va Sleeve Design (kem Visual Object + constructionInfo)"""
+    """Xuat STL cho Bar Design va Sleeve Design (+ constructionInfo). Khong xuat kem Attachment /
+    Visual Object: file chi gom dung Bar Segment hoac Sleeve"""
     bl_idname = "rmvb.save_design"
     bl_label = "Save Bar & Sleeve Design"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3896,11 +4044,6 @@ class RMVB_OT_save_design(Operator):
             self.report({'ERROR'}, "Chon thu muc luu (file .blend chua duoc luu)")
             return {'CANCELLED'}
 
-        # Visual Object chi duoc xuat kem, khong tham gia boolean
-        visuals = []
-        for group in props.groups:
-            visuals.extend(v.object for v in group.visuals if valid_obj(v.object))
-
         # Da transform theo before/transform.txt luc Place Connection -> xuat ve toa do file
         # (before x transform^-1), giong nut 'STLs ORG' cua add-on iBar
         back = org_matrix_from_props(props).inverted() if props.org_active else None
@@ -3908,7 +4051,7 @@ class RMVB_OT_save_design(Operator):
         saved = []
         for prefix, obj in items:
             filepath = os.path.join(folder, "%s_%s.stl" % (prefix, stamp))
-            targets = [obj] + visuals
+            targets = [obj]
             temps = []
             try:
                 if back is not None:
@@ -4005,6 +4148,15 @@ class RMVB_PT_panel(Panel):
                       icon=_ic('FILE'))
         box.label(text="Đã đặt: %d implant" % len(props.placed), icon=_ic('CHECKMARK'))
         if props.placed:
+            sub = box.box()
+            sub.label(text="Connection Base từng implant (bấm để đổi):", icon=_ic('MESH_CYLINDER'))
+            col = sub.column(align=True)
+            for index, item in enumerate(props.placed):
+                split = col.split(factor=0.3, align=True)
+                split.label(text="Răng %s" % item.tooth)
+                op = split.operator(RMVB_OT_choose_implant_connection.bl_idname,
+                                    text=item.lib_name or "(?)", icon=_ic('DOWNARROW_HLT'))
+                op.index = index
             if props.org_active:
                 box.label(text="Tọa độ: transform theo before/transform.txt", icon=_ic('ORIENTATION_GLOBAL'))
             else:
@@ -4137,6 +4289,8 @@ _classes = (
     RMVB_PG_props,
     RMVB_OT_set_role,
     RMVB_OT_place_connection,
+    RMVB_OT_choose_implant_connection,
+    RMVB_OT_set_implant_connection,
     RMVB_OT_clear_connection,
     RMVB_OT_create_bar_pillar,
     RMVB_OT_edit_bar_pillar,
