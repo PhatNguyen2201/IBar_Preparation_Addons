@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 5, 1),
+    "version": (0, 7, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -15,7 +15,10 @@ bl_info = {
 Panel thiet ke khung bar implant. Lay Connection Base va Attachment tu add-on
 Dental-Lib. Quy trinh:
 
-    Set Gingiva / Denture / Antagonist (chon object san co trong scene)
+    Set Gingiva / Denture / Antagonist (chon object san co trong scene; Set CHI doi mau +
+    danh dau + doi ten mesh, khong chuan bi - khoi cat nuouu tao khi Create Top Bar Plane cho
+    Bar ('GingivaCut') va khi Create Sleeve Design cho Sleeve ('GingivaCut.Sleeve'), moi loai
+    mot Offset Gingiva rieng)
       -> Select Connection Base + Place Connection (doc .constructionInfo)
       -> Bar Pillar -> Create Top Bar Plane -> Draw Line Bar (snap Plane) -> Bar Segment
          tu cap nhat -> Enable / Disable Preview cat Top Bar (modifier them san)
@@ -78,6 +81,9 @@ OBJ_ARROW = "InsertionArrow"
 OBJ_PLANE = "PlaneVisual"
 OBJ_CUTTER = "PlaneCubeCut"
 OBJ_SLEEVE = "Rmvb_Sleeve"
+OBJ_GINGIVA_CUT = "GingivaCut"        # khoi cat nuouu RIENG cho BAR: ban copy Gingiva da chuan bi kin + offset (an)
+OBJ_GINGIVA_CUT_SLEEVE = "GingivaCut.Sleeve"   # khoi cat nuouu RIENG cho SLEEVE: offset doc lap, an
+OBJ_GINGIVA_CUT_BASE = "GingivaCut.base"   # mesh cache da chuan bi kin (chua offset), DUNG CHUNG cho ca 2 khoi cat
 
 # Tien to ten modifier do add-on tao (rebuild xoa theo tien to nay)
 MOD_PREFIX = "RMVB_"
@@ -87,9 +93,10 @@ TOP_EPS = 1e-4
 
 GROUP_AXES_SIZE = 1.0               # mm: size Plain Axes (Empty) cua nhom Implant / Attachment
 CENTER_GUIDE_WIDTH = 0.001         # mm: be rong khoi dan huong "Can giua be mat Bar" (sai so ngang toi da 0.0005 mm)
-CENTER_GUIDE_HALF_HEIGHT = 100.0    # mm: nua chieu cao khoi dan huong (doc phap tuyen Plane)
-CENTER_GUIDE_VERSION = 3            # 1 = dai phang tren Plane (khoa luon Z), 2 = tuong dung ho (khong dung duoc voi
-                                    # Snap Mode Inside), 3 = khoi hop mong KIN doc tam bar
+CENTER_GUIDE_HALF_HEIGHT = 100.0    # mm: nua chieu dai khoi dan huong (doc HUONG MUI TEN, cung truc extrude Bar)
+CENTER_GUIDE_VERSION = 4            # 1 = dai phang tren Plane (khoa luon Z), 2 = tuong dung ho (khong dung duoc voi
+                                    # Snap Mode Inside), 3 = khoi hop mong KIN doc tam bar (dai doc phap tuyen Plane),
+                                    # 4 = dai doc HUONG MUI TEN (cung truc extrude Bar Segment)
 
 CST_ON_PLANE = "RMVB_on_plane"
 CST_CENTER = "RMVB_center_bar"
@@ -100,6 +107,7 @@ CST_COPY_ROT = "RMVB_lock_rotation"
 
 # Thong so chuan bi mesh (mm, truc local cua mesh)
 GINGIVA_BASE_DEPTH = 10.0       # Gingiva: extrude day xuong 10 mm roi fill
+GINGIVA_OFFSET_EPS = 1e-6       # Nguong so sanh offset trong chu ky (dung lai) khoi cat nuouu
 CONN_BOTTOM_LIFT = 0.1          # Base ho day, buoc 1: extrude +0.1 mm theo z local
 CONN_BOTTOM_EXTRUDE = 1.0       # buoc 2: tu phan moi extrude them -1 mm theo z local
 CONN_BOTTOM_SCALE = 1.5         # ... va scale local x1.5 (tam = tam vong ho goc)
@@ -952,6 +960,36 @@ def set_group_index(props, index):
         _GROUP_SELECT_LOCK[0] = False
 
 
+def _gingiva_offset_update(self, context):
+    """Doi Offset Gingiva Bar: ap dung lai khoi cat nuouu CUA BAR (neu da tao) va cap nhat stack
+    modifier cua Bar Segment ngay; chua Create Top Bar Plane thi chi luu gia tri, khong tao som.
+    Khoi cat cua Sleeve (GingivaCut.Sleeve) khong bi anh huong."""
+    try:
+        props = context.scene.rmvb
+        if valid_obj(props.gingiva_cutter) or valid_obj(props.bar_segment):
+            ensure_gingiva_cutter(props)
+        if valid_obj(props.bar_segment):
+            rebuild_segment_modifiers(context)
+    except Exception as exc:
+        print("[Rmvb-Bar] Khong cap nhat duoc khoi cat Gingiva (Bar): %s" % exc)
+
+
+_GCUT_QUIET = [False]     # True: dang di du offset tu file cu -> khong dung lai khoi cat
+
+
+def _gingiva_offset_sleeve_update(self, context):
+    """Doi Offset Gingiva Sleeve: chi dung lai khoi cat nuouu RIENG CUA SLEEVE (neu no da ton tai
+    tu lan Create Sleeve Design dau tien). Bar Segment va khoi cat cua Bar khong doi."""
+    if _GCUT_QUIET[0]:
+        return                      # luc mo file: chi di du gia tri, Create Sleeve Design moi dung
+    try:
+        props = context.scene.rmvb
+        if valid_obj(props.gingiva_cutter_sleeve) or valid_obj(props.sleeve_object):
+            ensure_gingiva_cutter(props, sleeve=True)
+    except Exception as exc:
+        print("[Rmvb-Bar] Khong cap nhat duoc khoi cat Gingiva (Sleeve): %s" % exc)
+
+
 class RMVB_PG_PlacedConnection(PropertyGroup):
     tooth: StringProperty(name="Tooth", default="?")
     lib_name: StringProperty(name="Library", default="")
@@ -1035,6 +1073,21 @@ class RMVB_PG_props(PropertyGroup):
     denture_object: PointerProperty(name="Denture", type=bpy.types.Object)
     antagonist_object: PointerProperty(name="Antagonist", type=bpy.types.Object)
 
+    # Offset cua khoi cat nuouu DUNG CHO BAR (Boolean Difference cua Bar Segment voi Gingiva)
+    gingiva_offset: FloatProperty(
+        name="Offset Gingiva Bar (mm)", default=0.0, soft_min=-2.0, soft_max=2.0, unit='LENGTH',
+        update=_gingiva_offset_update,
+        description="CHỈ ÁP DỤNG CHO BAR: nới / thu hẹp khối cắt nướu 'GingivaCut' trước khi "
+                    "Boolean Difference với Bar Segment: + = phình khối cắt ra ngoài, Bar bị cắt "
+                    "HỞ, cách mặt nướu đúng số mm này; − = thu khối cắt lại, Bar ăn SÂU vào nướu; "
+                    "0 = cắt sát mặt nướu (không dời đỉnh). Khối cắt (ẩn) được tạo khi Create Top "
+                    "Bar Plane và luôn cập nhật theo thông số này. Sleeve có khối cắt "
+                    "'GingivaCut.Sleeve' và thông số Offset Gingiva Sleeve riêng (mục 6). "
+                    "Mesh offset dựng bằng cách dời toàn bộ đỉnh của bản copy đã đóng kín của "
+                    "Gingiva dọc pháp tuyến của nó (không Remesh nên biên dạng scan giữ nguyên)")
+    gingiva_cutter: PointerProperty(name="Gingiva Cutter Bar (ẩn)", type=bpy.types.Object)
+    gingiva_cutter_sleeve: PointerProperty(name="Gingiva Cutter Sleeve (ẩn)", type=bpy.types.Object)
+
     # Connection Base + constructionInfo
     connection_index: IntProperty(name="Connection Index", default=0, min=0)
     connection_name: StringProperty(name="Connection Name", default="")
@@ -1094,6 +1147,16 @@ class RMVB_PG_props(PropertyGroup):
         description="Cỡ voxel của lớp Remesh dùng RIÊNG để tạo Sleeve (không đổi Bar Segment): mặt Sleeve "
                     "đều và mịn, hết tam giác dài mỏng / giao cắt. Nhỏ = chính xác hơn nhưng nặng hơn. "
                     "0 = tắt Remesh (cách cũ)")
+    # Offset cua khoi cat nuouu DUNG CHO SLEEVE (khoi cat GingivaCut.Sleeve, ap luc cat Sleeve)
+    gingiva_offset_sleeve: FloatProperty(
+        name="Offset Gingiva Sleeve (mm)", default=0.0, soft_min=-2.0, soft_max=2.0, unit='LENGTH',
+        update=_gingiva_offset_sleeve_update,
+        description="CHỈ ÁP DỤNG CHO SLEEVE: nới / thu hẹp khối cắt nướu riêng 'GingivaCut.Sleeve' "
+                    "trước khi cắt Sleeve ở bước cuối: + = phình khối cắt ra ngoài, Sleeve bị cắt "
+                    "HỞ, cách mặt nướu đúng số mm này; − = thu khối cắt lại, Sleeve ăn SÂU vào "
+                    "nướu; 0 = cắt sát mặt nướu. Độc lập với Offset Gingiva Bar: đổi thông số này "
+                    "không làm đổi Bar Segment. Khối cắt (ẩn) được tạo khi bấm Create Sleeve "
+                    "Design và luôn cập nhật theo thông số này")
     apply_attachment_sleeve: BoolProperty(
         name="Apply attachment on Sleeve",
         description="Cong don cac Attachment (toggle Add/Remove on Sleeve cua "
@@ -1239,7 +1302,13 @@ def count_self_intersections(bm, limit=100000):
 
 
 def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
-    """Bien mesh Gingiva thanh KHOI kin + manifold:
+    """Chuan bi tren CHINH obj (sua mesh cua obj) - giu API cu."""
+    return prepare_gingiva_mesh(obj.data, obj.matrix_world, depth)
+
+
+def prepare_gingiva_mesh(mesh, world, depth=GINGIVA_BASE_DEPTH):
+    """Bien mesh (toa do local, `world` = matrix world cua object so huu) thanh KHOI kin +
+    manifold - dung cho BAN COPY cua Gingiva (mesh goac giu nguyen):
 
     0. Lam sach: hop nhat dinh trung, xoa dinh that nut / canh > 2 mat (nguyen nhan mesh
        sau extrude van hong va Boolean tu choi), bo manh roi rac nho.
@@ -1252,13 +1321,13 @@ def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
     info: loops, filled, extruded, closed (khong con canh ho), manifold (kin + khong canh
     > 2 mat + khong dinh that nut), repaired (so dinh/mat da xoa), islands (manh roi bi bo),
     intersections (cap tam giac tu giao con lai), floor_z, open_side_up (than mesh nam DUOI
-    vanh: de keo xuong se di xuyen vao than mesh nen Set Gingiva canh bao).
+    vanh: de keo xuong se di xuyen vao than mesh nen Create Top Bar Plane canh bao).
     """
     info = {"loops": 0, "filled": 0, "extruded": False, "closed": False, "manifold": False,
             "repaired": 0, "islands": 0, "intersections": 0,
             "open_side_up": False, "floor_z": None}
     bm = bmesh.new()
-    bm.from_mesh(obj.data)
+    bm.from_mesh(mesh)
     # 1e-5 mm: chi gop dinh trung toa do (Blender 4.5 gop khong het neu nguong qua nho)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
     info["repaired"] = repair_manifold(bm)
@@ -1293,24 +1362,23 @@ def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
                 if loop is not base and cap_loop(bm, loop):
                     info["filled"] += 1
 
-        matrix = obj.matrix_world
         try:
-            inverse = matrix.inverted()
+            inverse = world.inverted()
         except ValueError:
-            matrix = inverse = Matrix.Identity(4)
-        rim_world = [matrix @ v.co for base in bases for v in unique_loop_verts(base)]
+            world = inverse = Matrix.Identity(4)
+        rim_world = [world @ v.co for base in bases for v in unique_loop_verts(base)]
         main = unique_loop_verts(bases[0])
-        main_center = matrix @ (sum((v.co for v in main), Vector()) / max(1, len(main)))
-        body = matrix @ (sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts)))
+        main_center = world @ (sum((v.co for v in main), Vector()) / max(1, len(main)))
+        body = world @ (sum((v.co for v in bm.verts), Vector()) / max(1, len(bm.verts)))
         info["open_side_up"] = body.z < main_center.z - 1e-6
         floor_z = min(p.z for p in rim_world) - depth
         info["floor_z"] = floor_z
         for base in bases:
             new_verts = _extrude_loop(bm, base)
             for vert in new_verts:
-                world = matrix @ vert.co
-                world.z = floor_z                  # cung 1 mat phang Oxy
-                vert.co = inverse @ world
+                point = world @ vert.co
+                point.z = floor_z                  # cung 1 mat phang Oxy
+                vert.co = inverse @ point
             for loop in _loops_within(bm, new_verts):
                 cap_loop(bm, loop)
         info["extruded"] = True
@@ -1327,8 +1395,8 @@ def prepare_gingiva(obj, depth=GINGIVA_BASE_DEPTH):
                 except Exception:
                     pass
         outward_solid(bm)
-        bm.to_mesh(obj.data)
-        obj.data.update()
+        bm.to_mesh(mesh)
+        mesh.update()
     info["closed"] = not any(e.is_boundary for e in bm.edges)
     info["manifold"] = (info["closed"] and not any(len(e.link_faces) > 2 for e in bm.edges)
                         and all(v.is_manifold for v in bm.verts))
@@ -1371,8 +1439,10 @@ def pick_mesh_object(context):
 
 
 class RMVB_OT_set_role(Operator):
-    """Gan object mesh dang chon vao vai tro Gingiva / Denture / Antagonist
-    (doi mau hien thi; Gingiva con duoc chuan bi thanh khoi kin)"""
+    """Gan object mesh dang chon vao vai tro Gingiva / Denture / Antagonist:
+    CHI doi ten + danh dau (rmvb_role) + doi mau hien thi, mesh giu nguyen.
+    Khoi cat nuouu (ban copy da chuan bi kin + offset) chi duoc tao khi
+    Create Top Bar Plane"""
     bl_idname = "rmvb.set_role"
     bl_label = "Set"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1399,37 +1469,28 @@ class RMVB_OT_set_role(Operator):
 
         message = ""
         if self.role == 'GINGIVA':
-            if obj.get("rmvb_gingiva_ready"):
-                message = " (da la khoi kin tu truoc)"
-            else:
-                if obj.data.users > 1:
-                    obj.data = obj.data.copy()      # khong sua mesh dung chung
-                try:
-                    info = prepare_gingiva(obj)
-                except Exception as exc:
-                    self.report({'ERROR'}, "Khong chuan bi duoc Gingiva: %s" % exc)
-                    return {'CANCELLED'}
-                obj["rmvb_gingiva_ready"] = True
-                message = " (fill %d lo mat tren, de phang Z=%.2f cach diem thap nhat cua vanh ho %g mm, %s)" % (
-                    info["filled"], info["floor_z"] if info["floor_z"] is not None else 0.0,
-                    GINGIVA_BASE_DEPTH, "khoi kin + manifold" if info["manifold"] else "CHUA kin")
-                if info["repaired"] or info["islands"]:
-                    message += " [da don %d dinh/mat loi, bo %d manh roi]" % (
-                        info["repaired"], info["islands"])
-                if info["intersections"]:
-                    self.report({'INFO'}, "Gingiva con %d cap tam giac tu giao nhau (nep cuon o mep "
-                                "scan); khoi da kin, Boolean van chay" % info["intersections"])
-                if info["open_side_up"]:
-                    self.report({'WARNING'},
-                                "Mat ho cua Gingiva quay LEN (+Z world): de keo xuong se di xuyen vao "
-                                "than mesh. Xoay Gingiva cho mat ho huong xuong roi Set lai")
-                if not info["manifold"]:
-                    self.report({'WARNING'},
-                                "Gingiva chua thanh khoi kin manifold - Boolean co the khong on dinh")
+            # Thuat toan moi: Set Gingiva KHONG chuan bi / sua mesh nua - chi doi mau +
+            # danh dau + doi ten, mesh goac giu nguyen nguyen ven. Khoi cat nuouu (toi uu
+            # mesh / dong mesh ho / offset de toi uu cho Boolean) duoc tao khi Create Top
+            # Bar Plane
+            message = " (mesh giữ nguyên - khối cắt nướu được tạo khi Create Top Bar Plane)"
         obj.name = ROLE_OBJECT_NAME[self.role]
         obj["rmvb_role"] = self.role
         set_display_color(obj, ROLE_COLOR[self.role])
         setattr(props, ROLE_PROPERTY[self.role], obj)
+        if self.role == 'GINGIVA':
+            try:
+                # Chi dung lai khoi cat NEU no da ton tai (Create Top Bar Plane / Create Sleeve
+                # Design da chay, hoac file cu): doi sang Gingiva khac thi moi khoi cat dung lai
+                # theo mesh moi; chua tao thi khong tao som
+                if valid_obj(props.gingiva_cutter) or valid_obj(props.bar_segment):
+                    ensure_gingiva_cutter(props)
+                    if valid_obj(props.bar_segment):
+                        rebuild_segment_modifiers(context)   # CutGingiva tro lai dung operand
+                if valid_obj(props.gingiva_cutter_sleeve) or valid_obj(props.sleeve_object):
+                    ensure_gingiva_cutter(props, sleeve=True)
+            except Exception as exc:
+                self.report({'WARNING'}, "Không dựng được khối cắt nướu: %s" % exc)
         activate(context, obj)
         self.report({'INFO'}, "Set %s: %s%s" % (self.role.title(), obj.name, message))
         return {'FINISHED'}
@@ -2153,8 +2214,21 @@ def place_arrow(arrow):
         link_to(arrow, coll)
 
 
+def arrow_object(props):
+    """Mui ten huong lap hien co: pointer tren panel; pointer bi mat (file cu, undo, xoa
+    nham) -> tim lai InsertionArrow trong scene. None khi chua co mui ten nao."""
+    arrow = props.bar_arrow
+    if valid_obj(arrow):
+        return arrow
+    found = bpy.data.objects.get(OBJ_ARROW)
+    if valid_obj(found) and found.type == 'EMPTY':
+        return found
+    return None
+
+
 def arrow_direction(arrow, depsgraph=None):
-    """Huong lap (world, don vi) = truc Z cua mui ten (Z+ neu chua co mui ten)."""
+    """Huong lap (world, don vi) = truc Z cua mui ten. Chi khi THAT SU khong co mui ten
+    moi mac dinh Z+ - neu co mui ten dang nghieng thi luc nao cung doc theo no."""
     if not valid_obj(arrow):
         return Vector((0.0, 0.0, 1.0))
     obj = arrow.evaluated_get(depsgraph) if depsgraph is not None else arrow
@@ -2292,17 +2366,23 @@ def parallelogram_rings(points, normal, drop, width):
 
 # ---------------------------------------------------------------------------
 # Khoi dan huong "Can giua be mat Bar": Shrinkwrap constraint KHONG bam duoc vao line chi co canh
-# (khong co mat) nen tao 1 khoi hop mong (an) dung vuong goc Plane doc tam bar lam muc tieu. Phai DUNG
-# (khong phai dai phang tren Plane: diem gan nhat tren dai phang se khoa luon chieu Z) va phai KIN
-# (Snap Mode Inside chi bam dung voi khoi kin; mat ho chi snap duoc cac diem o mot phia).
+# (khong co mat) nen tao 1 khoi hop mong (an) doc tam bar lam muc tieu. Phai DUNG (khong phai dai
+# phang tren Plane: diem gan nhat tren dai phang se khoa luon chieu Z) va phai KIN (Snap Mode
+# Inside chi bam dung voi khoi kin; mat ho chi snap duoc cac diem o mot phia). Tru dai cua khoi
+# THEO HUONG MUI TEN - cung truc extrude cua Bar Segment - chu khong thang theo phap tuyen Plane:
+# mui ten nghieng (doi huong lap) thi khoi nghieng theo, mat ben khoi luon song song mat ben bar.
 # ---------------------------------------------------------------------------
-def update_center_guide(props, flat, normal):
+def update_center_guide(props, flat, normal, direction=None):
     """Dung lai khoi dan huong (mesh toa do world): hop mong KIN doc tam bar, rong CENTER_GUIDE_WIDTH,
-    cao +-CENTER_GUIDE_HALF_HEIGHT quanh Plane. Constraint Shrinkwrap dung Snap Mode Inside nen muc tieu
+    dai +-CENTER_GUIDE_HALF_HEIGHT DOC HUONG MUI TEN (`direction`, cung truc extrude cua Bar Segment -
+    khong con thang theo phap tuyen Plane). Constraint Shrinkwrap dung Snap Mode Inside nen muc tieu
     phai la khoi kin, phap tuyen huong ra ngoai. Diem gan nhat tren khoi chi doi vi tri NGANG (vao
-    tam bar), con chieu cao so voi Plane giu nguyen - muon group nam tren Plane thi tick them Lock Z."""
+    tam bar), con vi tri doc huong mui ten giu nguyen - muon group nam tren Plane thi tick them Lock Z."""
+    if direction is None or direction.length < 1e-6:
+        direction = arrow_direction(arrow_object(props))       # Z+ neu chua co mui ten
+    direction = direction.normalized()
     _CENTERLINE["flat"], _CENTERLINE["normal"] = list(flat), normal.copy()
-    lift = normal * CENTER_GUIDE_HALF_HEIGHT
+    lift = direction * CENTER_GUIDE_HALF_HEIGHT           # truc dai THEO HUONG MUI TEN, giong Bar Segment
     rings = parallelogram_rings([point - lift for point in flat], normal, lift * 2.0, CENTER_GUIDE_WIDTH)
     if rings is None:
         return None
@@ -2323,6 +2403,7 @@ def update_center_guide(props, flat, normal):
     bm.free()
     guide.data.update()
     guide["rmvb_guide_ver"] = CENTER_GUIDE_VERSION
+    guide["rmvb_guide_dir"] = tuple(round(c, 6) for c in direction)
     return guide
 
 
@@ -2342,15 +2423,33 @@ def flat_centerline(props, depsgraph=None):
     return [project_to_plane(p, matrix.translation, normal) for p in points], normal
 
 
-def ensure_center_guide(props):
-    """Dai tam bar hien co, hoac dung tu line + Plane neu chua co (None neu line < 2 diem)."""
+def guide_is_stale(props):
+    """Khoi dan huong can dung lai: file kieu cu (dai doc phap tuyen Plane) hoac khoi bi dung
+    luc chua biet huong mui ten that (truc luu tren object lech huong mui ten hien tai > ~0.57 do)."""
     guide = props.bar_center
-    if (valid_obj(guide) and len(guide.data.polygons)
-            and guide.get("rmvb_guide_ver") == CENTER_GUIDE_VERSION):
+    if not valid_obj(guide) or not len(guide.data.polygons):
+        return False
+    if guide.get("rmvb_guide_ver") != CENTER_GUIDE_VERSION:
+        return True
+    stored = guide.get("rmvb_guide_dir")
+    if stored is None:
+        return False
+    try:
+        return Vector(stored).angle(arrow_direction(arrow_object(props))) > 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def ensure_center_guide(props):
+    """Dai tam bar hien co, hoac dung tu line + Plane + mui ten neu chua co (None neu line < 2 diem).
+    Khoi dung roi nhung sai huong mui ten (file kieu cu, mui ten moi tim lai duoc) -> dung lai."""
+    guide = props.bar_center
+    if valid_obj(guide) and len(guide.data.polygons) and not guide_is_stale(props):
         return guide
     data = flat_centerline(props)
     if data:
-        return update_center_guide(props, *data)
+        return update_center_guide(props, data[0], data[1],
+                                   arrow_direction(arrow_object(props)))
     return guide if valid_obj(guide) and len(guide.data.polygons) else None
 
 
@@ -2454,7 +2553,7 @@ def sync_bar_segment(scene, depsgraph=None, force=False):
         return False
 
     matrix = plane.evaluated_get(depsgraph).matrix_world
-    direction = arrow_direction(props.bar_arrow, depsgraph)
+    direction = arrow_direction(arrow_object(props), depsgraph)
     normal = (matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
     if normal.dot(direction) < 0:
         normal = -normal
@@ -2495,7 +2594,7 @@ def sync_bar_segment(scene, depsgraph=None, force=False):
         seg.data.update()
         seg["rmvb_topbar"] = True
         try:
-            guide = update_center_guide(props, flat, normal)
+            guide = update_center_guide(props, flat, normal, direction)
             if guide is not None:        # group da tick "Can giua be mat Bar" truoc khi co line
                 for group in props.groups:
                     if group.center_bar and valid_obj(group.empty):
@@ -2525,12 +2624,36 @@ def rmvb_load_post(_dummy=None):
         props = getattr(scene, "rmvb", None)
         if props is None:
             continue
-        if valid_obj(props.bar_arrow):
-            place_arrow(props.bar_arrow)
-        if valid_obj(props.bar_center) and props.bar_center.get("rmvb_guide_ver") != CENTER_GUIDE_VERSION:
+        if not props.get("rmvb_gcut_split"):
+            # File cu (truoc v0.7.0): Bar va Sleeve dung CHUNG mot khoi cat + mot offset. Lan mo
+            # dau tien voi add-on moi thi lay Offset Gingiva Bar lam Offset Gingiva Sleeve de
+            # Sleeve duoc cat giong nhu truoc day; khong dung lai mesh ngay luc mo file
+            # (_GCUT_QUIET) - lan Create Sleeve Design tiep theo moi dung lai
+            props["rmvb_gcut_split"] = True
+            if (valid_obj(props.sleeve_object) and not valid_obj(props.gingiva_cutter_sleeve)
+                    and abs(props.gingiva_offset) >= GINGIVA_OFFSET_EPS):
+                _GCUT_QUIET[0] = True
+                try:
+                    props.gingiva_offset_sleeve = props.gingiva_offset
+                finally:
+                    _GCUT_QUIET[0] = False
+        arrow = arrow_object(props)
+        if arrow is not None:
+            if not valid_obj(props.bar_arrow):
+                props.bar_arrow = arrow        # pointer bi mat -> gan lai de dung dung huong lap
+            place_arrow(arrow)
+        if guide_is_stale(props) and not (
+                valid_obj(props.bar_backup)
+                or (valid_obj(props.bar_segment) and props.bar_segment.get("rmvb_applied"))):
+            # Bar Segment va dai tam bar phai cung HUONG MUI TEN -> dung lai ca hai. Bar da
+            # Apply / co backup thi giu dai cu cho khop voi khoi bar da dong bang.
             try:
-                guide = ensure_center_guide(props)     # dai phang / tuong ho kieu cu -> thay bang khoi kin
-                if guide is not None:
+                if valid_obj(props.bar_segment):
+                    sync_bar_segment(scene, force=True)      # dung bar + dai tam bar cung luc
+                if guide_is_stale(props):
+                    ensure_center_guide(props)               # chi moi truong hop dung lai dai
+                guide = props.bar_center
+                if valid_obj(guide):
                     for group in props.groups:
                         if group.center_bar and valid_obj(group.empty):
                             add_center_constraint(group.empty, guide)   # dat lai Snap Mode Inside
@@ -2560,8 +2683,9 @@ def rmvb_depsgraph_handler(scene, depsgraph):
     bar_moved = False
     if valid_obj(line) and valid_obj(plane):
         watched = {line.name, line.data.name, plane.name, plane.data.name}
-        if valid_obj(props.bar_arrow):
-            watched.add(props.bar_arrow.name)
+        arrow = arrow_object(props)
+        if valid_obj(arrow):
+            watched.add(arrow.name)
         bar_moved = bool(updated & watched)
         if bar_moved:
             try:
@@ -2571,6 +2695,19 @@ def rmvb_depsgraph_handler(scene, depsgraph):
                 if message != _SYNC["error"]:
                     _SYNC["error"] = message
                     print("[Rmvb-Bar] Khong cap nhat duoc Bar Segment: %s" % message)
+    gingiva = props.gingiva_object
+    if valid_obj(gingiva) and {gingiva.name, gingiva.data.name} & updated:
+        # Sua mesh / doi scale Gingiva: MOI khoi cat nuouu DA DUOC TAO (Bar va Sleeve, du offset
+        # 0 hay khong) dung lai theo; keo xoay thi con cua Gingiva di theo nen _cutter_current
+        # bao qua, khong dung lai mesh
+        for sleeve_kind in (False, True):
+            if not valid_obj(get_gingiva_cutter(props, sleeve_kind)):
+                continue
+            try:
+                ensure_gingiva_cutter(props, sleeve=sleeve_kind)
+            except Exception as exc:
+                print("[Rmvb-Bar] Khong dung duoc khoi cat Gingiva (%s): %s"
+                      % ("Sleeve" if sleeve_kind else "Bar", exc))
     for group in props.groups:
         if group.align_x_bar and valid_obj(group.empty) and (bar_moved or group.empty.name in updated):
             try:
@@ -3050,6 +3187,204 @@ def add_group_boolean(seg, entries, operation, all_name, one_prefix, key):
     return [add_boolean_modifier(seg, obj, operation, MOD_PREFIX + one_prefix + name) for name, obj in entries]
 
 
+# ---------------------------------------------------------------------------
+# Khoi cat nuouu (GingivaCut / GingivaCut.Sleeve) cho phep Difference Gingiva
+#
+# HAI KHOI DOC LAP: 'GingivaCut' cat Bar Segment (Offset Gingiva Bar), 'GingivaCut.Sleeve' cat
+# Sleeve (Offset Gingiva Sleeve) - doi thong so nay khong lam doi ket qua cua loai kia.
+#
+# Moi khoi LUON la mot ban copy cua Gingiva (mesh goac khong bao gio bi sua): copy duoc chuan bi
+# thanh khoi kin (lam sach, dong mesh ho, de phang - xem prepare_gingiva_mesh) ROI moi doi
+# TOAN BO dinh doc theo phap tuyen cua dinh (`v.co += v.normal * distance`, cach lam giong
+# "Create Framework thickness" cua add-on ScansPrep), duong = phinh ra ngoai, am = thut vao
+# trong. KHONG dung buoc Remesh cua ScansPrep: Remesh SMOOTH lam doi bien dang scan, trong
+# khi day la khoi cat - moi lech nho deu vao ket qua cat cua Bar Segment. Khoi cat an
+# trong Viewport + Render, la CON cua Gingiva; khoi cua Bar tao khi Create Top Bar Plane, khoi
+# cua Sleeve tao khi Create Sleeve Design, sau do luon cap nhat theo Offset Gingiva tuong ung.
+# ---------------------------------------------------------------------------
+def offset_mesh_along_normals(mesh, distance):
+    """Doi dinh cua `mesh` doc phap tuyen ngay tai cho. Tra ve so dinh da doi (0 neu distance ~ 0)."""
+    if abs(distance) < 1e-9:
+        return 0
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    for vert in bm.verts:
+        vert.co += vert.normal * distance
+    count = len(bm.verts)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    return count
+
+
+def world_scale_factor(obj):
+    """He so phong to world (trung binh nhan 3 truc) cua object.
+
+    Mesh cua khoi cat nam trong toa do LOCAL cua Gingiva nen offset mm phai chia cho he so nay
+    de trong world doi dung `offset` mm (scale khong deu thi ket qua gan dung)."""
+    sx, sy, sz = obj.matrix_world.to_scale()
+    factor = abs(sx * sy * sz) ** (1.0 / 3.0)
+    return factor if factor > 1e-6 else 1.0
+
+
+def gingiva_cutter_name(sleeve):
+    """Ten object cua khoi cat nuouu theo loai: Bar = GingivaCut, Sleeve = GingivaCut.Sleeve."""
+    return OBJ_GINGIVA_CUT_SLEEVE if sleeve else OBJ_GINGIVA_CUT
+
+
+def get_gingiva_cutter(props, sleeve):
+    """Pointer khoi cat nuouu dang luu tren scene theo loai (Bar / Sleeve)."""
+    return props.gingiva_cutter_sleeve if sleeve else props.gingiva_cutter
+
+
+def set_gingiva_cutter(props, sleeve, cut):
+    if sleeve:
+        props.gingiva_cutter_sleeve = cut
+    else:
+        props.gingiva_cutter = cut
+
+
+def gingiva_offset_value(props, sleeve):
+    """Offset dang dung cua loai khoi cat: Offset Gingiva Bar / Offset Gingiva Sleeve."""
+    return (props.gingiva_offset_sleeve if sleeve else props.gingiva_offset) or 0.0
+
+
+def remove_gingiva_cutter(props, sleeve=None):
+    """Xoa khoi cat nuouu cua MOT loai (sleeve True/False) hoac CAC loai (sleeve None, dung khi
+    Gingiva bi go bo) + mesh cache da chuan bi khi khong con khoi cat nao dung toi no."""
+    for kind in ((False, True) if sleeve is None else (bool(sleeve),)):
+        cut = get_gingiva_cutter(props, kind)
+        if valid_obj(cut):
+            remove_object(cut)
+        set_gingiva_cutter(props, kind, None)
+    if not any(valid_obj(get_gingiva_cutter(props, kind)) for kind in (False, True)):
+        base = bpy.data.meshes.get(OBJ_GINGIVA_CUT_BASE)
+        if base is not None:
+            try:
+                bpy.data.meshes.remove(base)
+            except Exception:
+                pass
+
+
+def _attach_cutter_to(cut, gingiva):
+    """Cho khoi cat lam con cua Gingiva: keo / xoay Gingiva la phan cat di theo, khoi khong can
+    dung lai mesh (matrix_parent_inverse giu dung toa do world tai luc gan)."""
+    cut.parent = gingiva
+    cut.matrix_parent_inverse = gingiva.matrix_world.inverted()
+    cut.matrix_world = gingiva.matrix_world.copy()
+
+
+def _cutter_stamp(cut, gingiva, offset):
+    """Ghi dau cac dau vao da dung de dung khoi cat: biet khi nao phai dung lai."""
+    cut["rmvb_gcut_obj"] = gingiva.name
+    cut["rmvb_gcut_mesh"] = gingiva.data.name
+    cut["rmvb_gcut_verts"] = len(gingiva.data.vertices)
+    cut["rmvb_gcut_polys"] = len(gingiva.data.polygons)
+    cut["rmvb_gcut_offset"] = float(offset)
+    cut["rmvb_gcut_scale"] = world_scale_factor(gingiva)
+
+
+def _cutter_current(cut, gingiva, offset):
+    return (cut.get("rmvb_gcut_obj") == gingiva.name
+            and cut.get("rmvb_gcut_mesh") == gingiva.data.name
+            and cut.get("rmvb_gcut_verts") == len(gingiva.data.vertices)
+            and cut.get("rmvb_gcut_polys") == len(gingiva.data.polygons)
+            and abs(float(cut.get("rmvb_gcut_offset", 0.0)) - float(offset)) < GINGIVA_OFFSET_EPS
+            and abs(float(cut.get("rmvb_gcut_scale", 1.0)) - world_scale_factor(gingiva)) < 1e-6)
+
+
+def _gingiva_signature(gingiva):
+    """Chu ky cua mesh Gingiva (doi -> phai dung lai khoi cat nuouu)."""
+    return "|".join((gingiva.name, gingiva.data.name,
+                    str(len(gingiva.data.vertices)), str(len(gingiva.data.polygons)),
+                    "%.9f" % world_scale_factor(gingiva)))
+
+
+def _rebuild_gingiva_cut(cut, gingiva, offset, name=None):
+    """Dung lai mesh cua mot khoi cat nuouu (Bar hoac Sleeve):
+    - mesh cache `GingivaCut.base` (use_fake_user) giu ban DA CHUAN BI KIN theo chu ky mesh
+      Gingiva va DU DUNG CHUNG cho ca hai khoi cat -> them loai thu hai chi copy + doi dinh
+      (nhanh), khong chuan bi lai tu dau; chi khi nao chu ky Gingiva doi moi dung lai base;
+    - Gingiva doi (mesh / so dinh / so mat / scale) thi chuan bi lai ban moi.
+    Ket qua chuan bi (fill / khoi kin / canh bao) duoc luu len `cut` de Create Top Bar Plane
+    bao cho nguoi dung biet."""
+    sig = _gingiva_signature(gingiva)
+    base = bpy.data.meshes.get(OBJ_GINGIVA_CUT_BASE)
+    if base is None or base.get("rmvb_gcut_sig") != sig:
+        if base is not None:
+            bpy.data.meshes.remove(base)
+        base = gingiva.data.copy()
+        base.name = OBJ_GINGIVA_CUT_BASE
+        base.use_fake_user = True              # mesh khong co object: khong bi purge, save van giu
+        info = prepare_gingiva_mesh(base, gingiva.matrix_world)
+        base["rmvb_gcut_sig"] = sig
+        base["rmvb_gcut_filled"] = int(info["filled"])
+        base["rmvb_gcut_manifold"] = bool(info["manifold"])
+        base["rmvb_gcut_open_up"] = bool(info["open_side_up"])
+        base["rmvb_gcut_floor"] = float(info["floor_z"] if info["floor_z"] is not None else 0.0)
+    cut["rmvb_gcut_base"] = sig
+    cut["rmvb_gcut_filled"] = int(base.get("rmvb_gcut_filled", 0))
+    cut["rmvb_gcut_manifold"] = bool(base.get("rmvb_gcut_manifold", True))
+    cut["rmvb_gcut_open_up"] = bool(base.get("rmvb_gcut_open_up", False))
+    cut["rmvb_gcut_floor"] = float(base.get("rmvb_gcut_floor", 0.0))
+    old = cut.data
+    mesh = base.copy()
+    mesh.name = name or cut.name
+    cut.data = mesh
+    if old.users == 0:
+        bpy.data.meshes.remove(old)
+    offset_mesh_along_normals(cut.data, offset / world_scale_factor(gingiva))
+    _cutter_stamp(cut, gingiva, offset)
+
+
+def ensure_gingiva_cutter(props, sleeve=False):
+    """Khoi cat nuouu cho phep Difference Gingiva - CO HAI KHOI DOC LAP NHAU:
+
+        sleeve=False -> 'GingivaCut'          cat Bar Segment  (offset props.gingiva_offset)
+        sleeve=True  -> 'GingivaCut.Sleeve'   cat Sleeve       (offset props.gingiva_offset_sleeve)
+
+    Moi khoi LUON la mot ban copy cua Gingiva da chuan bi thanh khoi kin (toi uu mesh / dong
+    mesh ho / de phang) roi offset doc phap tuyen (0 = khong doi dinh), an trong Viewport +
+    Render va lam CON cua Gingiva; ca hai dung chung mesh cache nen tao them loai thu hai
+    khong phai chuan bi lai mesh.
+
+    Khoi cat cua Bar duoc tao khi Create Top Bar Plane, khoi cat cua Sleeve khi Create Sleeve
+    Design; sau do luon cap nhat theo thong so Offset Gingiva tuong ung tren panel. Chi dung
+    lai mesh khi Gingiva doi (mesh / so dinh / so mat / scale) hoac offset cua loai do doi;
+    keo / xoay Gingiva khong can dung lai vi khoi cat di theo transform cua Gingiva."""
+    name = gingiva_cutter_name(sleeve)
+    gingiva = props.gingiva_object
+    if not valid_obj(gingiva) or gingiva.type != 'MESH':
+        remove_gingiva_cutter(props)                 # Gingiva bi go bo -> xoa ca hai khoi cat
+        return None
+    offset = gingiva_offset_value(props, sleeve)
+    cut = get_gingiva_cutter(props, sleeve)
+    if not valid_obj(cut):
+        cut = bpy.data.objects.get(name)             # pointer mat (file cu / undo) -> tai dung lai
+        if valid_obj(cut):
+            set_gingiva_cutter(props, sleeve, cut)
+    if valid_obj(cut):
+        # GIU NGUYEN object: modifier CutGingiva / boolean dang tro toi no, xoa roi tao la thi operand bi chet
+        if cut.parent != gingiva:
+            _attach_cutter_to(cut, gingiva)
+        if not _cutter_current(cut, gingiva, offset):
+            _rebuild_gingiva_cut(cut, gingiva, offset, name)
+        return cut
+    cut = bpy.data.objects.new(name, bpy.data.meshes.new(name))
+    ensure_collection(COL_CUTPLANE).objects.link(cut)
+    cut.hide_viewport = True               # an trong Viewport + render; Boolean van danh gia du (da do)
+    cut.hide_render = True
+    cut.hide_select = True
+    cut.display_type = 'WIRE'
+    cut["rmvb_role"] = "GINGIVA_CUT_SLEEVE" if sleeve else "GINGIVA_CUT"
+    set_gingiva_cutter(props, sleeve, cut)
+    _attach_cutter_to(cut, gingiva)
+    _rebuild_gingiva_cut(cut, gingiva, offset, name)
+    return cut
+
+
 def rebuild_segment_modifiers(context):
     """Dung lai toan bo modifier cua Bar Segment theo thu tu co dinh:
 
@@ -3073,7 +3408,7 @@ def rebuild_segment_modifiers(context):
     preview_att = preview_enabled(seg)
     preview_cut = cut_preview_enabled(seg)
     cut_mods = []
-    gingiva = props.gingiva_object
+    gingiva = ensure_gingiva_cutter(props)      # Luon cat bang GingivaCut: ban copy da chuan bi kin + offset
     if valid_obj(gingiva):
         cut_mods.append(add_boolean_modifier(seg, gingiva, 'DIFFERENCE', MOD_PREFIX + "CutGingiva"))
     cut_mods += add_group_boolean(
@@ -3177,8 +3512,10 @@ def fit_plane_size(plane, cutter):
 
 class RMVB_OT_create_top_bar_plane(Operator):
     """Buoc DAU TIEN cua Bar Segment: tao PlaneVisual (100 mm, xanh duong, opacity 0.4) va
-    PlaneCubeCut (an) trong collection CutPlane + Mui ten huong lap. Sau do Draw Line Bar
-    se ve tren PlaneVisual va Bar Segment tu cap nhat theo line, Plane, mui ten"""
+    PlaneCubeCut (an) trong collection CutPlane + Mui ten huong lap. Neu da Set Gingiva, buoc
+    nay cung la luc tao khoi cat nuouu (GingivaCut): ban copy da chuan bi khoi kin + offset
+    theo thong so Offset Gingiva, an khoi Viewport. Sau do Draw Line Bar se ve tren
+    PlaneVisual va Bar Segment tu cap nhat theo line, Plane, mui ten"""
     bl_idname = "rmvb.create_top_bar_plane"
     bl_label = "Create Top Bar Plane"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3188,7 +3525,7 @@ class RMVB_OT_create_top_bar_plane(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         coll = ensure_collection(COL_CUTPLANE)
-        direction = arrow_direction(props.bar_arrow)
+        direction = arrow_direction(arrow_object(props))
         created = False
         plane = props.top_plane
         if not valid_obj(plane):
@@ -3218,6 +3555,28 @@ class RMVB_OT_create_top_bar_plane(Operator):
         resized = False if created else fit_plane_size(plane, cutter)
         context.view_layer.update()
         ensure_arrow(context, plane.matrix_world.translation)
+
+        # Khoi cat nuouu CUA BAR: TU buoc nay moi bat dau tao (Set Gingiva chi doi mau + danh dau +
+        # doi ten, mesh goac giu nguyen). Ban copy mesh Gingiva duoc toi uu / dong mesh ho
+        # thanh khoi kin roi offset doc phap tuyen de toi uu cho Boolean; an khoi Viewport va
+        # luon cap nhat theo thong so Offset Gingiva Bar tren panel. Sleeve co khoi cat
+        # GingivaCut.Sleeve rieng, tao khi bam Create Sleeve Design
+        gingiva_cut = ensure_gingiva_cutter(props)
+        if valid_obj(gingiva_cut):
+            filled = int(gingiva_cut.get("rmvb_gcut_filled", 0))
+            manifold = bool(gingiva_cut.get("rmvb_gcut_manifold", True))
+            floor_z = float(gingiva_cut.get("rmvb_gcut_floor", 0.0))
+            self.report({'INFO'},
+                        "Mesh cắt nướu Bar (ẩn): fill %d lỗ, đế phẳng Z=%.2f, offset %g mm, %s"
+                        % (filled, floor_z, props.gingiva_offset or 0.0,
+                           "khối kín + manifold" if manifold else "CHƯA kín"))
+            if bool(gingiva_cut.get("rmvb_gcut_open_up", False)):
+                self.report({'WARNING'},
+                            "Mặt hở của Gingiva quay LÊN (+Z world): đế phẳng sẽ đùm lên trên "
+                            "thay vì xuống. Xoay Gingiva cho mặt hở hướng xuống rồi Set lại")
+            if not manifold:
+                self.report({'WARNING'},
+                            "Khối cắt nướu chưa kín manifold - Boolean có thể không ổn định")
         if valid_obj(props.bar_segment):
             rebuild_segment_modifiers(context)           # them modifier CutPlane (tat Preview)
         for group in props.groups:
@@ -3231,8 +3590,10 @@ class RMVB_OT_create_top_bar_plane(Operator):
         if resized:
             message = "Da phong to PlaneVisual + PlaneCubeCut len %g mm" % PLANE_SIZE
         else:
-            message = "%s PlaneVisual + PlaneCubeCut (%g mm) + Mui ten huong lap - bam Draw " \
-                      "Line Bar de ve line tren Plane" % ("Da tao" if created else "Da co", PLANE_SIZE)
+            message = "%s PlaneVisual + PlaneCubeCut (%g mm) + Mui ten huong lap%s - bam Draw " \
+                      "Line Bar de ve line tren Plane" % (
+                          "Da tao" if created else "Da co", PLANE_SIZE,
+                          " + mesh cat nuouu (an)" if valid_obj(gingiva_cut) else "")
         self.report({'INFO'}, message)
         return {'FINISHED'}
 
@@ -4014,8 +4375,9 @@ class RMVB_OT_create_sleeve_design(Operator):
                                     'UNION' if group.on_sleeve else 'DIFFERENCE')
                     remove_object(copy)
 
-            # Cat phan tiep xuc voi nuou
-            gingiva = props.gingiva_object
+            # Cat phan tiep xuc voi nuou bang KHOI CAT RIENG CUA SLEEVE (GingivaCut.Sleeve +
+            # Offset Gingiva Sleeve) - khong dung GingivaCut cua Bar nen Bar khong bi anh huong
+            gingiva = ensure_gingiva_cutter(props, sleeve=True)
             if valid_obj(gingiva) and gingiva.type == 'MESH':
                 # Ca Sleeve va Nuou deu duoc tam giac hoa truoc khi cat de STL xuat ra kin (khong n-gon thung)
                 triangulate_object(sleeve)
@@ -4044,9 +4406,10 @@ class RMVB_OT_create_sleeve_design(Operator):
         purge_unused_meshes()
         bar_att = len(sleeve_bar_part_names(props))
         self.report({'INFO'}, "Da tao Sleeve tu be mat Bar sau Union Pillar (chua cat nuou, chua ap Base, "
-                    "%s%s) roi cat nuou (offset %g mm, day %g mm%s)"
+                    "%s%s) roi cat nuou bang '%s' (Offset Gingiva Sleeve %g mm; gap bar %g mm, day %g mm%s)"
                     % ("ap %d Attachment tren Bar" % bar_att if bar_att else "chua ap Attachment tren Bar",
-                       ", Remesh %g mm" % voxel if voxel > 0.0 else "", inner_gap, wall,
+                       ", Remesh %g mm" % voxel if voxel > 0.0 else "", OBJ_GINGIVA_CUT_SLEEVE,
+                       props.gingiva_offset_sleeve or 0.0, inner_gap, wall,
                        ", da cat Gingiva" if cut_gingiva else ""))
         return {'FINISHED'}
 
@@ -4349,7 +4712,7 @@ class RMVB_PT_panel(Panel):
         box.operator(RMVB_OT_create_top_bar_plane.bl_idname,
                      text="Create Top Bar Plane" if not plane_ok else "Create Top Bar Plane (đã có)",
                      icon=_ic('MESH_PLANE'))
-        if valid_obj(props.bar_arrow):
+        if valid_obj(arrow_object(props)):
             box.label(text="Mũi tên hướng lắp: xoay '%s' để đổi hướng" % OBJ_ARROW,
                       icon=_ic('EMPTY_SINGLE_ARROW'))
         col = box.column(align=True)
@@ -4377,6 +4740,11 @@ class RMVB_PT_panel(Panel):
                      icon=_ic('HIDE_OFF'), depress=cut_on)
         row.operator(RMVB_OT_disable_cut_preview.bl_idname, text="Disable Preview",
                      icon=_ic('HIDE_ON'))
+        box.prop(props, "gingiva_offset")
+        if abs(props.gingiva_offset) >= GINGIVA_OFFSET_EPS:
+            box.label(text="Cắt Bar bằng '%s': %s %g mm so với mặt nướu (Sleeve có offset riêng ở mục 6)"
+                      % (OBJ_GINGIVA_CUT, "hở" if props.gingiva_offset > 0 else "ăn sâu",
+                         abs(props.gingiva_offset)), icon=_ic('INFO'))
 
         # ---- Attachment ----------------------------------------------------
         box = layout.box()
@@ -4430,6 +4798,16 @@ class RMVB_PT_panel(Panel):
         box.prop(props, "sleeve_thickness")
         box.prop(props, "sleeve_voxel")
         box.prop(props, "apply_attachment_sleeve")
+        col = box.column(align=True)
+        col.prop(props, "gingiva_offset_sleeve")
+        if abs(props.gingiva_offset_sleeve) >= GINGIVA_OFFSET_EPS:
+            col.label(text="Cắt Sleeve bằng '%s': %s %g mm so với mặt nướu (không đổi Bar)"
+                      % (OBJ_GINGIVA_CUT_SLEEVE,
+                         "hở" if props.gingiva_offset_sleeve > 0 else "ăn sâu",
+                         abs(props.gingiva_offset_sleeve)), icon=_ic('INFO'))
+        elif not valid_obj(props.gingiva_cutter_sleeve):
+            col.label(text="Khối cắt riêng '%s' sẽ được tạo khi bấm Create Sleeve Design"
+                      % OBJ_GINGIVA_CUT_SLEEVE, icon=_ic('INFO'))
         box.operator(RMVB_OT_create_sleeve_design.bl_idname,
                      text="Create Sleeve Design", icon=_ic('MOD_SOLIDIFY'))
 
