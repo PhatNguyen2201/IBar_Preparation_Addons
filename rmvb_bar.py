@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 9),
+    "version": (0, 4, 10),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -33,6 +33,7 @@ Mau hien thi lay tu thu vien Dental-Lib:
 
 import bpy
 import bmesh
+import math
 import os
 import re
 import sys
@@ -71,6 +72,7 @@ COL_PREVIEW = "Rmvb Preview"
 OBJ_SEGMENT = "BarSegment"
 OBJ_BACKUP = "BarSegmentBackup"
 OBJ_LINE = "Rmvb_BarLine"
+OBJ_CENTER = "Rmvb_BarCenter"
 OBJ_ARROW = "InsertionArrow"
 OBJ_PLANE = "PlaneVisual"
 OBJ_CUTTER = "PlaneCubeCut"
@@ -82,7 +84,10 @@ MOD_PREFIX = "RMVB_"
 # Ngung dung (mm) khi xac dinh cac dinh nam cung mot cao do dinh mui extrude.
 TOP_EPS = 1e-4
 
+CENTER_GUIDE_WIDTH = 0.001      # mm: be rong dai dan huong "Can giua be mat Bar" (sai so toi da 0.0005 mm)
+
 CST_ON_PLANE = "RMVB_on_plane"
+CST_CENTER = "RMVB_center_bar"
 CST_ROT_PLANE = "RMVB_lock_rot_topbar"
 CST_ROT_LIMIT = "RMVB_lock_rot_xy"
 CST_COPY_LOC = "RMVB_lock_location"
@@ -282,7 +287,17 @@ def set_single_material(obj, rgba):
     return obj
 
 
+def ensure_object_mode(context):
+    """Thoat Edit Mode (vd. dang Edit Line Bar) ve Object Mode; Edit Mode ghi diem vao mesh khi thoat."""
+    if context.mode != 'OBJECT':
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError:
+            pass
+
+
 def activate(context, obj, select=True):
+    ensure_object_mode(context)     # select_all poll fail neu dang o Edit Mode
     bpy.ops.object.select_all(action='DESELECT')
     try:
         obj.select_set(select)
@@ -918,9 +933,26 @@ class RMVB_PG_AttachmentGroup(PropertyGroup):
     on_bar: BoolProperty(
         name="Add/Remove on Bar", default=True,
         description="Lay tu Dental-Lib: True = Union len Bar, False = Difference")
+    bar_in_sleeve: BoolProperty(
+        name="Attachment on Bar khi tạo Sleeve", default=False,
+        description="Lay tu Dental-Lib: tick = Part Bar cua Attachment nay VAN duoc ap len Bar "
+                    "(Union / Difference theo Add/Remove on Bar) khi bam Create Sleeve Design, "
+                    "khong bi bo qua")
     on_sleeve: BoolProperty(
         name="Add/Remove on Sleeve", default=False,
         description="Lay tu Dental-Lib: True = Union len Sleeve, False = Difference")
+    center_bar: BoolProperty(
+        name="Căn giữa bề mặt Bar",
+        description="Tam group luon nam NGAY GIUA be mat Bar Segment theo be rong bar (tren duong "
+                    "tam line, tren mat Plane): keo group doc theo Bar thi group truot theo tam, "
+                    "khong lech sang hai ben. Khong anh huong huong xoay",
+        default=False, update=_group_lock_update)
+    align_x_bar: BoolProperty(
+        name="Trục X theo dọc Bar",
+        description="Truc X cua group luon chay doc theo tam Bar Segment tai vi tri group (theo chieu "
+                    "ve line, tren mat Plane): doi vi tri doc Bar thi group xoay theo cho cong cua "
+                    "bar. Tu giu truc Z vuong goc Plane nhu Lock Rotation; xoay tay quanh Z bi ghi de",
+        default=False, update=_group_lock_update)
     lock_topbar: BoolProperty(
         name="Lock Z với Top Bar",
         description="Tam group luon nam tren mat phang PlaneVisual (chi khoa Z local "
@@ -978,6 +1010,7 @@ class RMVB_PG_props(PropertyGroup):
 
     # Bar Segment + Top Bar
     bar_line: PointerProperty(name="Bar Line", type=bpy.types.Object)
+    bar_center: PointerProperty(name="Bar Center (dai tam bar)", type=bpy.types.Object)
     bar_arrow: PointerProperty(name="Mũi tên hướng lắp", type=bpy.types.Object)
     bar_segment: PointerProperty(name="Bar Segment", type=bpy.types.Object)
     bar_backup: PointerProperty(name="Bar Segment Backup", type=bpy.types.Object)
@@ -2039,6 +2072,136 @@ def parallelogram_rings(points, normal, drop, width):
 
 
 # ---------------------------------------------------------------------------
+# Dai dan huong "Can giua be mat Bar": Shrinkwrap constraint KHONG bam duoc vao line chi co
+# canh (khong co mat) nen tao 1 dai rat mong (an) doc tam bar tren Plane lam muc tieu.
+# ---------------------------------------------------------------------------
+def update_center_guide(props, flat, normal):
+    """Dung lai dai tam bar (mesh toa do world) tu cac diem tam da chieu len Plane."""
+    _CENTERLINE["flat"], _CENTERLINE["normal"] = list(flat), normal.copy()
+    rings = parallelogram_rings(flat, normal, Vector((0.0, 0.0, 0.0)), CENTER_GUIDE_WIDTH)
+    if rings is None:
+        return None
+    bm = bmesh.new()
+    pairs = [(bm.verts.new(ring[0]), bm.verts.new(ring[1])) for ring in rings]
+    for (left0, right0), (left1, right1) in zip(pairs, pairs[1:]):
+        try:
+            bm.faces.new((left0, right0, right1, left1))
+        except ValueError:
+            pass
+    guide = props.bar_center
+    if not valid_obj(guide):
+        guide = bpy.data.objects.new(OBJ_CENTER, bpy.data.meshes.new(OBJ_CENTER))
+        ensure_collection(COL_SEGMENT).objects.link(guide)
+        guide["rmvb_role"] = "BAR_CENTER"
+        guide.hide_render = True
+        guide.hide_select = True
+        try:
+            guide.hide_set(True)        # an khoi Viewport; Shrinkwrap van dung duoc lam muc tieu
+        except RuntimeError:
+            pass
+        props.bar_center = guide
+    bm.to_mesh(guide.data)
+    bm.free()
+    guide.data.update()
+    return guide
+
+
+def flat_centerline(props, depsgraph=None):
+    """(cac diem tam bar da chieu len Plane, phap tuyen Plane) tinh tu line + Plane; None neu line
+    < 2 diem hoac chua co Plane."""
+    line, plane = props.bar_line, props.top_plane
+    if not (valid_obj(line) and valid_obj(plane)):
+        return None
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    points = clean_points(line_world_points(line, depsgraph))
+    if len(points) < 2:
+        return None
+    matrix = plane.evaluated_get(depsgraph).matrix_world
+    normal = (matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+    return [project_to_plane(p, matrix.translation, normal) for p in points], normal
+
+
+def ensure_center_guide(props):
+    """Dai tam bar hien co, hoac dung tu line + Plane neu chua co (None neu line < 2 diem)."""
+    guide = props.bar_center
+    if valid_obj(guide) and len(guide.data.polygons):
+        return guide
+    data = flat_centerline(props)
+    return update_center_guide(props, *data) if data else None
+
+
+# Tam bar (cac diem da chieu len Plane) lan cuoi Bar Segment cap nhat - "Truc X theo doc Bar" doc o
+# day thay vi dung lai line moi lan Empty dich chuyen. Mat khi mo file -> dung lai tu line.
+_CENTERLINE = {"flat": None, "normal": None}
+
+
+def centerline(props):
+    if _CENTERLINE["flat"] is None:
+        data = flat_centerline(props)
+        if data is None:
+            return None
+        _CENTERLINE["flat"], _CENTERLINE["normal"] = list(data[0]), data[1].copy()
+    return _CENTERLINE["flat"]
+
+
+def polyline_tangent(flat, point):
+    """Huong (don vi) cua doan tam bar gan `point` nhat, theo chieu ve line (diem dau -> diem cuoi)."""
+    best = None
+    for index in range(len(flat) - 1):
+        a, b = flat[index], flat[index + 1]
+        edge = b - a
+        length2 = edge.length_squared
+        if length2 < 1e-12:
+            continue
+        t = max(0.0, min(1.0, (point - a).dot(edge) / length2))
+        dist2 = (a + edge * t - point).length_squared
+        if best is None or dist2 < best[0] - 1e-12:
+            best = (dist2, edge)
+    return best[1].normalized() if best else None
+
+
+def align_group_x(group, props, depsgraph=None):
+    """Xoay Empty cua group quanh phap tuyen Plane de truc X trung huong tam bar tai vi tri group.
+
+    Lock Rotation (COPY_ROTATION BEFORE Plane) coi rotation_euler.z la goc quanh phap tuyen Plane, do
+    tu truc X cua Plane -> chi can dat z = goc cua huong bar trong he truc Plane. Tra ve True neu doi."""
+    empty, plane = group.empty, props.top_plane
+    if not (valid_obj(empty) and valid_obj(plane)) or centerline(props) is None:
+        return False
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    tangent = polyline_tangent(_CENTERLINE["flat"], empty.evaluated_get(depsgraph).matrix_world.translation)
+    if tangent is None:
+        return False
+    plane_rot = plane.evaluated_get(depsgraph).matrix_world.to_3x3().normalized()
+    local = plane_rot.inverted() @ tangent
+    if math.hypot(local.x, local.y) < 1e-6:
+        return False                      # huong bar vuong goc Plane (khong xay ra khi line nam tren Plane)
+    angle = math.atan2(local.y, local.x)
+    if empty.rotation_mode != 'XYZ':
+        empty.rotation_mode = 'XYZ'
+    current = empty.rotation_euler.z
+    delta = (angle - current + math.pi) % (2.0 * math.pi) - math.pi
+    if abs(delta) < 1e-5:
+        return False
+    empty.rotation_euler.z = current + delta
+    return True
+
+
+def add_center_constraint(empty, guide):
+    """Shrinkwrap (Nearest Surface Point) cua Empty vao dai tam bar: vi tri luon nam tren tam bar."""
+    constraint = empty.constraints.get(CST_CENTER)
+    if constraint is None:
+        constraint = empty.constraints.new('SHRINKWRAP')
+        constraint.name = CST_CENTER
+    constraint.target = guide
+    constraint.shrinkwrap_type = 'NEAREST_SURFACE'
+    constraint.distance = 0.0
+    return constraint
+
+
+# ---------------------------------------------------------------------------
 # Bar Segment tu cap nhat (handler depsgraph + update cua thong so)
 # ---------------------------------------------------------------------------
 _SYNC = {"sig": None, "busy": False, "error": ""}
@@ -2105,6 +2268,14 @@ def sync_bar_segment(scene, depsgraph=None, force=False):
         bm.free()
         seg.data.update()
         seg["rmvb_topbar"] = True
+        try:
+            guide = update_center_guide(props, flat, normal)
+            if guide is not None:        # group da tick "Can giua be mat Bar" truoc khi co line
+                for group in props.groups:
+                    if group.center_bar and valid_obj(group.empty):
+                        add_center_constraint(group.empty, guide)
+        except Exception as exc:
+            print("[Rmvb-Bar] Khong cap nhat duoc dai tam bar: %s" % exc)
         if created:
             rebuild_segment_modifiers(bpy.context)
         _SYNC["sig"] = signature
@@ -2117,7 +2288,8 @@ def sync_bar_segment(scene, depsgraph=None, force=False):
 @persistent
 def rmvb_load_post(_dummy=None):
     """Mo file: group da bat Lock Rotation tu ban cu (copy ca 3 truc) duoc dung lai
-    constraint kieu moi (chi khoa X/Y)."""
+    constraint kieu moi (chi khoa X/Y). Xoa cache tam bar cua file truoc."""
+    _CENTERLINE["flat"] = _CENTERLINE["normal"] = None
     for scene in bpy.data.scenes:
         props = getattr(scene, "rmvb", None)
         if props is None:
@@ -2133,28 +2305,36 @@ def rmvb_load_post(_dummy=None):
 
 @persistent
 def rmvb_depsgraph_handler(scene, depsgraph):
-    """Line / PlaneVisual / mui ten duoc sua (ke ca trong Edit Mode) -> cap nhat Bar Segment."""
+    """Line / PlaneVisual / mui ten duoc sua (ke ca trong Edit Mode) -> cap nhat Bar Segment; group
+    tick "Truc X theo doc Bar" duoc xoay lai theo huong bar tai vi tri moi."""
     if _SYNC["busy"]:
         return
     try:
         props = scene.rmvb
     except AttributeError:
         return
+    updated = {update.id.name for update in depsgraph.updates}
     line, plane = props.bar_line, props.top_plane
-    if not (valid_obj(line) and valid_obj(plane)):
-        return
-    watched = {line.name, line.data.name, plane.name, plane.data.name}
-    if valid_obj(props.bar_arrow):
-        watched.add(props.bar_arrow.name)
-    if not any(update.id.name in watched for update in depsgraph.updates):
-        return
-    try:
-        sync_bar_segment(scene, depsgraph)
-    except Exception as exc:
-        message = str(exc)
-        if message != _SYNC["error"]:
-            _SYNC["error"] = message
-            print("[Rmvb-Bar] Khong cap nhat duoc Bar Segment: %s" % message)
+    bar_moved = False
+    if valid_obj(line) and valid_obj(plane):
+        watched = {line.name, line.data.name, plane.name, plane.data.name}
+        if valid_obj(props.bar_arrow):
+            watched.add(props.bar_arrow.name)
+        bar_moved = bool(updated & watched)
+        if bar_moved:
+            try:
+                sync_bar_segment(scene, depsgraph)
+            except Exception as exc:
+                message = str(exc)
+                if message != _SYNC["error"]:
+                    _SYNC["error"] = message
+                    print("[Rmvb-Bar] Khong cap nhat duoc Bar Segment: %s" % message)
+    for group in props.groups:
+        if group.align_x_bar and valid_obj(group.empty) and (bar_moved or group.empty.name in updated):
+            try:
+                align_group_x(group, props, depsgraph)
+            except Exception as exc:
+                print("[Rmvb-Bar] Khong canh duoc truc X cua '%s': %s" % (group.name, exc))
 
 
 class RMVB_OT_update_bar_segment(Operator):
@@ -2722,7 +2902,7 @@ class RMVB_OT_create_top_bar_plane(Operator):
         context.view_layer.update()
         ensure_arrow(context, plane.matrix_world.translation)
         for group in props.groups:
-            if group.lock_topbar or group.lock_rot_topbar:
+            if group.lock_topbar or group.lock_rot_topbar or group.center_bar or group.align_x_bar:
                 apply_group_locks(group, props)
         if valid_obj(props.bar_line):
             if valid_obj(props.bar_line) and props.bar_line.modifiers:
@@ -2757,6 +2937,7 @@ class RMVB_OT_cut_top_bar(Operator):
         if not valid_obj(props.top_cutter):
             self.report({'ERROR'}, "Chua co PlaneCubeCut - bam Create Top Bar Plane truoc")
             return {'CANCELLED'}
+        ensure_object_mode(context)     # dang Edit Line Bar -> chot diem line truoc khi dung modifier
         seg["rmvb_cut"] = True
         count = rebuild_segment_modifiers(context)
         activate(context, seg)
@@ -2853,13 +3034,17 @@ def _lock_cycle(props, group, target):
     return False
 
 
-LOCK_CONSTRAINTS = (CST_ON_PLANE, CST_ROT_LIMIT, CST_ROT_PLANE, CST_COPY_LOC, CST_COPY_ROT)
+LOCK_CONSTRAINTS = (CST_CENTER, CST_ON_PLANE, CST_ROT_LIMIT, CST_ROT_PLANE, CST_COPY_LOC, CST_COPY_ROT)
 
 
 def apply_group_locks(group, props):
     """Dung lai cac constraint khoa tren Empty cua group:
 
+    - Can giua be mat Bar       : SHRINKWRAP (Nearest Surface Point) vao dai tam bar - vi tri luon nam
+                                  tren duong tam line, tren mat Plane (khong anh huong huong xoay)
     - Lock Z voi Top Bar        : LIMIT_LOCATION z = 0 trong he truc cua PlaneVisual
+    - Truc X theo doc Bar       : giu Z vuong goc Plane (nhu Lock Rotation) + align_group_x dat goc
+                                  xoay quanh Z theo huong tam bar (handler depsgraph giu cap nhat)
     - Lock Rotation voi Top Bar : khoa nghieng X/Y theo PlaneVisual, Z tu do. LIMIT_ROTATION
                                   dua X/Y rieng cua group ve 0, roi COPY_ROTATION (Before
                                   Original) dat huong cua Plane lam he truc cha -> Z cua
@@ -2877,6 +3062,14 @@ def apply_group_locks(group, props):
     for constraint in list(empty.constraints):
         if constraint.name in LOCK_CONSTRAINTS:
             empty.constraints.remove(constraint)
+    if group.center_bar:
+        try:
+            guide = ensure_center_guide(props)
+        except Exception as exc:
+            guide = None
+            print("[Rmvb-Bar] Khong dung duoc dai tam bar: %s" % exc)
+        if guide is not None:
+            add_center_constraint(empty, guide)
     if group.lock_topbar and valid_obj(plane):
         constraint = empty.constraints.new('LIMIT_LOCATION')
         constraint.name = CST_ON_PLANE
@@ -2888,7 +3081,7 @@ def apply_group_locks(group, props):
         constraint.max_z = 0.0
         if hasattr(constraint, "use_transform_limit"):
             constraint.use_transform_limit = True
-    if group.lock_rot_topbar and valid_obj(plane):
+    if (group.lock_rot_topbar or group.align_x_bar) and valid_obj(plane):
         if empty.rotation_mode != 'XYZ':
             empty.rotation_mode = 'XYZ'
         limit = empty.constraints.new('LIMIT_ROTATION')
@@ -2913,6 +3106,12 @@ def apply_group_locks(group, props):
                 constraint = empty.constraints.new(kind)
                 constraint.name = name
                 constraint.target = target.empty
+    if group.align_x_bar:
+        bpy.context.view_layer.update()
+        try:
+            align_group_x(group, props)
+        except Exception as exc:
+            print("[Rmvb-Bar] Khong canh duoc truc X: %s" % exc)
     bpy.context.view_layer.update()
 
 
@@ -3031,6 +3230,7 @@ class RMVB_OT_add_attachment(Operator):
         group.name = gname
         group.lib_name = name
         group.on_bar = bool(entry.get("on_bar", True))
+        group.bar_in_sleeve = bool(entry.get("bar_in_sleeve", False))
         group.on_sleeve = bool(entry.get("on_sleeve", False))
 
         for slot, field, role in (("part_bar", "part_bar", "ATTACHMENT"),
@@ -3346,22 +3546,33 @@ def sleeve_shell(source, inner_gap, wall, name, coll, voxel=0.0):
 # ---------------------------------------------------------------------------
 # Sleeve Design
 # ---------------------------------------------------------------------------
-def is_sleeve_source_modifier(mod):
+def sleeve_bar_part_names(props):
+    """Ten Part Bar cua cac Attachment co tick 'Attachment on Bar khi tao Sleeve' (Dental-Lib)."""
+    return {g.part_bar.name for g in props.groups if g.bar_in_sleeve and valid_obj(g.part_bar)}
+
+
+def is_sleeve_source_modifier(mod, bar_parts=()):
     """Modifier dung de dung be mat Bar cho Sleeve: Union cac Bar Pillar, Difference
-    PlaneCubeCut. KHONG gom Difference Gingiva (Sleeve duoc cat nuou SAU CUNG, tren be mat sach,
-    chu khong dung nguon da bi duong cat nuou lom chom cua scan lam hong), Difference Base va
-    Union/Difference Attachment."""
+    PlaneCubeCut, va Union/Difference Part Bar cua Attachment co tick 'Attachment on Bar khi tao
+    Sleeve' (`bar_parts` = ten cac Part Bar do). KHONG gom Difference Gingiva (Sleeve duoc cat nuou
+    SAU CUNG, tren be mat sach, chu khong dung nguon da bi duong cat nuou lom chom cua scan lam
+    hong), Difference Base va Attachment khong tick."""
     if not mod.name.startswith(MOD_PREFIX):
         return True                        # modifier do nguoi dung tu them: giu nguyen
     short = mod.name[len(MOD_PREFIX):]
-    return short == "CutPlane" or short.startswith("Union_")
+    if short == "CutPlane" or short.startswith("Union_"):
+        return True
+    return (short.startswith("Att_") and mod.type == 'BOOLEAN'
+            and mod.object is not None and mod.object.name in bar_parts)
 
 
 def bar_source(context, coll, voxel=None):
     """Ban sao (toa do world) cua Bar Segment sau khi Boolean voi Bar Pillar, CHUA cat nuou va
-    CHUA ap Base / Attachment - be mat dung de tao Sleeve.
+    CHUA ap Base - be mat dung de tao Sleeve. Attachment chi duoc ap khi co tick 'Attachment on Bar
+    khi tao Sleeve' (Dental-Lib), con lai bi bo qua.
 
-    Danh gia tren 1 ban sao tam cua Bar Segment (chi giu Union Pillar + CutPlane) cong them 1 lop
+    Danh gia tren 1 ban sao tam cua Bar Segment (chi giu Union Pillar + CutPlane + Attachment co
+    tick) cong them 1 lop
     Remesh (Voxel) dung RIENG cho Sleeve, nen Bar Segment that khong bi dong cham. Neu Bar Design
     da Apply thi dung BarSegmentBackup (con nguyen modifier) vi Bar Segment da nuong luon phan cat.
     voxel None = lay props.sleeve_voxel; 0 = khong Remesh."""
@@ -3374,9 +3585,13 @@ def bar_source(context, coll, voxel=None):
     origin = props.bar_backup if valid_obj(props.bar_backup) else seg
     temp = origin.copy()
     temp.name = "BarSegment.sleeve_tmp"
+    bar_parts = sleeve_bar_part_names(props)
     for mod in list(temp.modifiers):
-        if not is_sleeve_source_modifier(mod):
+        if not is_sleeve_source_modifier(mod, bar_parts):
             temp.modifiers.remove(mod)
+        elif mod.name.startswith(ATT_PREFIX):
+            mod.show_viewport = True        # Disable Preview tat modifier Attachment: van phai ap len Bar
+            mod.show_render = True
     if voxel > 0.0:
         remesh = temp.modifiers.new(MOD_PREFIX + "SleeveRemesh", 'REMESH')
         remesh.mode = 'VOXEL'
@@ -3393,7 +3608,8 @@ def bar_source(context, coll, voxel=None):
 
 class RMVB_OT_create_sleeve_design(Operator):
     """Tao Sleeve: vo mong bao quanh be mat Bar Segment (da Boolean voi Bar Pillar, chua ap
-    Base va Attachment) voi offset + chieu day da chon, cat phan tiep xuc voi nuou"""
+    Base; chi ap Attachment co tick 'Attachment on Bar khi tao Sleeve') voi offset + chieu day
+    da chon, cat phan tiep xuc voi nuou"""
     bl_idname = "rmvb.create_sleeve_design"
     bl_label = "Create Sleeve Design"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3469,9 +3685,11 @@ class RMVB_OT_create_sleeve_design(Operator):
         props.sleeve_object = sleeve
         activate(context, sleeve)
         purge_unused_meshes()
-        self.report({'INFO'}, "Da tao Sleeve tu be mat Bar sau Union Pillar (chua cat nuou, chua ap Base / "
-                    "Attachment%s) roi cat nuou (offset %g mm, day %g mm%s)"
-                    % (", Remesh %g mm" % voxel if voxel > 0.0 else "", inner_gap, wall,
+        bar_att = len(sleeve_bar_part_names(props))
+        self.report({'INFO'}, "Da tao Sleeve tu be mat Bar sau Union Pillar (chua cat nuou, chua ap Base, "
+                    "%s%s) roi cat nuou (offset %g mm, day %g mm%s)"
+                    % ("ap %d Attachment tren Bar" % bar_att if bar_att else "chua ap Attachment tren Bar",
+                       ", Remesh %g mm" % voxel if voxel > 0.0 else "", inner_gap, wall,
                        ", da cat Gingiva" if cut_gingiva else ""))
         return {'FINISHED'}
 
@@ -3803,6 +4021,12 @@ class RMVB_PT_panel(Panel):
             if 0 <= props.group_index < len(props.groups):
                 group = props.groups[props.group_index]
                 box.prop(group, "name", text="Tên Attachment")
+                box.prop(group, "bar_in_sleeve")
+                box.prop(group, "center_bar")
+                box.prop(group, "align_x_bar")
+                if (group.center_bar or group.align_x_bar) and not valid_obj(props.bar_center):
+                    box.label(text="Chưa có Line Bar (≥ 2 điểm): vẽ line để căn giữa / canh trục X",
+                              icon=_ic('INFO'))
                 box.prop(group, "lock_topbar")
                 box.prop(group, "lock_rot_topbar")
                 box.prop(group, "lock_attachment")

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 1, 7),
+    "version": (0, 1, 8),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -439,6 +439,12 @@ class DLIB_PG_AttachmentEntry(PropertyGroup):
                     "(Boolean Difference khoet Part Bar khoi Bar). Duoc ap dung khi "
                     "Add Attachment ben Rmvb-Bar (them san modifier, mac dinh Disable Preview; Enable / "
                     "Disable Preview chi bat / tat Realtime Display in Viewport cua modifier do)")
+    bar_in_sleeve: BoolProperty(
+        name="Attachment on Bar khi tao Sleeve", default=False,
+        description="Tick = khi bam 'Create Sleeve Design' ben Rmvb-Bar, Part Bar cua Attachment nay "
+                    "VAN duoc ap len Bar (Union / Difference theo Add/Remove on Bar) truoc khi tao "
+                    "Sleeve. Bo tick = Attachment bi bo qua, Sleeve chi theo be mat Bar goc",
+        update=_update_color)       # ghi library.json ngay: Rmvb-Bar doc tu dia khi Add Attachment
     part_bar: StringProperty(name="Apply Part Bar", subtype='FILE_PATH', default="")
     part_bar_color: FloatVectorProperty(
         name="Mau Apply Part Bar",
@@ -495,6 +501,7 @@ def index_from_scene(context):
         item = {
             "name": entry.entry_name,
             "on_bar": bool(entry.on_bar),
+            "bar_in_sleeve": bool(entry.bar_in_sleeve),
             "part_bar": entry.part_bar,
             "part_bar_color": write_color(entry.part_bar_color),
             "on_sleeve": bool(entry.on_sleeve),
@@ -530,6 +537,7 @@ def _fill_group(group, data):
         entry = group.attachments.add()
         entry.entry_name = item.get("name", "Attachment")
         entry.on_bar = bool(item.get("on_bar", True))
+        entry.bar_in_sleeve = bool(item.get("bar_in_sleeve", False))
         entry.part_bar = item.get("part_bar", "")
         entry.part_bar_color = read_color(item.get("part_bar_color"),
                                           DEFAULT_PART_BAR_COLOR)
@@ -1171,6 +1179,7 @@ class DLIB_PT_panel(Panel):
                 continue
             _draw_slot(sub, "attachment", i, "part_bar", "Apply Part Bar",
                        'MESH_CUBE', entry.part_bar, toggle=(entry, "on_bar"))
+            sub.prop(entry, "bar_in_sleeve")
             _draw_slot(sub, "attachment", i, "part_sleeve", "Apply Part Sleeve",
                        'MESH_TORUS', entry.part_sleeve,
                        toggle=(entry, "on_sleeve"))
