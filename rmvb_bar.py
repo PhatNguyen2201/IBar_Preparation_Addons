@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 4, 11),
+    "version": (0, 4, 12),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -61,10 +61,10 @@ MM_TO_BU = 1.0
 
 COL_IMPORT = "Rmvb Import"
 COL_CONNECTION = "Rmvb Connections"
-COL_BARDESIGN = "BarDesign"          # Bar Pillar + Bar Segment (+ line, mui ten)
+COL_BARDESIGN = "BarDesign"          # Bar Pillar + Bar Segment (+ line)
 COL_PILLAR = COL_BARDESIGN
 COL_SEGMENT = COL_BARDESIGN
-COL_CUTPLANE = "CutPlane"            # PlaneVisual + PlaneCubeCut
+COL_CUTPLANE = "CutPlane"            # PlaneVisual + PlaneCubeCut + InsertionArrow
 COL_ATTACHMENT = "Rmvb Attachment"
 COL_SLEEVE = "Rmvb Sleeve"
 COL_PREVIEW = "Rmvb Preview"
@@ -1937,7 +1937,9 @@ def ensure_arrow(context, location):
     lap = huong canh ben cua Bar)."""
     props = context.scene.rmvb
     arrow = props.bar_arrow
-    if not valid_obj(arrow):
+    if valid_obj(arrow):
+        place_arrow(arrow)
+    else:
         arrow = bpy.data.objects.new(OBJ_ARROW, None)
         arrow.empty_display_type = 'SINGLE_ARROW'
         arrow.empty_display_size = 12.0
@@ -1945,9 +1947,16 @@ def ensure_arrow(context, location):
         arrow.color = (0.1, 0.9, 0.2, 1.0)
         arrow.location = location
         arrow["rmvb_role"] = "ARROW"
-        ensure_collection(COL_BARDESIGN).objects.link(arrow)
+        ensure_collection(COL_CUTPLANE).objects.link(arrow)
         props.bar_arrow = arrow
     return arrow
+
+
+def place_arrow(arrow):
+    """InsertionArrow nam cung collection voi PlaneVisual (CutPlane); file cu de no o BarDesign."""
+    coll = ensure_collection(COL_CUTPLANE)
+    if list(arrow.users_collection) != [coll]:
+        link_to(arrow, coll)
 
 
 def arrow_direction(arrow, depsgraph=None):
@@ -2322,6 +2331,8 @@ def rmvb_load_post(_dummy=None):
         props = getattr(scene, "rmvb", None)
         if props is None:
             continue
+        if valid_obj(props.bar_arrow):
+            place_arrow(props.bar_arrow)
         if valid_obj(props.bar_center) and props.bar_center.get("rmvb_guide_ver") != CENTER_GUIDE_VERSION:
             try:
                 guide = ensure_center_guide(props)     # dai phang / tuong ho kieu cu -> thay bang khoi kin
