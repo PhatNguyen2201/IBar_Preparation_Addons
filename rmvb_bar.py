@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -154,46 +154,92 @@ def dlib():
         return None
 
 
-def lib_connection_names():
+def lib_connection_group(name):
+    """Ten nhom cua Connection theo ten (chi dung duoc voi muc co ten duy nhat)."""
     lib = dlib()
-    return lib.connection_names() if lib else []
+    if lib is not None and hasattr(lib, "connection_group"):
+        return lib.connection_group(name) or ""
+    return ""
 
 
-def lib_attachment_names():
+def lib_group_aware():
+    """Dental-Lib dang chay co tra cuu theo cap (nhom, ten) khong (>= 0.4.0).
+
+    Thu vien cu chi loc duoc theo ten nen hai muc trung ten o hai nhom khac
+    nhau luon ve muc dau tien - dung no thi van hien du nhom tren menus."""
     lib = dlib()
-    return lib.attachment_names() if lib else []
+    return lib is not None and hasattr(lib, "connection_list")
 
 
-def lib_connection_asset(name, slot):
+def lib_connection_pairs():
+    """[(ten nhom, ten Connection), ...] theo thu tu thu vien. Dental-Lib cu
+    (khong co connection_list) thi suy nhom tu ten."""
     lib = dlib()
-    return lib.connection_asset(name, slot) if lib else ""
+    if lib is None:
+        return []
+    if lib_group_aware():
+        return list(lib.connection_list())
+    return [(lib_connection_group(name), name) for name in lib.connection_names()]
 
 
-def lib_attachment(name):
+def lib_attachment_group(name):
+    """Ten nhom cua Attachment theo ten (chi dung duoc voi muc co ten duy nhat)."""
     lib = dlib()
-    return lib.get_attachment(name) if lib else None
+    if lib is not None and hasattr(lib, "attachment_group"):
+        return lib.attachment_group(name) or ""
+    return ""
 
 
-def lib_visuals(name):
+def lib_attachment_pairs():
+    """[(ten nhom, ten Attachment), ...] theo thu tu thu vien."""
+    lib = dlib()
+    if lib is None:
+        return []
+    if lib_group_aware():
+        return list(lib.attachment_list())
+    return [(lib_attachment_group(name), name) for name in lib.attachment_names()]
+
+
+def lib_group_arg(group):
+    """Gia tri `group` tra cho API Dental-Lib: None (thu vien cu) = khong loc nhom."""
+    return group if lib_group_aware() else None
+
+
+def lib_connection_asset(name, slot, group=None):
+    lib = dlib()
+    return lib.connection_asset(name, slot, lib_group_arg(group)) if lib else ""
+
+
+def lib_attachment_asset(name, slot, group=None):
+    lib = dlib()
+    return lib.attachment_asset(name, slot, lib_group_arg(group)) if lib else ""
+
+
+def lib_attachment(name, group=None):
+    lib = dlib()
+    return lib.get_attachment(name, lib_group_arg(group)) if lib else None
+
+
+def lib_visuals(name, group=None):
     """[(label, abspath, rgba), ...] Visual Object kem mau cua tung object."""
     lib = dlib()
     if lib is None:
         return []
     if hasattr(lib, "attachment_visuals_rgba"):
-        return lib.attachment_visuals_rgba(name)
+        return lib.attachment_visuals_rgba(name, lib_group_arg(group))
     gray = getattr(lib, "DEFAULT_VISUAL_COLOR", (0.75, 0.75, 0.80, 1.0))
     return [(label, path, tuple(gray))
             for label, path in lib.attachment_visuals(name)]
 
 
-def lib_slot_color(name, slot):
+def lib_slot_color(name, slot, group=None):
     """Mau mac dinh cua Apply Part Bar / Apply Part Sleeve tu thu vien."""
     fallbacks = {"part_bar": FALLBACK_PART_BAR_COLOR,
                  "part_sleeve": FALLBACK_PART_SLEEVE_COLOR}
     lib = dlib()
     if lib is not None and hasattr(lib, "attachment_slot_color"):
         try:
-            return lib.attachment_slot_color(name, slot)
+            return lib.attachment_slot_color(name, slot, lib_group_arg(group))
         except Exception:
             pass
     return fallbacks.get(slot, FALLBACK_VISUAL_COLOR)
@@ -789,20 +835,74 @@ def parse_construction_info(filepath):
 #   EnumProperty dong: callback items tra ve chuoi tao moi nen Blender co the
 #   doc chuoi da bi giai phong -> chon muc trong dropdown khong an.
 # ---------------------------------------------------------------------------
-def get_connection_items():
-    return lib_connection_names()
+def get_connection_pairs():
+    """[(ten nhom, ten Connection), ...] - cap (nhom, ten) la khoa chinh cua muc."""
+    return lib_connection_pairs()
 
 
-def get_attachment_items():
-    return lib_attachment_names()
+def get_attachment_pairs():
+    """[(ten nhom, ten Attachment), ...]"""
+    return lib_attachment_pairs()
 
 
 def _clamp_index(value, count):
     return max(0, min(int(value), max(0, count - 1)))
 
 
+def duplicate_library_names(pairs):
+    """Ten moc xuat hien nhieu lan trong thu vien (o cac nhom khac nhau)."""
+    counts = {}
+    for _group, name in pairs:
+        counts[name] = counts.get(name, 0) + 1
+    return {name for name, count in counts.items() if count > 1}
+
+
+def pair_label(group, name, duplicates=()):
+    """Nhan hien thi trong menus: ten muc; ten bi trung thi gan them (ten nhom)
+    de hai muc trung ten van nhin thay khac nhau tren man hinh."""
+    if name not in duplicates:
+        return name
+    return "%s (%s)" % (name, group) if group else "%s (chưa nhóm)" % name
+
+
+def pair_text(group, name):
+    """Chuoi day du "Nhóm / Tên" cho nut dang chon; rong khi chua chon muc nao."""
+    if not name:
+        return ""
+    return "%s / %s" % (group, name) if group else name
+
+
+def resolve_pair(pairs, group, name, index):
+    """(nhom, ten) duoc chon trong thu vien.
+
+    Thu tu uu tien: khop dung (nhom, ten) -> khop theo ten (nhom bi doi ten / xoa,
+    hoac file .blend cu chua luu nhom) -> theo vi tri `index`.
+    File cu ma thu vien co muc trung ten thi lan dau mo len co the chon ve muc
+    chua nhom thay vi muc dau tien nhu truoc day - nut tren panel hien day du
+    "Nhóm / Tên" nen chi can chon lai muc can dung là đủ."""
+    if not pairs:
+        return ("", "")
+    if name:
+        if (group, name) in pairs:
+            return (group, name)
+        for pair in pairs:
+            if pair[1] == name:
+                return pair
+    return pairs[_clamp_index(index, len(pairs))]
+
+
+def pair_matches(item_group, item_name, group, name):
+    """Muc da dat (item_group, item_name) co phai la muc (group, name) khong;
+    file cu chua luu nhom thi khop theo ten."""
+    return item_name == name and (not item_group or item_group == group)
+
+
 class RMVB_OT_pick_library_item(Operator):
-    """Chon Connection Base / Attachment trong thu vien Dental-Lib"""
+    """Chon Connection Base / Attachment trong thu vien Dental-Lib
+
+    `index` = vi tri muc trong danh sach thu vien nen hai muc trung ten o hai
+    nhom khac nhau la hai muc khac nhau (truoc day tra cuu theo ten nen chi
+    lay duoc muc dau tien)"""
     bl_idname = "rmvb.pick_library_item"
     bl_label = "Chon muc thu vien"
     bl_options = {'INTERNAL'}
@@ -815,82 +915,71 @@ class RMVB_OT_pick_library_item(Operator):
 
     def execute(self, context):
         props = context.scene.rmvb
+        pairs = (get_connection_pairs() if self.kind == 'CONNECTION'
+                 else get_attachment_pairs())
+        if not pairs:
+            return {'CANCELLED'}
+        index = _clamp_index(self.index, len(pairs))
+        group, name = pairs[index]
         if self.kind == 'CONNECTION':
-            names = get_connection_items()
-            props.connection_index = _clamp_index(self.index, len(names))
-            props.connection_name = names[props.connection_index] if names else ""
+            props.connection_index = index
+            props.connection_group = group
+            props.connection_name = name
         else:
-            names = get_attachment_items()
-            props.attachment_index = _clamp_index(self.index, len(names))
-            props.active_attachment = names[props.attachment_index] if names else ""
+            props.attachment_index = index
+            props.attachment_group = group
+            props.active_attachment = name
         for area in context.screen.areas:
             area.tag_redraw()
         return {'FINISHED'}
 
 
-def _draw_library_menu(layout, kind, names, icon):
-    if not names:
+def grouped_library_pairs(pairs):
+    """[(ten nhom, [(ten nhom, ten muc, vi tri), ...]), ...]: nhom dat ten theo
+    ABC, "" (chua nhom) o cuoi; trong moi nhom giu thu tu thu vien."""
+    buckets = {}
+    for position, (group, name) in enumerate(pairs):
+        buckets.setdefault(group, []).append((group, name, position))
+    out = [(key, buckets[key]) for key in sorted((k for k in buckets if k), key=str.casefold)]
+    if "" in buckets:
+        out.append(("", buckets[""]))
+    return out
+
+
+def _draw_grouped_pick(layout, kind, pairs, icon):
+    """Menu chon muc thu vien gom theo nhom (tieu de thu muc + cac muc); chua co
+    nhom nao thi danh sach phang. Chi so gui cho operator la vi tri trong danh
+    sach thu vien nen muc trung ten o nhom khac van chon duoc tung muc."""
+    if not pairs:
         layout.label(text="(Trống - thêm mục trong Dental-Lib)", icon='ERROR')
         return
-    for index, name in enumerate(names):
-        op = layout.operator(RMVB_OT_pick_library_item.bl_idname, text=name, icon=icon)
-        op.kind = kind
-        op.index = index
-
-
-def lib_connection_groups(names):
-    """[(ten nhom, [ten Connection, ...]), ...] theo Dental-Lib; thu vien cu khong co nhom -> 1 nhom ""."""
-    lib = dlib()
-    if lib is not None and hasattr(lib, "connection_groups"):
-        groups = lib.connection_groups()
-        if groups:
-            return groups
-    return [("", list(names))]
-
-
-def _draw_grouped_pick(layout, kind, names, groups, icon):
-    """Menu chon muc thu vien gom theo nhom (tieu de thu muc + cac muc); chua co nhom nao thi danh sach phang.
-    Chi so gui cho operator la vi tri trong danh sach thu vien."""
-    if not any(group for group, _members in groups):
-        _draw_library_menu(layout, kind, names, icon)
-        return
-    index_of = {name: index for index, name in enumerate(names)}
+    groups = grouped_library_pairs(pairs)
+    duplicates = duplicate_library_names(pairs)
+    named = any(group for group, _members in groups)
     for position, (group, members) in enumerate(groups):
-        if position:
-            layout.separator()
-        layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
-        for name in members:
-            if name not in index_of:
-                continue
-            op = layout.operator(RMVB_OT_pick_library_item.bl_idname, text=name, icon=icon)
+        if named:
+            if position:
+                layout.separator()
+            layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
+        for _group, name, index in members:
+            op = layout.operator(RMVB_OT_pick_library_item.bl_idname,
+                                 text=pair_label(group, name, duplicates), icon=icon)
             op.kind = kind
-            op.index = index_of[name]
+            op.index = index
 
 
 class RMVB_MT_pick_connection(Menu):
     bl_label = "Select Connection Base"
 
     def draw(self, context):
-        names = get_connection_items()
-        _draw_grouped_pick(self.layout, 'CONNECTION', names, lib_connection_groups(names), 'MESH_CYLINDER')
-
-
-def lib_attachment_groups(names):
-    """[(ten nhom, [ten Attachment, ...]), ...] theo Dental-Lib; thu vien cu khong co nhom -> 1 nhom ""."""
-    lib = dlib()
-    if lib is not None and hasattr(lib, "attachment_groups"):
-        groups = lib.attachment_groups()
-        if groups:
-            return groups
-    return [("", list(names))]
+        _draw_grouped_pick(self.layout, 'CONNECTION', get_connection_pairs(), 'MESH_CYLINDER')
 
 
 class RMVB_MT_pick_attachment(Menu):
     bl_label = "Select Attachment"
 
     def draw(self, context):
-        names = get_attachment_items()
-        _draw_grouped_pick(self.layout, 'ATTACHMENT', names, lib_attachment_groups(names), 'MESH_CUBE')
+        _draw_grouped_pick(self.layout, 'ATTACHMENT', get_attachment_pairs(), 'MESH_CUBE')
 
 
 def _save_dir_get(self):
@@ -993,6 +1082,10 @@ def _gingiva_offset_sleeve_update(self, context):
 class RMVB_PG_PlacedConnection(PropertyGroup):
     tooth: StringProperty(name="Tooth", default="?")
     lib_name: StringProperty(name="Library", default="")
+    lib_group: StringProperty(
+        name="Library Group", default="",
+        description="Ten nhom (thu muc) cua Connection Base da dat trong thu vien "
+                    "Dental-Lib - dung cung Library de phan biet cac muc trung ten")
     group_object: PointerProperty(name="Implant group", type=bpy.types.Object)
     base_object: PointerProperty(name="Base", type=bpy.types.Object)
     visual_object: PointerProperty(name="ConnectionVisual", type=bpy.types.Object)
@@ -1014,6 +1107,10 @@ class RMVB_PG_AttachmentGroup(PropertyGroup):
                     "thu vien). Doi ten se doi ten Empty cua group",
         default="", update=_group_name_update)
     lib_name: StringProperty(name="Library", default="")
+    lib_group: StringProperty(
+        name="Library Group", default="",
+        description="Ten nhom (thu muc) cua Attachment trong thu vien Dental-Lib - "
+                    "dung cung Library de phan biet cac muc trung ten")
     empty: PointerProperty(name="Group", type=bpy.types.Object)
     part_bar: PointerProperty(name="Part Bar", type=bpy.types.Object)
     part_sleeve: PointerProperty(name="Part Sleeve", type=bpy.types.Object)
@@ -1090,6 +1187,11 @@ class RMVB_PG_props(PropertyGroup):
 
     # Connection Base + constructionInfo
     connection_index: IntProperty(name="Connection Index", default=0, min=0)
+    connection_group: StringProperty(
+        name="Connection Group", default="",
+        description="Ten nhom (thu muc) cua Connection Base dang chon trong thu vien "
+                    "Dental-Lib; truy xuat theo ca nhom lan ten nen hai muc trung ten "
+                    "o hai nhom khac nhau chon duoc tung muc")
     connection_name: StringProperty(name="Connection Name", default="")
     construction_file: StringProperty(name="constructionInfo",
                                       subtype='FILE_PATH', default="")
@@ -1132,6 +1234,11 @@ class RMVB_PG_props(PropertyGroup):
 
     # Attachment
     attachment_index: IntProperty(name="Attachment Index", default=0, min=0)
+    attachment_group: StringProperty(
+        name="Attachment Group", default="",
+        description="Ten nhom (thu muc) cua Attachment dang chon trong thu vien "
+                    "Dental-Lib; truy xuat theo ca nhom lan ten nen hai muc trung "
+                    "ten o hai nhom khac nhau chon duoc tung muc")
     active_attachment: StringProperty(name="Attachment", default="")
     groups: CollectionProperty(type=RMVB_PG_AttachmentGroup)
     group_index: IntProperty(name="Group Index", default=0, min=0,
@@ -1512,14 +1619,11 @@ def clear_placed_connections(context, remove_pillars=False):
         props.pillars.clear()
 
 
-def current_connection_name(props):
-    name = props.connection_name
-    names = get_connection_items()
-    if name in names:
-        return name
-    if names:
-        return names[min(props.connection_index, len(names) - 1)]
-    return ""
+def current_connection(props):
+    """(nhom, ten) Connection Base dang chon - loc theo ca nhom lan ten nen ten
+    trung o nhom khac khong bi resolve nham ve muc dau tien."""
+    return resolve_pair(get_connection_pairs(), props.connection_group,
+                        props.connection_name, props.connection_index)
 
 
 def prepare_connection_mesh(source):
@@ -1638,13 +1742,15 @@ CONN_PART_STYLE = {
 CONN_PART_FIELD = (("analog", "analog_object"), ("screw", "screw_object"))
 
 
-def make_connection_kit(lib_name):
+def make_connection_kit(lib_name, lib_group=""):
     """Bo mesh cua 1 Connection Base trong thu vien (dung chung cho nhieu implant):
     Base da extrude (khoi Boolean), hinh hien thi cua Base goc, Analog / Screw.
+    `lib_group` chon dung muc khi thu vien co nhieu Connection trung ten.
     Raise FileNotFoundError neu thu vien chua co mesh Base."""
-    base_path = lib_connection_asset(lib_name, "base")
+    base_path = lib_connection_asset(lib_name, "base", lib_group)
     if not base_path or not os.path.exists(base_path):
-        raise FileNotFoundError("Connection '%s' chua co mesh Base" % lib_name)
+        raise FileNotFoundError("Connection '%s' chua co mesh Base"
+                                % pair_text(lib_group, lib_name))
     source_mesh = mesh_from_file(base_path)
     base_mesh, base_info = prepare_connection_mesh(source_mesh)
 
@@ -1662,15 +1768,16 @@ def make_connection_kit(lib_name):
     parts = {}
     warnings = []
     for slot, _field in CONN_PART_FIELD:
-        asset = lib_connection_asset(lib_name, slot)
+        asset = lib_connection_asset(lib_name, slot, lib_group)
         if asset and os.path.exists(asset):
             try:
                 parts[slot] = mesh_from_file(asset).copy()
                 parts[slot].name = "Rmvb_Conn_" + slot
             except Exception as exc:
                 warnings.append("%s: %s" % (slot, exc))
-    return {"lib_name": lib_name, "base": base_mesh, "info": base_info,
-            "visual": visual_mesh, "parts": parts, "warnings": warnings}
+    return {"lib_name": lib_name, "lib_group": lib_group, "base": base_mesh,
+            "info": base_info, "visual": visual_mesh, "parts": parts,
+            "warnings": warnings}
 
 
 def populate_implant(item, group, kit, coll):
@@ -1678,6 +1785,7 @@ def populate_implant(item, group, kit, coll):
     va ghi vao `item` (RMVB_PG_PlacedConnection)."""
     tooth = item.tooth
     item.lib_name = kit["lib_name"]
+    item.lib_group = kit.get("lib_group", "")
     # Base da xu ly (extrude) chi dung lam khoi Boolean -> an
     obj = object_from_mesh("Conn_%s_Base" % tooth, kit["base"], coll)
     attach_to(obj, group)
@@ -1725,15 +1833,16 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             self.report({'ERROR'}, "Khong tim thay file constructionInfo")
             return {'CANCELLED'}
 
-        lib_name = current_connection_name(props)
+        lib_group, lib_name = current_connection(props)
         if not lib_name:
             self.report({'ERROR'},
                         "Chua chon Connection Base trong thu vien Dental-Lib")
             return {'CANCELLED'}
 
-        base_path = lib_connection_asset(lib_name, "base")
+        base_path = lib_connection_asset(lib_name, "base", lib_group)
         if not base_path or not os.path.exists(base_path):
-            self.report({'ERROR'}, "Connection '%s' chua co mesh Base" % lib_name)
+            self.report({'ERROR'}, "Connection '%s' chua co mesh Base"
+                        % pair_text(lib_group, lib_name))
             return {'CANCELLED'}
 
         try:
@@ -1747,7 +1856,7 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
-            kit = make_connection_kit(lib_name)
+            kit = make_connection_kit(lib_name, lib_group)
         except Exception as exc:
             self.report({'ERROR'}, "Loi doc mesh Base: %s" % exc)
             return {'CANCELLED'}
@@ -1791,6 +1900,7 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             populate_implant(item, group, kit, coll)
 
         props.construction_file = path
+        props.connection_group = lib_group
         props.connection_name = lib_name
         props.org_active = org is not None
         props.org_folder = org_folder if org is not None else ""
@@ -1801,7 +1911,7 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
             self.report({'WARNING'}, "Base co %d vung ho (can 2: day + dinh)"
                         % base_info["loops"])
         self.report({'INFO'}, "Da dat %d Connection (%s) tu %s%s%s"
-                    % (len(implants), lib_name, os.path.basename(path),
+                    % (len(implants), pair_text(lib_group, lib_name), os.path.basename(path),
                        " + transform theo before/transform.txt" if org is not None else "",
                        "" if base_info["closed"] else " (Base chua kin)"))
         return {'FINISHED'}
@@ -1809,23 +1919,27 @@ class RMVB_OT_place_connection(Operator, ImportHelper):
 
 def draw_implant_connection_choices(layout, props, index):
     """Danh sach Connection Base trong thu vien de doi cho implant `index` (muc dang dung co dau tick);
-    gom theo nhom Implant Connection cua Dental-Lib neu co."""
-    names = get_connection_items()
-    if not names:
+    gom theo nhom Implant Connection cua Dental-Lib va phan biet cac muc trung ten."""
+    pairs = get_connection_pairs()
+    if not pairs:
         layout.label(text="(Trống - thêm mục trong Dental-Lib)", icon='ERROR')
         return
-    current = props.placed[index].lib_name if 0 <= index < len(props.placed) else ""
-    groups = lib_connection_groups(names)
-    named = any(group for group, _members in groups)
-    for position, (group, members) in enumerate(groups):
+    item = props.placed[index] if 0 <= index < len(props.placed) else None
+    duplicates = duplicate_library_names(pairs)
+    named = any(group for group, _name in pairs)
+    for position, (group, members) in enumerate(grouped_library_pairs(pairs)):
         if named:
             if position:
                 layout.separator()
             layout.label(text=group or "(Chưa nhóm)", icon='FILE_FOLDER')
-        for name in members:
-            op = layout.operator(RMVB_OT_set_implant_connection.bl_idname, text=name,
-                                 icon='CHECKMARK' if name == current else 'MESH_CYLINDER')
+        for _group, name, _i in members:
+            used = item is not None and pair_matches(item.lib_group, item.lib_name,
+                                                     group, name)
+            op = layout.operator(RMVB_OT_set_implant_connection.bl_idname,
+                                 text=pair_label(group, name, duplicates),
+                                 icon='CHECKMARK' if used else 'MESH_CYLINDER')
             op.index = index
+            op.group = group
             op.connection = name
 
 
@@ -1859,6 +1973,8 @@ class RMVB_OT_set_implant_connection(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     index: IntProperty(default=0, min=0)
+    group: StringProperty(default="",
+                          description="Ten nhom (thu muc) cua Connection trong thu vien")
     connection: StringProperty(default="")
 
     def execute(self, context):
@@ -1874,23 +1990,27 @@ class RMVB_OT_set_implant_connection(Operator):
         if not valid_obj(item.group_object):
             self.report({'ERROR'}, "Implant %s mat nhom Plain Axes - bam Place Connection lai" % item.tooth)
             return {'CANCELLED'}
-        if self.connection not in get_connection_items():
-            self.report({'ERROR'}, "Connection '%s' khong co trong thu vien Dental-Lib" % self.connection)
+        if (self.group, self.connection) not in get_connection_pairs():
+            self.report({'ERROR'}, "Connection '%s' khong co trong thu vien Dental-Lib"
+                        % pair_text(self.group, self.connection))
             return {'CANCELLED'}
-        if item.lib_name == self.connection and valid_obj(item.base_object):
-            self.report({'INFO'}, "Rang %s da dung Connection '%s'" % (item.tooth, self.connection))
+        if item.lib_name == self.connection and item.lib_group == self.group \
+                and valid_obj(item.base_object):
+            self.report({'INFO'}, "Rang %s da dung Connection '%s'"
+                        % (item.tooth, pair_text(self.group, self.connection)))
             return {'CANCELLED'}
         try:
-            kit = make_connection_kit(self.connection)
+            kit = make_connection_kit(self.connection, self.group)
         except Exception as exc:
-            self.report({'ERROR'}, "Loi doc mesh Base cua '%s': %s" % (self.connection, exc))
+            self.report({'ERROR'}, "Loi doc mesh Base cua '%s': %s"
+                        % (pair_text(self.group, self.connection), exc))
             return {'CANCELLED'}
         for warning in kit["warnings"]:
             self.report({'WARNING'}, warning)
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        old_name = item.lib_name
+        old_name = pair_text(item.lib_group, item.lib_name)
         remove_implant_parts(item)
         populate_implant(item, item.group_object, kit, ensure_collection(COL_CONNECTION))
         if valid_obj(seg) and cut_preview_enabled(seg):
@@ -1898,7 +2018,8 @@ class RMVB_OT_set_implant_connection(Operator):
         rebuild_segment_modifiers(context)           # CutBase tro vao Base moi
         purge_unused_meshes()
         stale = any(ref.tooth == item.tooth for ref in props.pillars)
-        self.report({'INFO'}, "Rang %s: Connection '%s' -> '%s'" % (item.tooth, old_name, self.connection))
+        self.report({'INFO'}, "Rang %s: Connection '%s' -> '%s'"
+                    % (item.tooth, old_name, pair_text(self.group, self.connection)))
         if stale:
             self.report({'WARNING'}, "Bar Pillar rang %s dang tao tu Base cu - chon implant (Plain Axes) hoac "
                         "Pillar cua rang nay roi bam Create/Reset bar pillar de dung lai theo Base moi" % item.tooth)
@@ -3671,13 +3792,10 @@ class RMVB_OT_disable_cut_preview(Operator):
 # ---------------------------------------------------------------------------
 # Attachment: moi lan Add = 1 group (Empty cha + Part Bar + Part Sleeve + Visual)
 # ---------------------------------------------------------------------------
-def current_attachment_name(props):
-    names = get_attachment_items()
-    if props.active_attachment in names:
-        return props.active_attachment
-    if names:
-        return names[min(props.attachment_index, len(names) - 1)]
-    return ""
+def current_attachment(props):
+    """(nhom, ten) Attachment dang chon - loc theo ca nhom lan ten."""
+    return resolve_pair(get_attachment_pairs(), props.attachment_group,
+                        props.active_attachment, props.attachment_index)
 
 
 def slugify(text):
@@ -3904,23 +4022,24 @@ class RMVB_OT_add_attachment(Operator):
     def execute(self, context):
         props = context.scene.rmvb
         context.view_layer.update()
-        name = current_attachment_name(props)
+        lib_group, name = current_attachment(props)
         if not name:
             self.report({'ERROR'}, "Chua chon Attachment trong Dental-Lib")
             return {'CANCELLED'}
-        entry = lib_attachment(name) or {}
+        entry = lib_attachment(name, lib_group) or {}
         lib = dlib()
         assets = {}
         for slot in ("part_bar", "part_sleeve"):
-            path = lib.attachment_asset(name, slot) if lib else ""
+            path = lib_attachment_asset(name, slot, lib_group) if lib else ""
             if path and os.path.exists(path):
                 try:
                     assets[slot] = mesh_from_file(path)
                 except Exception as exc:
-                    self.report({'WARNING'}, "Loi doc %s cua '%s': %s" % (slot, name, exc))
+                    self.report({'WARNING'}, "Loi doc %s cua '%s': %s"
+                                % (slot, pair_text(lib_group, name), exc))
         visuals = []
         if lib:
-            for slot, path, rgba in lib_visuals(name):
+            for slot, path, rgba in lib_visuals(name, lib_group):
                 if not path or not os.path.exists(path):
                     continue
                 try:
@@ -3928,7 +4047,8 @@ class RMVB_OT_add_attachment(Operator):
                 except Exception as exc:
                     self.report({'WARNING'}, "Loi doc Visual Object '%s': %s" % (slot, exc))
         if not assets and not visuals:
-            self.report({'ERROR'}, "Attachment '%s' chua co mesh nao (STL/PLY)" % name)
+            self.report({'ERROR'}, "Attachment '%s' chua co mesh nao (STL/PLY)"
+                        % pair_text(lib_group, name))
             return {'CANCELLED'}
 
         coll = ensure_collection(COL_ATTACHMENT)
@@ -3947,6 +4067,7 @@ class RMVB_OT_add_attachment(Operator):
         group["prev_name"] = gname
         group.name = gname
         group.lib_name = name
+        group.lib_group = lib_group
         group.on_bar = bool(entry.get("on_bar", True))
         group.bar_in_sleeve = bool(entry.get("bar_in_sleeve", False))
         group.on_sleeve = bool(entry.get("on_sleeve", False))
@@ -3958,15 +4079,17 @@ class RMVB_OT_add_attachment(Operator):
                 continue
             obj = object_from_mesh("%s_%s" % (gname, slot), mesh, coll)
             attach_to(obj, empty)
-            set_display_color(obj, lib_slot_color(name, slot))
+            set_display_color(obj, lib_slot_color(name, slot, lib_group))
             obj["rmvb_role"] = role
             obj["rmvb_attachment"] = name
+            obj["rmvb_attachment_group"] = lib_group
             setattr(group, field, obj)
         for label, mesh, rgba in visuals:
             vobj = object_from_mesh("%s_%s" % (gname, slugify(label)), mesh, coll)
             attach_to(vobj, empty)
             vobj["rmvb_role"] = "VISUAL"
             vobj["rmvb_attachment"] = name
+            vobj["rmvb_attachment_group"] = lib_group
             set_display_color(vobj, rgba)
             ref = group.visuals.add()
             ref.object = vobj
@@ -4663,7 +4786,7 @@ class RMVB_PT_panel(Panel):
         box.label(text="2. Connection Base", icon=_ic('MESH_CYLINDER'))
         box.label(text="Select Connection Base")
         box.menu("RMVB_MT_pick_connection",
-                 text=current_connection_name(props) or "(Trống)",
+                 text=pair_text(*current_connection(props)) or "(Trống)",
                  icon=_ic('MESH_CYLINDER'))
         box.prop(props, "use_org_txt")
         row = box.row(align=True)
@@ -4683,7 +4806,8 @@ class RMVB_PT_panel(Panel):
                 split = col.split(factor=0.3, align=True)
                 split.label(text="Răng %s" % item.tooth)
                 op = split.operator(RMVB_OT_choose_implant_connection.bl_idname,
-                                    text=item.lib_name or "(?)", icon=_ic('DOWNARROW_HLT'))
+                                    text=pair_text(item.lib_group, item.lib_name) or "(?)",
+                                    icon=_ic('DOWNARROW_HLT'))
                 op.index = index
             if props.org_active:
                 box.label(text="Tọa độ: transform theo before/transform.txt", icon=_ic('ORIENTATION_GLOBAL'))
@@ -4751,7 +4875,7 @@ class RMVB_PT_panel(Panel):
         box.label(text="5. Attachment", icon=_ic('MESH_CUBE'))
         box.label(text="Select Attachment")
         box.menu("RMVB_MT_pick_attachment",
-                 text=current_attachment_name(props) or "(Trống)",
+                 text=pair_text(*current_attachment(props)) or "(Trống)",
                  icon=_ic('MESH_CUBE'))
         box.operator(RMVB_OT_add_attachment.bl_idname,
                      text="Add selected Attachment", icon=_ic('ADD'))
@@ -4761,6 +4885,9 @@ class RMVB_PT_panel(Panel):
             if 0 <= props.group_index < len(props.groups):
                 group = props.groups[props.group_index]
                 box.prop(group, "name", text="Tên Attachment")
+                box.label(text="Từ thư viện: %s" % (pair_text(group.lib_group, group.lib_name)
+                                                    or "(chưa có)"),
+                          icon=_ic('FILE_FOLDER'))
                 box.prop(group, "bar_in_sleeve")
                 box.prop(group, "center_bar")
                 row = box.row(align=True)

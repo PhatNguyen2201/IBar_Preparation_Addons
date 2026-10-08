@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dental-Lib",
     "author": "Phat Nguyen",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Dental-Lib",
     "description": "Thu vien Connection Base (Implant Connection) va Attachment cho Rmvb-Bar",
@@ -33,8 +33,13 @@ Du luu ben vung trong <lib_dir>/library.json; asset duoc copy vao
 <lib_dir>/connections/<Name>/ va <lib_dir>/attachments/<Name>/ de thu vien
 chuyen duoc giua may. Add-on khac (Rmvb-Bar) truy cap qua API module:
     import dental_lib
-    dental_lib.connection_names() / get_connection(name)
-    dental_lib.attachment_names() / get_attachment(name)
+    dental_lib.connection_names() / connection_list() / get_connection(name, group)
+    dental_lib.attachment_names() / attachment_list() / get_attachment(name, group)
+Ten muc KHONG duoc dam bao duy nhat (hai Connection / Attachment o hai nhom khac
+nhau co the trung ten), nen moi ham tra cuu deu nhan them `group`:
+    group=None  : khong loc nhom -> muc dau tien co ten trung (thu vien cu)
+    group=""    : muc chua nhom
+    group="X"   : muc thuoc nhom X; khong thay thi quay ve theo ten
 """
 
 import bpy
@@ -582,22 +587,49 @@ def resolve_asset(ref):
 
 # ---------------------------------------------------------------------------
 # API cho add-on khac (Rmvb-Bar)
+#   Moi muc duoc nhan dien bang cap (ten nhom, ten muc): thu vien cho phep hai
+#   muc o hai nhom khac nhau trung ten, nen loc theo ten khong thi du.
 # ---------------------------------------------------------------------------
-def connection_names():
-    return [c.get("name", "") for c in read_index()["connections"] if c.get("name")]
+def _entry_group(entry):
+    return str(entry.get("group", "") or "").strip()
 
 
-def get_connection(name):
-    for entry in read_index()["connections"]:
+def _find_entry(entries, name, group=None):
+    """Muc co ten `name`; `group` = loc theo ten nhom (None: bo qua nhom).
+
+    Dat `group` thi uu tien khop dung (nhom, ten); neu khong thay (nhom bi doi
+    ten / xoa, file .blend luu nhom cu) thi quay ve khop theo ten."""
+    if group is not None:
+        for entry in entries:
+            if entry.get("name") == name and _entry_group(entry) == group:
+                return entry
+    for entry in entries:
         if entry.get("name") == name:
             return entry
     return None
 
 
+def connection_names():
+    return [c.get("name", "") for c in read_index()["connections"] if c.get("name")]
+
+
+def connection_list():
+    """[(ten nhom, ten Connection), ...] theo thu tu thu vien; vi tri trong danh
+    sach la chi so dung chung voi menus cua add-on khac (Rmvb-Bar)."""
+    return [(_entry_group(c), c.get("name", ""))
+            for c in read_index()["connections"] if c.get("name")]
+
+
+def get_connection(name, group=None):
+    """Muc Connection theo ten; `group` duoc cung cap thi khop dung nhom truoc,
+    de ten trung o nhom khac khong bi resolve ve muc dau tien."""
+    return _find_entry(read_index()["connections"], name, group)
+
+
 def connection_group(name):
     """Ten nhom cua Connection ("" = chua nhom)."""
     entry = get_connection(name)
-    return str(entry.get("group", "") or "").strip() if entry else ""
+    return _entry_group(entry) if entry else ""
 
 
 def _scanbody_refs(item):
@@ -609,14 +641,14 @@ def _scanbody_refs(item):
     return [str(ref) for ref in refs if ref]
 
 
-def connection_scanbodies(name):
+def connection_scanbodies(name, group=None):
     """[duong dan tuyet doi, ...] cac file Scanbody cua Connection: danh sach rieng neu co, khong thi danh sach
     chung cua nhom (ke thua). Phan tu co the tro toi file khong con tren dia."""
-    entry = get_connection(name)
+    entry = get_connection(name, group)
     if not entry:
         return []
     refs = _scanbody_refs(entry)
-    group = str(entry.get("group", "") or "").strip()
+    group = _entry_group(entry)
     if not refs and group:
         for item in read_index().get("connection_groups", []):
             if item.get("name") == group:
@@ -624,20 +656,20 @@ def connection_scanbodies(name):
     return [resolve_asset(ref) for ref in refs]
 
 
-def connection_asset(name, slot):
+def connection_asset(name, slot, group=None):
     """File mesh cua mot thanh phan (base|analog|screw|scanbody): file rieng cua Connection neu co, khong
     thi file chung cua nhom ma Connection thuoc ve (ke thua). Scanbody co nhieu file: slot "scanbody" tra ve
-    file dau tien, day du xem connection_scanbodies()."""
+    file dau tien, day du xem connection_scanbodies(). `group` chon dung muc khi thu vien co ten trung."""
     if slot == "scanbody":
-        found = connection_scanbodies(name)
+        found = connection_scanbodies(name, group)
         return found[0] if found else ""
-    entry = get_connection(name)
+    entry = get_connection(name, group)
     if not entry:
         return ""
     own = entry.get(slot, "")
     if own:
         return resolve_asset(own)
-    group = str(entry.get("group", "") or "").strip()
+    group = _entry_group(entry)
     if group:
         for item in read_index().get("connection_groups", []):
             if item.get("name") == group:
@@ -655,10 +687,16 @@ def attachment_names():
     return [a.get("name", "") for a in read_index()["attachments"] if a.get("name")]
 
 
+def attachment_list():
+    """[(ten nhom, ten Attachment), ...] theo thu tu thu vien (chi so nhu attachment_names())."""
+    return [(_entry_group(a), a.get("name", ""))
+            for a in read_index()["attachments"] if a.get("name")]
+
+
 def attachment_group(name):
     """Ten nhom cua Attachment ("" = chua nhom)."""
     entry = get_attachment(name)
-    return str(entry.get("group", "") or "").strip() if entry else ""
+    return _entry_group(entry) if entry else ""
 
 
 def _grouped_names(entries):
@@ -678,23 +716,21 @@ def attachment_groups():
     return _grouped_names(read_index()["attachments"])
 
 
-def get_attachment(name):
-    for entry in read_index()["attachments"]:
-        if entry.get("name") == name:
-            return entry
-    return None
+def get_attachment(name, group=None):
+    """Muc Attachment theo ten; `group` duoc cung cap thi khop dung nhom truoc."""
+    return _find_entry(read_index()["attachments"], name, group)
 
 
-def attachment_asset(name, slot):
-    entry = get_attachment(name)
+def attachment_asset(name, slot, group=None):
+    entry = get_attachment(name, group)
     if not entry:
         return ""
     return resolve_asset(entry.get(slot, ""))
 
 
-def attachment_visuals(name):
+def attachment_visuals(name, group=None):
     """[(label, abspath), ...] cac Visual Object cua Attachment."""
-    entry = get_attachment(name)
+    entry = get_attachment(name, group)
     if not entry:
         return []
     out = []
@@ -704,9 +740,9 @@ def attachment_visuals(name):
     return out
 
 
-def attachment_visuals_rgba(name):
+def attachment_visuals_rgba(name, group=None):
     """[(label, abspath, (r, g, b, a)), ...] - Visual Object kem mau cua no."""
-    entry = get_attachment(name)
+    entry = get_attachment(name, group)
     if not entry:
         return []
     out = []
@@ -717,10 +753,10 @@ def attachment_visuals_rgba(name):
     return out
 
 
-def attachment_slot_color(name, slot):
+def attachment_slot_color(name, slot, group=None):
     """RGBA mac dinh/da luu cua Apply Part Bar | Apply Part Sleeve."""
     fallback = SLOT_DEFAULT_COLOR.get(slot, DEFAULT_VISUAL_COLOR)
-    entry = get_attachment(name)
+    entry = get_attachment(name, group)
     if not entry:
         return tuple(fallback)
     return read_color(entry.get(SLOT_COLOR_FIELD.get(slot, ""), None), fallback)
