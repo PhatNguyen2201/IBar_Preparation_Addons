@@ -1370,6 +1370,36 @@ def face_components(bm):
     return comps
 
 
+def remove_disconnected_islands(mesh, keep=1):
+    """Xoa cac island roi khoi mesh, chi giu lai `keep` thanh phan lon nhat.
+
+    Dung cho ban copy tam truoc khi xuat STL cua Bar / Sleeve de loai cac
+    manh roi do Boolean de lai ma khong sua object dang hien trong scene.
+    """
+    info = {"components": 0, "removed_components": 0, "removed_faces": 0}
+    if mesh is None:
+        return info
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    comps = face_components(bm)
+    info["components"] = len(comps)
+    keep = max(1, int(keep))
+    if len(comps) <= keep:
+        bm.free()
+        return info
+    trash = comps[keep:]
+    trash_verts = {vert for comp in trash for face in comp for vert in face.verts}
+    info["removed_components"] = len(trash)
+    info["removed_faces"] = sum(len(comp) for comp in trash)
+    bmesh.ops.delete(bm, geom=list(trash_verts), context='VERTS')
+    outward_solid(bm)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.validate()
+    mesh.update()
+    return info
+
+
 def repair_manifold(bm, rounds=8):
     """Xoa canh > 2 mat va dinh KHONG-manifold (that nut o vanh, dinh roi) cho den khi sach.
 
@@ -4734,18 +4764,21 @@ class RMVB_OT_save_design(Operator):
         back = org_matrix_from_props(props).inverted() if props.org_active else None
         stamp = timestamp()
         saved = []
+        cleaned = []
         for prefix, obj in items:
             filepath = os.path.join(folder, "%s_%s.stl" % (prefix, stamp))
-            targets = [obj]
             temps = []
             try:
+                copy = evaluated_mesh_object(obj, obj.name + ".export")
                 if back is not None:
-                    for source in targets:
-                        copy = evaluated_mesh_object(source, source.name + ".org")
-                        copy.matrix_world = back @ source.matrix_world
-                        temps.append(copy)
-                    targets = temps
-                export_stl(targets, filepath, context)
+                    copy.matrix_world = back @ obj.matrix_world
+                cleanup = remove_disconnected_islands(copy.data)
+                if cleanup["removed_components"]:
+                    cleaned.append("%s: xoa %d island (%d mat)"
+                                   % (prefix, cleanup["removed_components"],
+                                      cleanup["removed_faces"]))
+                temps.append(copy)
+                export_stl(temps, filepath, context)
             except Exception as exc:
                 self.report({'ERROR'}, "Khong xuat duoc %s: %s" % (prefix, exc))
                 return {'CANCELLED'}
@@ -4758,9 +4791,10 @@ class RMVB_OT_save_design(Operator):
                 saved.append(ci_path)
             else:
                 self.report({'WARNING'}, "Khong tim thay constructionInfo de cap nhat")
-        self.report({'INFO'}, "Da luu%s: %s" % (
+        self.report({'INFO'}, "Da luu%s: %s%s" % (
             " (toa do file goc)" if back is not None else "",
-            ", ".join(os.path.basename(p) for p in saved)))
+            ", ".join(os.path.basename(p) for p in saved),
+            "; da xoa island roi truoc khi xuat: %s" % ", ".join(cleaned) if cleaned else ""))
         return {'FINISHED'}
 
 
