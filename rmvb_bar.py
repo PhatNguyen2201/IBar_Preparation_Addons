@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rmvb-Bar",
     "author": "Phat Nguyen",
-    "version": (0, 8, 1),
+    "version": (0, 8, 2),
     "blender": (4, 5, 3),
     "location": "View3D > Sidebar > Rmvb-Bar",
     "description": "Thiet ke bar implant: Set / Connection / Bar Pillar / Top Bar Plane + Bar Segment tu cap nhat / Attachment / Sleeve",
@@ -3906,9 +3906,13 @@ def set_parts_hidden(groups, hidden):
 
 
 def attach_to(child, parent):
-    """Gan child vao parent (toa do local cua child = toa do cua parent)."""
+    """Gan child vao parent (toa do local cua child = toa do cua parent) va khoa Location /
+    Rotation / Scale cua child: chi Empty cua cum di chuyen, cac thanh phan khong bi keo lech."""
     child.parent = parent
     child.matrix_parent_inverse = Matrix.Identity(4)
+    child.lock_location = (True, True, True)
+    child.lock_rotation = (True, True, True)
+    child.lock_scale = (True, True, True)
 
 
 def unparent_keep_world(obj):
